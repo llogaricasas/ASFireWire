@@ -6,10 +6,13 @@
   <false/>
   <key>com.apple.developer.system-extension.install</key>
   <true/>
-  <key>com.apple.developer.driverkit.userclient-access</key>
-  <array>
-    <string>net.mrmidi.ASFW.ASFWDriver</string>
-    <string>net.mrmidi.ASFW.ASFWDriver:ASFWDriverUserClient</string>
-  </array>
+  <!-- Team 7JUH6837PL is provisioned with the broad "allow any user client"
+       entitlement; the profile does NOT carry a userclient-access list, and
+       Xcode refuses to sign if the two disagree. Upstream (ad-hoc builds)
+       uses the explicit list instead:
+         com.apple.developer.driverkit.userclient-access =
+           [ <prefix>.ASFW.ASFWDriver, <prefix>.ASFW.ASFWDriver:ASFWDriverUserClient ] -->
+  <key>com.apple.developer.driverkit.allow-any-userclient-access</key>
+  <true/>
 </dict>
 </plist>

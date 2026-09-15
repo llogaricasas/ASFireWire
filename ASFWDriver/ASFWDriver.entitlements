@@ -6,8 +6,6 @@
   <true/>
   <key>com.apple.developer.driverkit.transport.pci</key>
   <true/>
-  <key>com.apple.developer.driverkit.transport.pci.bridge</key>
-  <true/>
   <key>com.apple.developer.driverkit.family.audio</key>
   <true/>
   <key>com.apple.developer.driverkit.family.scsicontroller</key>
