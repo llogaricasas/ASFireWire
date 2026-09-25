@@ -22,5 +22,11 @@
   <true/>
   <key>com.apple.developer.driverkit.family.scsicontroller</key>
   <true/>
+  <!-- Lets the ASFW app (and the MCP console) open ASFWDriverUserClient.
+       Granted on the dext App ID ("DriverKit Allow Any UserClient"); the
+       app-side alternative is com.apple.developer.driverkit.userclient-access
+       listing this dext, which upstream's ad-hoc build uses instead. -->
+  <key>com.apple.developer.driverkit.allow-any-userclient-access</key>
+  <true/>
 </dict>
 </plist>

@@ -86,6 +86,15 @@ ok "Signed bundle: $OUT_DIR/ASFW.app"
 
 if $INSTALL; then
   DEST="$INSTALL_DIR/ASFW.app"
+  # Replacing the bundle underneath a running ASFW leaves that process unable
+  # to locate its own embedded dext (OSSystemExtensionErrorExtensionNotFound,
+  # error 4) — quit it first and relaunch the fresh copy below.
+  if pgrep -xq ASFW; then
+    log "Quitting running ASFW…"
+    osascript -e 'tell application "ASFW" to quit' >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -xq ASFW || break; sleep 0.5; done
+    pgrep -xq ASFW && pkill -x ASFW && sleep 1
+  fi
   if [[ -d "$DEST" ]]; then
     log "Replacing existing $DEST"
     rm -rf "$DEST" 2>/dev/null || sudo rm -rf "$DEST"
