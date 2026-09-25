@@ -4,8 +4,20 @@
 <dict>
   <key>com.apple.developer.driverkit</key>
   <true/>
+  <!-- Must mirror the DriverKit provisioning profile for
+       net.kaleidoscop.ASFW.ASFWDriver EXACTLY: Apple grants transport.pci as an
+       array of PCI match dictionaries, not a boolean, and IOPCIFamily refuses
+       to attach a dext whose embedded value differs from the profile (the
+       symptom is a controller that is "registered, matched, active" in ioreg
+       with no ASFWDriver child). 0xFFFFFFFF&0x00000000 = mask 0 = any PCI ID.
+       Upstream's ad-hoc/SIP-off path uses <true/> instead. -->
   <key>com.apple.developer.driverkit.transport.pci</key>
-  <true/>
+  <array>
+    <dict>
+      <key>IOPCIPrimaryMatch</key>
+      <string>0xFFFFFFFF&amp;0x00000000</string>
+    </dict>
+  </array>
   <key>com.apple.developer.driverkit.family.audio</key>
   <true/>
   <key>com.apple.developer.driverkit.family.scsicontroller</key>

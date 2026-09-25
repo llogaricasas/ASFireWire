@@ -11,7 +11,7 @@
 
 import Foundation
 
-enum ASFWBundleIdentifiers {
+nonisolated enum ASFWBundleIdentifiers {
     /// The host app's bundle identifier ("<prefix>.ASFW").
     static let app: String = Bundle.main.bundleIdentifier ?? "net.mrmidi.ASFW"
 
