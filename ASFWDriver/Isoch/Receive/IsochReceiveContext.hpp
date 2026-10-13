@@ -86,11 +86,16 @@ class IsochReceiveContext final
     // interpretation and any state derived from it.
     void SetReceiveConsumer(IIsochReceiveConsumer* consumer) noexcept;
 
-    void LogHardwareState();
-
+#ifdef ASFW_HOST_TEST
+    bool AcquirePollGateForTesting() noexcept {
+        return !rxLock_.test_and_set(std::memory_order_acquire);
+    }
+    void ReleasePollGateForTesting() noexcept {
+        rxLock_.clear(std::memory_order_release);
+    }
+#endif
     void DrainZtsTelemetry(uint32_t maxRecords);
-    void DrainPayloadWriterTelemetry();
-    void LogTxSytTrace();
+    void ServiceConsumerDiagnostics();
 
   private:
     struct Registers {

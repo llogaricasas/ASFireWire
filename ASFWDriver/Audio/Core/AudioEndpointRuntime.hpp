@@ -27,6 +27,17 @@
 
 namespace ASFW::Audio {
 
+struct AudioOutputObserverState final {
+    uint64_t writeEndFrame{0};
+    uint64_t oldestValidFrame{0};
+    uint64_t sessionEpoch{0};
+    uint64_t discontinuityEpoch{0};
+    uint64_t memoryGeneration{0};
+    uint32_t activeRingFrames{0};
+    uint32_t channels{0};
+    uint32_t sampleRateHz{0};
+};
+
 class AudioEndpointRuntime final : public Runtime::IDirectAudioBindingSource {
 public:
     explicit AudioEndpointRuntime(uint64_t guid) noexcept : guid_(guid), lock_(IOLockAlloc()) {}
@@ -64,12 +75,15 @@ public:
     // config_.currentSampleRate. That field (and directGeneration_) is latched
     // only when the direct-audio memory is allocated in
     // EnsureDirectAudioMemoryLocked, which does not re-run on an idle rate change
-    // because the ring buffers are rate-independent (fixed kAudioRingBufferFrames)
-    // and are allocated once at bring-up then reused. So updating config_ alone
+    // because the ring buffers are allocated once at bring-up at the maximum
+    // (kAudioRingBufferFrames) and then reused. So updating config_ alone
     // leaves the binding (and the ZTS the HAL judges) stuck at the publish-time
     // 48 kHz. Refresh directSampleRateHz_ and bump the generation here so
     // CopyDirectAudioBinding reports the new rate and the IR re-arms the RX/ZTS
-    // clock at it.
+    // clock at it. The ACTIVE ring moves with the rate (V3: 12288 frames at 1x,
+    // 24576 at 2x) inside the unchanged allocation; the audio driver applies the
+    // same HalBufferProfileForRate value to its graph binding in the rate-change
+    // window, so both sides of the seam wrap on the same ring.
     void SetCurrentSampleRate(uint32_t sampleRateHz) noexcept {
         if (sampleRateHz == 0) {
             return;
@@ -78,8 +92,12 @@ public:
             IOLockLock(lock_);
         }
         config_.currentSampleRate = sampleRateHz;
-        if (directSampleRateHz_ != 0 && directSampleRateHz_ != sampleRateHz) {
+        const uint32_t activeFrames = ActiveRingFramesForRate(sampleRateHz, directAllocatedFrames_);
+        if (directSampleRateHz_ != 0 && directSampleRateHz_ != sampleRateHz &&
+            activeFrames != 0) {
             directSampleRateHz_ = sampleRateHz;
+            directOutputCapacityFrames_ = activeFrames;
+            directInputCapacityFrames_ = activeFrames;
             ++directGeneration_;
         }
         if (lock_) {
@@ -218,6 +236,45 @@ public:
         return kIOReturnSuccess;
     }
 
+    // Diagnostic observer export. It retains the exact output descriptor used
+    // by the AudioDriverKit stream and snapshots metadata under the runtime
+    // lock; sample bytes remain shared and are never copied.
+    [[nodiscard]] kern_return_t CopyOutputObserverMemory(
+        IOMemoryDescriptor** outMemory,
+        AudioOutputObserverState& outState) noexcept {
+        outState = {};
+        if (outMemory) { *outMemory = nullptr; }
+        if (!outMemory || !lock_) {
+            return kIOReturnBadArgument;
+        }
+        IOLockLock(lock_);
+        if (!HasCompleteDirectAudioMemoryLocked() || !directControl_) {
+            IOLockUnlock(lock_);
+            return kIOReturnNotReady;
+        }
+        directOutputMemory_->retain();
+        *outMemory = directOutputMemory_;
+        CopyOutputObserverStateLocked(outState);
+        IOLockUnlock(lock_);
+        return kIOReturnSuccess;
+    }
+
+    [[nodiscard]] kern_return_t CopyOutputObserverState(
+        AudioOutputObserverState& outState) noexcept {
+        outState = {};
+        if (!lock_) {
+            return kIOReturnNotReady;
+        }
+        IOLockLock(lock_);
+        if (!HasCompleteDirectAudioMemoryLocked() || !directControl_) {
+            IOLockUnlock(lock_);
+            return kIOReturnNotReady;
+        }
+        CopyOutputObserverStateLocked(outState);
+        IOLockUnlock(lock_);
+        return kIOReturnSuccess;
+    }
+
     void ReleaseDirectAudioMemory() noexcept {
         if (lock_) {
             IOLockLock(lock_);
@@ -236,6 +293,15 @@ public:
         const bool complete = HasCompleteDirectAudioMemoryLocked();
         IOLockUnlock(lock_);
         return complete;
+    }
+
+    [[nodiscard]] bool IsTransmitTimingReady() noexcept override {
+        if (!lock_) return false;
+        IOLockLock(lock_);
+        const bool ready = HasCompleteDirectAudioMemoryLocked() &&
+            directControl_->transmitTimingReady.load(std::memory_order_acquire) != 0;
+        IOLockUnlock(lock_);
+        return ready;
     }
 
     [[nodiscard]] bool CopyDirectAudioBinding(Runtime::DirectAudioBindingSnapshot& out) noexcept override {
@@ -276,6 +342,15 @@ public:
         out.valid = true;
         IOLockUnlock(lock_);
         return true;
+    }
+
+    [[nodiscard]] bool IsCurrentStreamingRxEpoch(uint64_t epoch) noexcept {
+        if (!lock_) return false;
+        IOLockLock(lock_);
+        const bool current = streaming_.load(std::memory_order_acquire) && directControl_ &&
+            directControl_->rxReplayEpochResets.load(std::memory_order_acquire) == epoch;
+        IOLockUnlock(lock_);
+        return current;
     }
 
     void MarkStreaming(bool streaming) noexcept {
@@ -320,12 +395,27 @@ public:
     }
 
 private:
-    [[nodiscard]] static uint32_t ClampAudioChannels(uint32_t channels) noexcept {
+    void CopyOutputObserverStateLocked(AudioOutputObserverState& out) const noexcept {
+        const auto& control = *directControl_;
+        out.writeEndFrame =
+            control.playbackRingWriteFrame.load(std::memory_order_acquire);
+        out.oldestValidFrame =
+            control.playbackRingOldestValidFrame.load(std::memory_order_relaxed);
+        out.sessionEpoch = control.generation.load(std::memory_order_acquire);
+        out.discontinuityEpoch =
+            control.playbackRingDiscontinuityGeneration.load(std::memory_order_relaxed);
+        out.memoryGeneration = directGeneration_;
+        out.activeRingFrames = directOutputCapacityFrames_;
+        out.channels = directOutputChannels_;
+        out.sampleRateHz = directSampleRateHz_;
+    }
+
+    [[nodiscard]] static uint32_t ClampAudioChannels(uint32_t channels, uint32_t limit) noexcept {
         if (channels == 0) {
             return 0;
         }
-        return (channels > ASFW::Encoding::kMaxPcmChannels)
-            ? ASFW::Encoding::kMaxPcmChannels
+        return (channels > limit)
+            ? limit
             : channels;
     }
 
@@ -464,15 +554,26 @@ private:
         // device->host stream for its firmware/clock protocol while explicitly
         // publishing zero CoreAudio input channels. In that case the aggregate
         // count is the transport buffer's safe fallback geometry.
+        const uint32_t channelLimit = Runtime::HostChannelLimit(config_.rateFormationCandidates);
         const uint32_t outputChannels = ClampAudioChannels(
-            config_.outputChannelCount ? config_.outputChannelCount : config_.channelCount);
+            config_.outputChannelCount ? config_.outputChannelCount : config_.channelCount, channelLimit);
         const uint32_t inputChannels = ClampAudioChannels(
-            config_.inputChannelCount ? config_.inputChannelCount : config_.channelCount);
+            config_.inputChannelCount ? config_.inputChannelCount : config_.channelCount, channelLimit);
         const uint32_t sampleRateHz = config_.currentSampleRate ? config_.currentSampleRate : 48000;
-        const uint32_t outputFrames = Isoch::Config::kAudioRingBufferFrames;
-        const uint32_t inputFrames = Isoch::Config::kAudioRingBufferFrames;
+        // Allocate the maximum once; publish the active ring for this rate.
+        Runtime::ConfigurationAllocation allocation{Isoch::Config::kAudioRingBufferFrames,
+            outputChannels, inputChannels, 0};
+        if (!config_.rateFormationCandidates.empty()) {
+            const auto maximum = Runtime::MaximumFormationAllocation(config_.rateFormationCandidates, allocation);
+            if (!maximum) return kIOReturnUnsupported;
+            allocation = *maximum;
+        }
+        const uint32_t allocatedFrames = allocation.frameCapacity;
+        const uint32_t outputFrames = ActiveRingFramesForRate(sampleRateHz, allocatedFrames);
+        const uint32_t inputFrames = outputFrames;
 
-        if (outputChannels == 0 || inputChannels == 0 || sampleRateHz == 0) {
+        if (outputChannels == 0 || inputChannels == 0 || sampleRateHz == 0 ||
+            outputFrames == 0) {
             ASFW_LOG(DirectAudio,
                      "ADK DBG MEM runtime ensure failed bad_config guid=0x%016llx agg=%u in=%u out=%u rate=%u",
                      guid_,
@@ -501,10 +602,26 @@ private:
             return kIOReturnSuccess;
         }
 
+        if (!config_.rateFormationCandidates.empty() && HasCompleteDirectAudioMemoryLocked()) {
+            // Both directions are stopped by the configuration coordinator.
+            // Keep the memory object identity: only its dense active view moves.
+            if (streaming_.load(std::memory_order_acquire)) return kIOReturnBusy;
+            if (uint64_t(outputFrames) * outputChannels * 4 > directOutputMap_->GetLength() ||
+                uint64_t(inputFrames) * inputChannels * 4 > directInputMap_->GetLength())
+                return kIOReturnNoResources;
+            directOutputCapacityFrames_ = outputFrames;
+            directInputCapacityFrames_ = inputFrames;
+            directOutputChannels_ = outputChannels;
+            directInputChannels_ = inputChannels;
+            directSampleRateHz_ = sampleRateHz;
+            directControl_->ResetForStart();
+            PublishDirectAudioBindingFromMappedMemoryLocked();
+            return kIOReturnSuccess;
+        }
         ReleaseDirectAudioMemoryLocked();
 
-        const uint64_t outputBytes = static_cast<uint64_t>(outputFrames) * outputChannels * sizeof(float);
-        const uint64_t inputBytes = static_cast<uint64_t>(inputFrames) * inputChannels * sizeof(int32_t);
+        const uint64_t outputBytes = static_cast<uint64_t>(allocatedFrames) * allocation.playbackChannelCapacity * sizeof(float);
+        const uint64_t inputBytes = static_cast<uint64_t>(allocatedFrames) * allocation.captureChannelCapacity * sizeof(int32_t);
         const uint64_t controlBytes = sizeof(Runtime::AudioTransportControlBlock);
 
         ASFW_LOG(DirectAudio,
@@ -541,6 +658,7 @@ private:
             return kr;
         }
 
+        directAllocatedFrames_ = allocatedFrames;
         directOutputCapacityFrames_ = outputFrames;
         directOutputChannels_ = outputChannels;
         directInputCapacityFrames_ = inputFrames;
@@ -562,6 +680,17 @@ private:
         return HasCompleteDirectAudioMemoryLocked() ? kIOReturnSuccess : kIOReturnNotReady;
     }
 
+    // Active ring at a rate: the HAL profile's ring when it fits the fixed
+    // allocation, else 0 (the rate is not supported by this allocation).
+    [[nodiscard]] static constexpr uint32_t ActiveRingFramesForRate(uint32_t sampleRateHz,
+        uint32_t allocationFrames = Isoch::Config::kAudioRingBufferFrames) noexcept {
+        const auto hal = IsochTransport::HalBufferProfileForRate(sampleRateHz);
+        return IsochTransport::IsValidAudioHalBufferProfile(hal) &&
+                       hal.frameRingFrames <= allocationFrames
+                   ? hal.frameRingFrames
+                   : 0;
+    }
+
     uint64_t guid_{0};
     mutable IOLock* lock_{nullptr};
     Model::ASFWAudioDevice config_{};
@@ -569,6 +698,7 @@ private:
     std::atomic<bool> streaming_{false};
 
     uint64_t directGeneration_{0};
+    uint32_t directAllocatedFrames_{Isoch::Config::kAudioRingBufferFrames};
     IOBufferMemoryDescriptor* directOutputMemory_{nullptr};
     IOBufferMemoryDescriptor* directInputMemory_{nullptr};
     IOBufferMemoryDescriptor* directControlMemory_{nullptr};

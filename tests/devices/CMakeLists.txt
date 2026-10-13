@@ -16,26 +16,43 @@ add_device_test(DiceFocusriteSerializationTests
     "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspTypes.cpp"
 )
 
-# DICE duplex parity tests (requires support dir in includes for ReferencePhase0ParityFixture.inc)
-add_executable(DICEDuplexBringupControllerTests
-    DICEDuplexBringupControllerTests.cpp
+# Linear DICE bring-up: parity and state tests (ReferencePhase0ParityFixture.inc
+# lives in the support dir).
+add_device_test(DiceFamilyDriverTests
+    DiceFamilyDriverTests.cpp
     "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICEDuplexBringupController.cpp"
-    "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
     "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
 )
-target_include_directories(DICEDuplexBringupControllerTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../support")
-target_link_libraries(DICEDuplexBringupControllerTests PRIVATE
-    asfw_test_support
-    GTest::gtest_main
+
+# Scripted FF400/FF800 register sequencing, clock admission, and resource ownership.
+add_device_test(FirefaceFamilyDriverTests
+    FirefaceFamilyDriverTests.cpp
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/RME/FirefaceSettings.cpp"
 )
-gtest_discover_tests(DICEDuplexBringupControllerTests)
+
+# Fireface settings flash decode and configuration-register encode (pure, no bus).
+add_device_test(FirefaceSettingsTests
+    FirefaceSettingsTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/RME/FirefaceSettings.cpp"
+)
+
+# Generic audio duplex IRM stream reservations and channel geometry tests
+add_device_test(DuplexIRMReservationsTests
+    DuplexIRMReservationsTests.cpp
+    "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+)
 
 # Generic DICE / TCAT protocol split tests
 add_device_test(DICETcatProtocolTests
     DICETcatProtocolTests.cpp
     "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICEDuplexBringupController.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/TCAT/DICETcatProtocol.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspProtocol.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspTypes.cpp"
@@ -43,33 +60,144 @@ add_device_test(DICETcatProtocolTests
     "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
 )
 
-# DICE restart-session tests
-add_device_test(DICERestartSessionTests
-    DICERestartSessionTests.cpp
+# Blocking DICE register access used by the linear bring-up (AUDIO_SESSION_REDESIGN.md S1).
+add_device_test(DiceDeviceIoTests
+    DiceDeviceIoTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
 )
 
-# DICE duplex restart coordinator FSM tests
-add_device_test(AudioDuplexCoordinatorTests
-    AudioDuplexCoordinatorTests.cpp
-    "${ASFW_DRIVER_DIR}/Audio/Protocols/Backends/AudioDuplexCoordinator.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Core/AudioRuntimeRegistry.cpp"
+# DICE golden wire traces against the simulated device (AUDIO_SESSION_REDESIGN.md S0).
+# Goldens live in tests/golden/dice; ASFW_UPDATE_GOLDEN=1 rewrites them.
+add_device_test(DiceWireCharacterizationTests
+    DiceWireCharacterizationTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/TCAT/DICETcatProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspTypes.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SaffireproCommon.cpp"
     "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+)
+
+# Session-layer golden traces of today's duplex coordinator (AUDIO_SESSION_REDESIGN.md S2).
+# Goldens live in tests/golden/session; ASFW_UPDATE_GOLDEN=1 rewrites them.
+add_device_test(SessionCharacterizationTests
+    SessionCharacterizationTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Session/AudioSessions.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/RestartRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/SessionScheduler.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/StopRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioRuntimeRegistry.cpp"
     "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/TCAT/DICETcatProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspTypes.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SaffireproCommon.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/DiceFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/AudioDeviceHost.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioNubPublisher.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AudioProfileRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
+)
+
+# Session scheduler: overlapping requests, faults, teardown (AUDIO_SESSION_REDESIGN.md S2).
+add_device_test(AudioSessionSchedulerTests
+    AudioSessionSchedulerTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Session/AudioSessions.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/RestartRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/SessionScheduler.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/StopRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioRuntimeRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/TCAT/DICETcatProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspTypes.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SaffireproCommon.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/DiceFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/AudioDeviceHost.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioNubPublisher.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AudioProfileRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
+)
+
+# MOTU on the audio device host over the real session: a bus reset while streaming rebinds
+# (AUDIO_DEVICE_HOST.md section 5, Δ6).
+add_device_test(MotuHostRebindTests
+    MotuHostRebindTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Host/AudioDeviceHost.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/MotuFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/AudioSessions.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/RestartRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/SessionScheduler.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/StopRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioRuntimeRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/TCAT/DICETcatProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspTypes.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SaffireproCommon.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/DiceFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioNubPublisher.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AudioProfileRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
 )
 
 # FW-74: resolver-owned duplex stream geometry, wire-format quirks, and host recipe.
 add_device_test(DuplexStreamProfileTests
     DuplexStreamProfileTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
 )
 
 # BeBoBProtocol base-class: async ApplyClockConfig chain, timer settle, epoch cancel.
 add_device_test(BeBoBProtocolTests
     BeBoBProtocolTests.cpp
     "${ASFW_DRIVER_DIR}/Audio/Protocols/BeBoB/BeBoBProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/BeBoB/MAudioSpecialProtocol.cpp"
     "${ASFW_DRIVER_DIR}/Protocols/AVC/CMP/CMPClient.cpp"
     "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWDevice.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWUnit.cpp"
     "${ASFW_DRIVER_DIR}/Protocols/AVC/FCPTransport.cpp"
-    "${ASFW_DRIVER_DIR}/Protocols/AVC/AudioFunctionBlockCommand.cpp"
 )
 
 add_device_test(DiceRuntimeDeviceConfigTests
@@ -79,31 +207,6 @@ add_device_test(DiceRuntimeDeviceConfigTests
 # FW-65: sync/async bridge (WaitForAsyncResult) characterization tests (header-only)
 add_device_test(WaitForAsyncResultTests
     WaitForAsyncResultTests.cpp
-)
-
-# DICE recovery-policy classification kernel tests (FW-66, header-only policy)
-add_device_test(DiceRecoveryPolicyTests
-    DiceRecoveryPolicyTests.cpp
-)
-
-# DICE duplex operation gate (active/stop-intent) tests (FW-68, header-only gate)
-add_device_test(DuplexOperationGateTests
-    DuplexOperationGateTests.cpp
-)
-
-# DICE restart-journal FSM mutator tests (FW-69a, header-only journal)
-add_device_test(RestartJournalTests
-    RestartJournalTests.cpp
-)
-
-# DICE restart-session store tests (FW-69b, header-only lock-borrowing store)
-add_device_test(RestartSessionStoreTests
-    RestartSessionStoreTests.cpp
-)
-
-# DICE clock-request broker tests (FW-67, header-only lock-borrowing broker)
-add_device_test(ClockRequestBrokerTests
-    ClockRequestBrokerTests.cpp
 )
 
 # FW-130: Apogee Duet device spec (control caps + CIP quirks), header-only
@@ -165,14 +268,6 @@ add_device_test(OxfordCsrTests
 )
 
 # FW-139: OXFW two-tier stream-format discovery (reported list vs probed rates)
-add_device_test(OxfwStreamFormatsTests
-    OxfwStreamFormatsTests.cpp
-    "${ASFW_DRIVER_DIR}/Audio/Protocols/Oxford/OxfwStreamFormats.cpp"
-    "${ASFW_DRIVER_DIR}/Protocols/AVC/FCPTransport.cpp"
-    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
-    "${ASFW_DRIVER_DIR}/Discovery/FWDevice.cpp"
-    "${ASFW_DRIVER_DIR}/Discovery/FWUnit.cpp"
-)
 
 # FW-138: shared AV/C test rig (deferred bus + real FCPTransport + target responder)
 add_device_test(AvcTestRigTests
@@ -219,4 +314,274 @@ add_device_test(ApogeeDuetClockTransitionTests
 
 add_device_test(AVCStartReadinessTests
     AVCStartReadinessTests.cpp
+)
+
+# Echo Fireworks (Mackie Onyx 400F): EFC codec + transaction runner.
+add_device_test(FireworksEfcTests
+    FireworksEfcTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/Fireworks/EfcProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/Fireworks/EfcTransport.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+)
+
+# FireworksProtocol on the BeBoB base: geometry gate + EFC clock apply.
+add_device_test(FireworksProtocolTests
+    FireworksProtocolTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/Fireworks/EfcProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/Fireworks/EfcTransport.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/Fireworks/FireworksProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/BeBoB/BeBoBProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/CMP/CMPClient.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/FCPTransport.cpp"
+)
+
+# One device catalog: the table that replaces the five independent matchers.
+# The Supported-row assertion is the one that would have caught #115.
+add_device_test(AudioDeviceCatalogTests
+    AudioDeviceCatalogTests.cpp
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+)
+
+# The catalog must be shown to agree with the matchers it replaces BEFORE it
+# replaces them, or the collapse is a behaviour change wearing a refactor's name.
+add_device_test(CatalogMatcherAgreementTests
+    CatalogMatcherAgreementTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+)
+
+# The pure half of DeviceProtocolFactory: which protocol an identity selects.
+# Create() itself constructs DriverKit objects and only runs on hardware, which
+# is why #115 could hide in the decision for as long as it did.
+add_device_test(DeviceProtocolChoiceTests
+    DeviceProtocolChoiceTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+)
+
+# The catalog's stream traits. Proven against the matchers they replace in
+# fa6c48f4, while those were still live.
+add_device_test(DeviceStreamTraitsAgreementTests
+    DeviceStreamTraitsAgreementTests.cpp
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+)
+
+# Audio backend lifecycle and publication race tests (controlled interleavings)
+add_device_test(BackendLifecycleRaceTests
+    BackendLifecycleRaceTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Host/DiceFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/AudioDeviceHost.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/AudioSessions.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/RestartRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/SessionScheduler.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/StopRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioRuntimeRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioNubPublisher.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AudioProfileRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
+)
+
+# Audio device host: the one lifecycle shell over every family
+# (documentation/AUDIO_DEVICE_HOST.md)
+add_device_test(AudioDeviceHostTests
+    AudioDeviceHostTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Host/AudioDeviceHost.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/AudioSessions.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/RestartRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/SessionScheduler.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/StopRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioRuntimeRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioNubPublisher.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AudioProfileRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
+)
+
+# SelectProbeBootstrap mapping tests
+add_device_test(SelectProbeBootstrapTests
+    SelectProbeBootstrapTests.cpp
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+)
+
+# Config ROM unit evidence -> catalog plan -> AV/C probe decision
+add_device_test(AvcProbeAdmissionTests
+    AvcProbeAdmissionTests.cpp
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+)
+
+# BeBoB capture channel map tests
+add_device_test(BeBoBCaptureChannelMapTests
+    BeBoBCaptureChannelMapTests.cpp
+)
+
+# M-Audio special firmware capture channel order and model-specific skew
+add_device_test(MAudioCaptureChannelMapTests
+    MAudioCaptureChannelMapTests.cpp
+)
+
+# M-Audio 48 kHz internal-clock TX cadence and commit policy.
+add_device_test(MAudioInternalTxTimingTests
+    MAudioInternalTxTimingTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/BeBoB/MAudioInternalTxTiming.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Wire/AMDTP/AmdtpCadence.cpp"
+)
+
+add_device_test(MAudioTxClockBridgeTests
+    MAudioTxClockBridgeTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Families/BeBoB/MAudio/MAudioTxClockBridge.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Families/BeBoB/MAudio/MAudioPresentationObserver.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Families/BeBoB/MAudio/MAudioDuplexChoreography.cpp"
+)
+
+# The generic DICE identity rule, the catalog fallback it drives, and the
+# section-table bounds checked before the first write to an unknown unit.
+add_device_test(DiceIdentityTests
+    DiceIdentityTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+)
+
+add_device_test(DiceMultirateClockTests
+    DiceMultirateClockTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp")
+target_compile_definitions(DiceMultirateClockTests PRIVATE ASFW_DICE_MULTIRATE_VALIDATION=1)
+
+# RME Fireface adapter on the audio device host (AUDIO_DEVICE_HOST.md §6 E2).
+add_device_test(RmeFamilyAdapterTests
+    RmeFamilyAdapterTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Host/RmeFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWDevice.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWUnit.cpp"
+)
+
+# MOTU adapter on the audio device host (AUDIO_DEVICE_HOST.md §6 E3/E3a). Runs the real
+# MotuProtocol over a recording bus.
+add_device_test(MotuFamilyAdapterTests
+    MotuFamilyAdapterTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Host/MotuFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/MOTU/MotuProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWDevice.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWUnit.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioRuntimeRegistry.cpp"
+)
+
+# AV/C adapter on the audio device host (AUDIO_DEVICE_HOST.md §6 E4).
+add_device_test(AvcFamilyAdapterTests
+    AvcFamilyAdapterTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Host/AvcFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWDevice.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWUnit.cpp"
+)
+
+# AudioCoordinator routing: every family to the audio device host
+# (AUDIO_DEVICE_HOST.md §6 E2-E5). Links the coordinator and the host with the real
+# isoch transport; only the device manager is faked.
+add_device_test(AudioCoordinatorRoutingTests
+    AudioCoordinatorRoutingTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioCoordinator.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioRuntimeRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioNubPublisher.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/AudioDeviceHost.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/RmeFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/AvcFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/MotuFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/MOTU/MotuProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/AudioSessions.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/RestartRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/SessionScheduler.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/StopRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/DiceFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/Backends/IsochDuplexHostTransport.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/TCAT/DICETcatProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspTypes.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SaffireproCommon.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWDevice.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/FWUnit.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AudioProfileRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Isoch/IsochService.cpp"
+    "${ASFW_DRIVER_DIR}/Isoch/Transmit/IsochTransmitContext.cpp"
+    "${ASFW_DRIVER_DIR}/Isoch/Transmit/IsochTxDmaRing.cpp"
+    "${ASFW_DRIVER_DIR}/Isoch/Transmit/IsochTxDescriptorSlab.cpp"
+    "${ASFW_DRIVER_DIR}/Isoch/Receive/IsochReceiveContext.cpp"
+    "${ASFW_DRIVER_DIR}/Isoch/Receive/IsochRxDmaRing.cpp"
+    "${ASFW_DRIVER_DIR}/Isoch/Memory/IsochDMAMemoryManager.cpp"
+    "${ASFW_DRIVER_DIR}/Shared/Memory/DMAMemoryManager.cpp"
+    "${ASFW_DRIVER_DIR}/Shared/Rings/DescriptorRing.cpp"
+    "${ASFW_DRIVER_DIR}/Shared/Rings/BufferRing.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Engine/Direct/AudioClockPublisher.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Engine/Direct/DirectInputWriter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Engine/Direct/Rx/RxAudioPacketProcessor.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Engine/Direct/Rx/DirectAudioReceiveConsumer.cpp"
+    "${ASFW_DRIVER_DIR}/Common/BarrierUtils.cpp"
+)
+
+# DICE family adapter on the audio device host: Describe refusals, runtime-fault
+# judgement, and device-event mapping (AUDIO_DEVICE_HOST.md §6 E5).
+add_device_test(DiceFamilyAdapterTests
+    DiceFamilyAdapterTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Session/AudioSessions.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/RestartRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/SessionScheduler.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Session/StopRoutine.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DeviceProtocolChoice.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioRuntimeRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/IRM/IRMClient.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DICETransaction.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceDeviceIo.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceNotificationRouter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Core/DiceFamilyDriver.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/TCAT/DICETcatProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspProtocol.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SPro24DspTypes.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/DICE/Focusrite/SaffireproCommon.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/DeviceRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/DiceFamilyAdapter.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Host/AudioDeviceHost.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Core/AudioNubPublisher.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AudioProfileRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
 )

@@ -16,12 +16,9 @@ SCHEME_NAME="ASFW"
 CONFIGURATION="${CONFIGURATION:-Debug}"
 # Empty by default so each target's own ARCHS (project.yml) governs.
 #
-# Pinning the destination to arm64 silently overrides the DriverKit target's
-# required "x86_64 arm64e": a plain-arm64 dext has no LC_MAIN entry point and
-# kernelmanagerd rejects it on hardware attach with OS_REASON_EXEC / ENOEXEC.
-# See CLAUDE.md, "DriverKit Architecture on Apple Silicon". Note arm64e is not a
-# valid -destination arch, so this cannot be fixed by changing the default --
-# the constraint has to be absent.
+# Leave the destination architecture unset so the DriverKit target can use
+# "x86_64 arm64e" for Debug and "x86_64 arm64" for Release. Pinning it to arm64
+# would override the Debug ABI; arm64e is not a valid -destination arch.
 ARCH_NAME="${ARCH_NAME:-}"
 BUILD_DIR="${BUILD_DIR:-./build}"
 DERIVED="${BUILD_DIR}/DerivedData"
@@ -54,29 +51,34 @@ COMPILE_COMMANDS_PATH="${COMPILE_COMMANDS_PATH:-./compile_commands.json}"
 SELECTED_TESTS_PATTERN=""
 # When true, run PVS-Studio static analyzer after successful build
 RUN_ANALYZER=false
+RUN_ASAN=false
 PVS_LOG="${BUILD_DIR}/PVS-Studio.log"
 PVS_JSON="${BUILD_DIR}/PVS-Studio.json"
-# When true, run only Swift/XCTest tests
 SWIFT_TEST_ONLY=false
-# When true, generate Swift code coverage
 SWIFT_COVERAGE=false
 SWIFT_COVERAGE_LCOV="${BUILD_DIR}/swift_coverage.lcov"
+ADHOC=false
 usage() {
   cat <<EOF
-Usage: $0 [--verbose] [--no-bump] [--scheme NAME] [--config CONFIG] [--arch ARCH] [--derived PATH]
+Usage: $0 [--verbose] [--no-bump] [--adhoc] [--scheme NAME] [--config CONFIG] [--arch ARCH] [--derived PATH]
   --verbose          Show full xcodebuild output (disables quiet filtering)
   --no-bump          Keep CURRENT_PROJECT_VERSION unchanged
+  --adhoc            Regenerate and build with ad-hoc signing (project.adhoc.yml)
   --test             Run C++ tests before building
   --test-only        Run C++ tests only (skip xcodebuild)
   --swift-test-only  Run Swift/XCTest tests only (skip main build)
   --swift-coverage   Run Swift tests with coverage and export to LCOV
   --commands         Generate compile_commands.json via xcpretty
   --analyze          Run PVS-Studio static analyzer after build
+  --asan             Build/run the C++ tests under AddressSanitizer + UBSan
+                     (use with --test-only or --test; lifetime bugs are this
+                     driver's recurring failure mode and a plain build cannot
+                     see them)
   --scheme NAME      Override scheme (default: ${SCHEME_NAME})
   --config CONFIG    Override configuration (default: ${CONFIGURATION})
   --arch ARCH        Pin the xcodebuild destination arch (default: unset, so each
-                     target's ARCHS from project.yml applies -- the DriverKit
-                     target needs arm64e, which is not a valid destination arch)
+                     target's ARCHS from project.yml applies -- Debug DriverKit
+                     uses arm64e, which is not a valid destination arch)
   --set KEY=VALUE    Append an xcodebuild build setting (repeatable)
   --derived PATH     Set DerivedData path (default: ${DERIVED})
 EOF
@@ -86,6 +88,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --verbose) VERBOSE=true; shift;;
     --no-bump) NO_BUMP=true; shift;;
+    --adhoc) ADHOC=true; shift;;
     --test) RUN_TESTS=true; shift;;
     --test-only) TEST_ONLY=true; shift;;
     --swift-test-only) SWIFT_TEST_ONLY=true; shift;;
@@ -93,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --test-filter) SELECTED_TESTS_PATTERN="$2"; shift 2;;
     --commands) GENERATE_COMMANDS=true; shift;;
     --analyze) RUN_ANALYZER=true; shift;;
+    --asan) RUN_ASAN=true; shift;;
     --set) EXTRA_SETTINGS+=("$2"); shift 2;;
     --scheme) SCHEME_NAME="$2"; shift 2;;
     --config) CONFIGURATION="$2"; shift 2;;
@@ -123,14 +127,18 @@ preflight() {
   # When running test-only we don't need xcodebuild or the Xcode project present.
   if ! $TEST_ONLY; then
     require_cmd xcodebuild
-    # The Xcode project is generated from project.yml (XcodeGen) and is NOT
+    # The Xcode project is generated from project.yml (or project.adhoc.yml) and is NOT
     # committed, so xcodegen is a hard build prerequisite. Regenerating also
     # picks up added/removed source files; output is deterministic, so this is
     # a no-op when nothing changed.
-    if [[ -f "project.yml" ]]; then
+    local spec="project.yml"
+    if $ADHOC; then
+      spec="project.adhoc.yml"
+    fi
+    if [[ -f "${spec}" ]]; then
       require_cmd xcodegen
-      log "Regenerating ${PROJECT_NAME}.xcodeproj from project.yml..."
-      xcodegen generate --quiet || { err "xcodegen generate failed"; exit 1; }
+      log "Regenerating ${PROJECT_NAME}.xcodeproj from ${spec}..."
+      xcodegen generate --spec "${spec}" --quiet || { err "xcodegen generate failed"; exit 1; }
     fi
     [[ -f "${PROJECT_NAME}.xcodeproj/project.pbxproj" ]] || { err "Run from project root (missing ${PROJECT_NAME}.xcodeproj)"; exit 1; }
   fi
@@ -183,6 +191,11 @@ run_tests() {
   # Test build/run directory (tests live next to this script in the ASFW folder)
   local TESTS_DIR="${SCRIPT_DIR}/tests"
   local TEST_BUILD_DIR="${BUILD_DIR}/tests_build"
+  # A sanitized build is a different binary; keep it out of the normal tree so
+  # switching between them does not silently reuse objects.
+  if [[ "${RUN_ASAN}" == true ]]; then
+    TEST_BUILD_DIR="${BUILD_DIR}/tests_asan"
+  fi
 
   if [[ ! -d "${TESTS_DIR}" ]]; then
     err "Tests directory not found: ${TESTS_DIR} (script dir: ${SCRIPT_DIR})"; return 2
@@ -192,8 +205,19 @@ run_tests() {
   require_cmd ctest
 
   log "Configuring tests (cmake) in ${TEST_BUILD_DIR}..."
+  local asan_flag="-DASFW_ENABLE_ASAN=OFF"
+  if [[ "${RUN_ASAN}" == true ]]; then
+    asan_flag="-DASFW_ENABLE_ASAN=ON"
+    # Without these a sanitizer report is printed and the test still exits 0,
+    # so ctest would call it a pass.
+    export ASAN_OPTIONS="abort_on_error=1:halt_on_error=1:print_stacktrace=1"
+    export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
+    log "AddressSanitizer + UBSan enabled for this test run"
+  fi
+
   cmake -S "${TESTS_DIR}" -B "${TEST_BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE="${CONFIGURATION}" \
+    "${asan_flag}" \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null
 
   log "Building tests..."

@@ -14,7 +14,9 @@
 
 #pragma once
 
-#include "../Duplex/IDuplexDeviceControl.hpp"
+#include "BeBoBMixerMap.hpp"
+
+#include "../Duplex/FamilyDriver.hpp"
 #include "../IDeviceProtocol.hpp"
 #include "../../../Protocols/Ports/FireWireBusPort.hpp"
 #include "../../../Protocols/AVC/CMP/CMPClient.hpp"
@@ -25,21 +27,15 @@
 #include <functional>
 #include <vector>
 
-namespace ASFW::Protocols::AVC {
-class FCPTransport;
-}
-
 namespace ASFW::IRM {
 class IRMClient;
 }
 
-#include "../../../Protocols/AVC/IAVCCommandSubmitter.hpp"
 
 namespace ASFW::Audio::BeBoB {
 
 class BeBoBProtocol : public IDeviceProtocol,
-                      public IDuplexDeviceControl,
-                      public Protocols::AVC::IAVCCommandSubmitter {
+                      public FamilyDriver {
 public:
     BeBoBProtocol(Protocols::Ports::FireWireBusOps& busOps,
                   Protocols::Ports::FireWireBusInfo& busInfo,
@@ -50,44 +46,70 @@ public:
 
     IOReturn Initialize() override;
     IOReturn Shutdown() override;
-    IDuplexDeviceControl* AsDuplexDeviceControl() noexcept override { return this; }
-    const IDuplexDeviceControl* AsDuplexDeviceControl() const noexcept override { return this; }
+    FamilyDriver* AsFamilyDriver() noexcept override { return this; }
     void UpdateRuntimeContext(const Discovery::DeviceRouteToken& route,
-                              Protocols::AVC::FCPTransport* transport) override;
+                              std::shared_ptr<ASFW::AVC::IAvcUnit> avcUnit) override;
 
-    // IAVCCommandSubmitter
-    void SubmitCommand(const Protocols::AVC::AVCCdb& cdb, Protocols::AVC::AVCCompletion completion) override;
-
-    // IDuplexDeviceControl — general BeBoB lifecycle
-    void PrepareDuplex(const AudioDuplexChannels& channels,
-                       const AudioClockConfig& desiredClock,
-                       PrepareCallback callback) override;
-    void SetAssignedChannels(const AudioDuplexChannels& channels) noexcept override;
-    void ProgramRx(StageCallback callback) override;
-    void ProgramTxAndEnableDuplex(StageCallback callback) override;
-    void ConfirmDuplexStart(ConfirmCallback callback) override;
-    void ApplyClockConfig(const AudioClockConfig& desiredClock,
-                          ClockApplyCallback callback) override;
-    void ReadDuplexHealth(HealthCallback callback) override;
-    void DisconnectPlayback(VoidCallback callback) override;
-    void DisconnectCapture(VoidCallback callback) override;
-    void BreakBothConnections(VoidCallback callback) override;
+    // The general BeBoB lifecycle, as callback chains over CMP and AV/C. The
+    // FamilyDriver steps below start them and wait; tests drive them directly.
+    // Virtual where a subclass replaces a stage: Fireworks (prepare, clock,
+    // confirm) and M-Audio special firmware (clock, confirm).
+    virtual void PrepareDuplex(const AudioDuplexChannels& channels,
+                               const AudioClockConfig& desiredClock,
+                               PrepareCallback callback);
+    void SetAssignedChannels(const AudioDuplexChannels& channels) noexcept;
+    void ProgramRx(StageCallback callback);
+    void ProgramTxAndEnableDuplex(StageCallback callback);
+    virtual void ConfirmDuplexStart(ConfirmCallback callback);
+    virtual void ApplyClockConfig(const AudioClockConfig& desiredClock,
+                                  ClockApplyCallback callback);
+    void ReadDuplexHealth(HealthCallback callback);
+    void DisconnectPlayback(VoidCallback callback);
+    void DisconnectCapture(VoidCallback callback);
+    void BreakBothConnections(VoidCallback callback);
     [[nodiscard]] IOReturn StopDuplex() override;
-    [[nodiscard]] IRM::IRMClient* GetIRMClient() const override { return irmClient_; }
+
+    // FamilyDriver: each step starts the callback chain above and waits for it
+    // (FamilyStageWait.hpp), so the chains and their wire traffic are unchanged.
+    void SetTeardownCancelToken(const std::atomic<bool>* cancel) noexcept override;
+    [[nodiscard]] IOReturn LoadGeometry() override;
+    [[nodiscard]] std::optional<AudioStreamRuntimeCaps> RuntimeCaps() const override;
+    [[nodiscard]] std::expected<DuplexPrepareResult, IOReturn> Configure(
+        const AudioDuplexChannels& channels, const AudioClockConfig& clock) override;
+    std::expected<AudioDuplexChannels, IOReturn> AssignChannels(const AudioDuplexChannels& channels) override;
+    [[nodiscard]] std::expected<DuplexHealthResult, IOReturn> ReadHealth(uint32_t timeoutMs) override;
+    [[nodiscard]] std::expected<DuplexStageResult, IOReturn> ArmDeviceRx() override;
+    [[nodiscard]] std::expected<DuplexStageResult, IOReturn> ArmDeviceTxAndEnable() override;
+    [[nodiscard]] std::expected<DuplexConfirmResult, IOReturn> Confirm() override;
+    [[nodiscard]] std::expected<DuplexClockApplyResult, IOReturn> ApplyClockIdle(
+        const AudioClockConfig& clock) override;
+    [[nodiscard]] IOReturn DisconnectPlayback() override;
+    [[nodiscard]] IOReturn DisconnectCapture() override;
+    [[nodiscard]] IOReturn BreakConnections() override;
+    // Linux bebob_stream.c:609-610: stop the AMDTP domain before breaking
+    // connections. Host reservations remain until the device BREAK completes.
+    [[nodiscard]] StopPolicy GetStopPolicy() const noexcept override {
+        return {.stopHostContextsBeforeDevice = true};
+    }
+    [[nodiscard]] IOReturn Stop() override;
 
 protected:
     // Device-specific overrides (pure virtual).
     [[nodiscard]] virtual const char* DeviceName() const = 0;
     [[nodiscard]] virtual AudioStreamRuntimeCaps DeviceCaps() const = 0;
     [[nodiscard]] virtual std::vector<uint32_t> SupportedRates() const = 0;
-    virtual void ReadClockHealth(HealthCallback callback) = 0;
+    virtual void ReadClockHealth(HealthCallback callback);
 
-    // Async mixer configuration. Override in devices that need FB mixer programming
-    // at stream start (e.g. Phase88 ships muted). Default: no-op (matches Linux
-    // bebob_stream.c behavior — no mixer programming at start).
+    // Async mixer configuration at stream start. Default: no-op (matches Linux
+    // bebob_stream.c, which programs no mixer). GenericAvcProtocol runs a
+    // startup MixerMap when its catalog row supplies one (the PHASE 88 ships muted).
     using MixerCompletion = std::function<void(IOReturn)>;
     enum class MixerFailurePolicy { kRequired, kBestEffort };
     virtual void ConfigureMixer(MixerFailurePolicy policy, MixerCompletion completion);
+
+    /// Program a device's startup mixer: selectors, then mutes, then volumes,
+    /// one CONTROL at a time. kRequired stops at the first failure.
+    void RunMixerMap(const MixerMap& map, MixerFailurePolicy policy, MixerCompletion completion);
 
     // FB framework helpers — async FCP operations for subclasses.
     void SetSelectorBlock(uint8_t fbId, uint8_t value, MixerCompletion completion);
@@ -98,12 +120,18 @@ protected:
     // non-zero stream plugs.
     [[nodiscard]] virtual uint8_t StreamPlug(bool isInput) const { return 0; }
 
+    /// Optional delay between output and input CONTROL signal-format writes.
+    /// Special M-Audio firmware needs a 100 ms gap; ordinary BeBoB devices keep
+    /// the existing immediate sequence.
+    [[nodiscard]] virtual uint32_t SignalFormatInterlockMs() const noexcept { return 0; }
+
     // Rate validation. Default rejects anything not in SupportedRates(); override for
     // devices with format-set logic.
     [[nodiscard]] virtual bool IsRateSupported(uint32_t hz) const;
 
     // Exactly-once completion guard for the async ApplyClockConfig chain.
     struct ClockApplyEpoch {
+        Discovery::DeviceRouteToken routeAtStart{};
         FW::Generation generation{FW::Generation{0}};
         Scheduling::TimerToken settleTimer{Scheduling::kInvalidTimerToken};
         std::atomic<bool> completed{false};
@@ -114,6 +142,7 @@ protected:
 
     void FinishClockApply(ClockApplyEpoch* epoch, IOReturn status);
     void CancelClockApply();
+    void CancelSignalFormatInterlock() noexcept;
 
     [[nodiscard]] CMP::CMPDevice CurrentCMPDevice() const noexcept;
     [[nodiscard]] IOReturn ResetEpochIfNeeded() noexcept;
@@ -122,7 +151,8 @@ protected:
     Discovery::DeviceRouteToken route_{};
     IRM::IRMClient* irmClient_{nullptr};
     CMP::CMPClient* cmpClient_{nullptr};
-    Protocols::AVC::FCPTransport* fcpTransport_{nullptr};
+    /// The device's AV/C unit (owned lease; every frame goes through its Submit).
+    std::shared_ptr<ASFW::AVC::IAvcUnit> avcUnit_;
     Scheduling::ITimerScheduler* timerScheduler_{nullptr};
     uint64_t preparedRouteEpoch_{0};
     AudioDuplexChannels duplexChannels_{};
@@ -132,8 +162,13 @@ protected:
 
     // In-flight clock-apply epoch. Non-nullptr while ApplyClockConfig is settling.
     ClockApplyEpoch* activeClockApply_{nullptr};
+    Scheduling::TimerToken signalFormatInterlockTimer_{Scheduling::kInvalidTimerToken};
+    std::shared_ptr<std::function<void(IOReturn)>> signalFormatInterlockCompletion_;
 
 private:
+    // Service teardown: the stage waits give up once it reads true.
+    const std::atomic<bool>* teardownCancel_{nullptr};
+
     void EnsurePlugFree(CMP::PCRDirection dir, uint8_t plug, std::function<void(IOReturn)> cb);
     void ProgramSignalFormat(const AudioClockConfig& desiredClock,
                              std::function<void(IOReturn)> completion);

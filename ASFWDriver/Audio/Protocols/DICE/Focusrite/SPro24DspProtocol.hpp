@@ -50,11 +50,18 @@ public:
     /// @param busOps     FireWire bus operations port
     /// @param busInfo    FireWire bus info port
     /// @param route      Current registry-issued device route
+    /// @param waitClock  Paces the bring-up's waits (CLOCK_ACCEPTED, clock
+    ///                   lock, source-lock confirm). Deliberately required: a
+    ///                   missing time source made every wait that needed a
+    ///                   second poll fail at once, which is how this protocol
+    ///                   ran until the S0 golden traces exposed it.
     SPro24DspProtocol(Protocols::Ports::FireWireBusOps& busOps,
                       Protocols::Ports::FireWireBusInfo& busInfo,
                       Discovery::DeviceRegistry& routeRegistry,
                       const Discovery::DeviceRouteToken& route,
-                      ::ASFW::IRM::IRMClient* irmClient = nullptr);
+                      ::ASFW::IRM::IRMClient* irmClient,
+                      DiceWaitClock& waitClock,
+                      DiceNotificationRouter* notifications);
     
     /// Initialize protocol (generic DICE init is delegated to the TCAT core)
     IOReturn Initialize() override;
@@ -64,27 +71,25 @@ public:
     
     /// Get device name
     const char* GetName() const override { return "Focusrite Saffire Pro 24 DSP"; }
-    Audio::IDuplexDeviceControl* AsDuplexDeviceControl() noexcept override {
-        return tcat_.AsDuplexDeviceControl();
-    }
-    const Audio::IDuplexDeviceControl* AsDuplexDeviceControl() const noexcept override {
-        return tcat_.AsDuplexDeviceControl();
-    }
+    Audio::FamilyDriver* AsFamilyDriver() noexcept override { return tcat_.AsFamilyDriver(); }
     
     /// Device has DSP effects
     bool HasDsp() const override { return true; }
 
     bool GetRuntimeAudioStreamCaps(AudioStreamRuntimeCaps& outCaps) const override;
+    std::shared_ptr<const std::vector<Runtime::RateFormation>> RateFormations() const override {
+        return tcat_.RateFormations();
+    }
+    void ReadRateObservation(std::function<void(IOReturn, RateHardwareObservation)> callback) override {
+        tcat_.ReadRateObservation(std::move(callback));
+    }
+    void EnsureRuntimeStreamGeometry(std::function<void(IOReturn)> callback) override {
+        tcat_.EnsureRuntimeStreamGeometry(std::move(callback));
+    }
     
-    /// Configure device for 48kHz duplex streaming (TX ch0 / RX ch1).
-    void PrepareDuplex48k(const AudioDuplexChannels& channels, VoidCallback callback) override;
-    void ProgramRxForDuplex48k(VoidCallback callback) override;
-    void ProgramTxAndEnableDuplex48k(VoidCallback callback) override;
-    void ConfirmDuplex48kStart(VoidCallback callback) override;
     IOReturn StopDuplex() override;
-    ::ASFW::IRM::IRMClient* GetIRMClient() const override { return tcat_.GetIRMClient(); }
     void UpdateRuntimeContext(const Discovery::DeviceRouteToken& route,
-                              Protocols::AVC::FCPTransport* transport) override;
+                              std::shared_ptr<ASFW::AVC::IAvcUnit> avcUnit) override;
     
     // ========================================================================
     // Async Initialization
@@ -133,14 +138,6 @@ public:
     
     /// Set output group state
     void SetOutputGroupState(const OutputGroupState& state, VoidCallback callback);
-
-    // ========================================================================
-    // TODO: Test only - Stream Control
-    // ========================================================================
-    
-    /// Start isochronous TX stream for testing (48kHz, channel 0)
-    /// This is a simplified test - real implementation would handle IRM allocation
-    void StartStreamTest(VoidCallback callback);
 
 private:
     TCAT::DICETcatProtocol tcat_;

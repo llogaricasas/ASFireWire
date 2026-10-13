@@ -1,5 +1,7 @@
 #pragma once
 
+#include "PcmSlotMap.hpp"
+
 #include <cstdint>
 
 namespace ASFW::Protocols::Audio::AMDTP {
@@ -24,6 +26,8 @@ enum class PcmSlotEncoding : uint8_t {
     Am824MBLA = 0,
     RawSigned24In32BE = 1,
     RawSigned24In32LE = 2,
+    /// Signed 24-bit sample in bits 31:8 of a little-endian quadlet.
+    RawPcm24Upper24In32LE = 3,
 };
 
 enum class DbsPolicy : uint8_t {
@@ -41,6 +45,7 @@ struct AmdtpStreamConfig final {
     uint8_t midiSlots{0};
 
     uint8_t fmt{0x10};
+    bool cipSph{false};
     uint8_t fdf{0x02};
 
     uint8_t framesPerDataPacket{8};
@@ -51,6 +56,12 @@ struct AmdtpStreamConfig final {
     // stream 0 reads channels [0, pcmChannels), stream 1 reads [16, 16+pcmChannels),
     // etc. Single-stream devices keep 0.
     uint8_t sourceChannelOffset{0};
+
+    /// Content framing. Defaults to the existing 8-byte IEC 61883 CIP header.
+    enum class PacketFraming : uint8_t { Cip = 0, Headerless = 1 };
+    PacketFraming packetFraming{PacketFraming::Cip};
+    uint8_t isochTag{1};
+    uint8_t isochSync{0};
 };
 
 struct AmdtpTxPolicy final {
@@ -62,6 +73,19 @@ struct AmdtpTxPolicy final {
     bool initializeNonAudioSlots{true};
     bool preserveFdfInNoDataPackets{false};
     bool emptyPacketsDuringIdle{false};
+    /// Some device families require a full blocking packet at cadence NO-DATA
+    /// phases. Those packets carry the scheduled blocks but use this audio-slot
+    /// label instead of PCM; non-audio slots retain defaultNonAudioSlotWord.
+    bool cadencePacketsCarryDataBlocks{false};
+    uint32_t cadenceSlotWord{0xCF000000};
+    /// Write the DBC of the block *after* this packet's last one rather than of its
+    /// first, i.e. advance before writing. IEC 61883-1 counts from the first block; MOTU
+    /// devices count the end, and Linux sets CIP_DBC_IS_END_EVENT on every MOTU transmit
+    /// stream for it (amdtp-motu.c:465, applied at amdtp-stream.c:1040-1046).
+    bool dbcIsEndEvent{false};
+
+    /// Logical host PCM channel -> AM824 slot mapping.
+    ASFW::Audio::Wire::PcmSlotMap playbackChannelMap{};
 };
 
 struct HostAudioBufferView final {
@@ -74,16 +98,20 @@ struct HostAudioBufferView final {
 };
 
 struct TxPacketSlotView final {
-    uint32_t packetIndex{0};
+    uint64_t packetIndex{0};
     uint8_t* bytes{nullptr};
     uint32_t capacityBytes{0};
 };
 
 struct PreparedTxPacket final {
-    uint32_t packetIndex{0};
+    uint64_t packetIndex{0};
     uint32_t byteCount{0};
 
     bool isData{false};
+    enum class Operation : uint8_t { Packet = 0, SkipCycle = 1 };
+    Operation operation{Operation::Packet};
+    uint8_t isochTag{1};
+    uint8_t isochSync{0};
     uint8_t dbc{0};
     uint16_t syt{0xFFFF};
 
@@ -107,7 +135,15 @@ struct AmdtpTimingState final {
     uint16_t nextDataSyt{0xFFFF};
     uint16_t replayDataBlocks{0};
     bool replayValid{false};
-    uint64_t nextAudioFrame{0};
+    /// Bus cycle (0..7999) this packet is transmitted in. MOTU bases each block's SPH on
+    /// it (write_sph, amdtp-motu.c:373-393); families that time by SYT ignore it.
+    uint32_t transmitCycle{0};
+    bool transmitCycleValid{false};
+    /// The same transmit time in full: 24.576 MHz ticks on the 8-second
+    /// cycle-timer offset domain, keeping the sub-cycle phase of the completion
+    /// stamp it was projected from. Valid with transmitCycleValid. A device
+    /// clock that runs between cycle boundaries (MOTU SPH) is seeded from it.
+    int64_t transmitTicks{0};
 };
 
 } // namespace ASFW::Protocols::Audio::AMDTP
@@ -122,6 +158,17 @@ enum class StreamMode : uint8_t {
 enum class AudioWireFormat : uint8_t {
     kAM824 = 0,
     kRawPcm24In32 = 1,
+    // MOTU protocol-v2: 3-byte PCM chunks from byte offset 10 of a data block, behind an
+    // SPH quadlet and two message chunks. Not a quadlet-slot format, so the slot-based
+    // encode/decode helpers do not apply -- see Audio/Wire/MOTU.
+    kMotuPacked = 2,
+    /// Headerless RME-style signed 24-in-32 with significant bits at [31:8].
+    kRawPcm24Upper24In32LE = 3,
+};
+
+enum class AudioPacketFraming : uint8_t {
+    kCip = 0,
+    kHeaderless = 1,
 };
 
 } // namespace ASFW::Encoding

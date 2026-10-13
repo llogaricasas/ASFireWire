@@ -77,6 +77,10 @@ class IDeviceManager;
 class IUnitRegistry;
 } // namespace ASFW::Discovery
 
+namespace ASFW::Audio::DICE {
+class DiceNotificationRouter;
+} // namespace ASFW::Audio::DICE
+
 namespace ASFW::Protocols::AVC {
 class AVCDiscovery;
 class IAVCDiscovery;
@@ -140,6 +144,9 @@ class ControllerCore final : private Role::IPhyConfigReset,
         // controller can trigger creation from its discovery path, where bus + IRM are
         // already in scope. The Audio layer holds the same shared instance by reference.
         std::shared_ptr<ASFW::Audio::AudioRuntimeRegistry> audioRuntimeRegistry;
+        // Attributes DICE notification writes to their device. Read by the
+        // local request dispatch; the DICE protocols and backend register with it.
+        std::shared_ptr<ASFW::Audio::DICE::DiceNotificationRouter> diceNotifications;
 
         std::shared_ptr<ASFW::Protocols::AVC::AVCDiscovery> avcDiscovery;
         std::shared_ptr<ASFW::Protocols::AVC::FCPResponseRouter> fcpResponseRouter;
@@ -258,6 +265,8 @@ class ControllerCore final : private Role::IPhyConfigReset,
     Bus::BroadcastChannelCSR* GetBroadcastChannel() const { return broadcastChannel_.get(); }
 
   private:
+    friend class ControllerCoreTestPeer;
+
     void LogBuildBanner() const;
     kern_return_t InitializeBusResetAndDiscovery();
     kern_return_t PerformSoftReset() const;
@@ -269,6 +278,7 @@ class ControllerCore final : private Role::IPhyConfigReset,
                              uint32_t currentMask,
                              uint32_t events) const;
     void HandleFaultInterrupts(uint32_t events);
+    void HandleCycleTooLong();
     void NotifyBusResetCoordinator(uint32_t events, uint64_t timestamp) const;
     void DispatchAsyncInterrupts(uint32_t events) const;
     void LogBusResetCompletionEvents(uint32_t events, uint64_t timestamp) const;

@@ -1,5 +1,7 @@
 #include "DiceTxStreamEngine.hpp"
 
+#include <span>
+
 namespace ASFW::Protocols::Audio::DICE {
 
 AMDTP::AmdtpStreamConfig DiceStreamConfigMapper::ToAmdtpConfig(
@@ -14,13 +16,21 @@ AMDTP::AmdtpStreamConfig DiceStreamConfigMapper::ToAmdtpConfig(
     config.pcmChannels = streamConfig.pcmChannels;
     config.midiSlots = streamConfig.midiSlots;
     config.fmt = streamConfig.fmt;
+    config.cipSph = streamConfig.cipSph;
     config.fdf = streamConfig.fdf;
     config.framesPerDataPacket = streamConfig.framesPerDataPacket;
     config.sourceChannelOffset = streamConfig.sourceChannelOffset;
-    // Compute the true max packet size: CIP headers (8 bytes) + frames × DBS × 4 bytes/slot.
+    config.packetFraming = (streamConfig.packetFraming ==
+                            ASFW::Encoding::AudioPacketFraming::kHeaderless)
+                               ? AMDTP::AmdtpStreamConfig::PacketFraming::Headerless
+                               : AMDTP::AmdtpStreamConfig::PacketFraming::Cip;
+    config.isochTag = config.packetFraming == AMDTP::AmdtpStreamConfig::PacketFraming::Headerless
+                          ? 0 : 1;
+    config.isochSync = 0;
+    // Compute the true max packet size: framing header + frames × DBS × 4 bytes/slot.
     // Do not use the AmdtpStreamConfig default (512) — it is too small for high-channel
     // devices (e.g. a 24-channel device with DBS=24 needs 776 bytes at 8 fpd).
-    config.maxPacketBytes = 8u +
+    config.maxPacketBytes = (config.packetFraming == AMDTP::AmdtpStreamConfig::PacketFraming::Cip ? 8u : 0u) +
         static_cast<uint32_t>(streamConfig.framesPerDataPacket) * streamConfig.dbs * 4u;
     return config;
 }
@@ -31,10 +41,14 @@ bool DiceTxStreamEngine::Configure(const ASFW::Isoch::Audio::IAudioStreamProfile
         return false;
     }
 
-    const ASFW::Isoch::Audio::AudioStreamTxPolicy txPolicy = profile.TxStreamPolicy();
+    auto txPolicy = profile.TxStreamPolicy();
+    if (txConfig.hasPcmSlotMap) {
+        if (!txConfig.pcmSlotMap.FitsWithin(txConfig.pcmChannels, txConfig.dbs)) return false;
+        txPolicy.playbackChannelMap = txConfig.pcmSlotMap;
+    }
     const AMDTP::AmdtpStreamConfig amdtpConfig =
         DiceStreamConfigMapper::ToAmdtpConfig(txConfig);
-    const AMDTP::AmdtpTxPolicy policy = BuildTxPolicy(txPolicy);
+    AMDTP::AmdtpTxPolicy policy = BuildTxPolicy(txPolicy);
 
     const uint32_t slotCount =
         static_cast<uint32_t>(sizeof(timelineSlots_) / sizeof(timelineSlots_[0]));
@@ -63,23 +77,38 @@ void DiceTxStreamEngine::BindSlotProvider(
 void DiceTxStreamEngine::ResetForStart(uint8_t initialDbc,
                                        uint64_t initialAudioFrame) noexcept {
     timeline_.Reset();
-    packetizer_.Reset(initialDbc, initialAudioFrame);
+    nextAudioFrame_ = initialAudioFrame;
+    frameCursorAligned_ = false;
+    consecutiveTimingReverts_ = 0;
+    timingLossReported_ = false;
+    ++cursorEpoch_;
+    packetizer_.Reset(initialDbc);
 }
 
 bool DiceTxStreamEngine::AlignFrameCursorOnce(uint64_t frameIndex) noexcept {
-    return packetizer_.AlignFrameCursorOnce(frameIndex);
+    if (frameCursorAligned_) {
+        return false;
+    }
+    nextAudioFrame_ = frameIndex;
+    frameCursorAligned_ = true;
+    ++cursorEpoch_;
+    return true;
 }
 
 void DiceTxStreamEngine::ReArmFrameCursorAlignment() noexcept {
-    packetizer_.ReArmFrameCursorAlignment();
+    if (!frameCursorAligned_) {
+        return;
+    }
+    frameCursorAligned_ = false;
+    ++cursorEpoch_;
 }
 
 bool DiceTxStreamEngine::IsFrameCursorAligned() const noexcept {
-    return packetizer_.IsFrameCursorAligned();
+    return frameCursorAligned_;
 }
 
 TxSlotPrepareResult DiceTxStreamEngine::PrepareNextTransmitSlot(
-    uint32_t packetIndex, const AMDTP::AmdtpTimingState& timing) noexcept {
+    uint64_t packetIndex, const AMDTP::AmdtpTimingState& timing) noexcept {
     if (slotProvider_ == nullptr) {
         return TxSlotPrepareResult::kSlotProviderUnavailable;
     }
@@ -90,9 +119,44 @@ TxSlotPrepareResult DiceTxStreamEngine::PrepareNextTransmitSlot(
         return TxSlotPrepareResult::kSlotAcquireFailed;
     }
 
+    const bool cadenceData = packetizer_.NextPacketWouldCarryData();
+    const bool isData = (timing.disposition == AMDTP::AmdtpPacketDisposition::Data) &&
+                        (timing.replayValid ? timing.replayDataBlocks != 0 : cadenceData);
+    const uint8_t frames = isData
+        ? static_cast<uint8_t>(timing.replayValid ? timing.replayDataBlocks : packetizer_.CurrentCycleDataFrames())
+        : 0;
+
+    AMDTP::TxPresentationPlan plan{};
+    plan.epoch = cursorEpoch_;
+    plan.cycleOrdinal = packetIndex;
+    plan.firstAudioFrame = nextAudioFrame_;
+    plan.frameCount = frames;
+    // No absolute presentation timestamp is available here. A transmit cycle
+    // index is neither a tick count nor the device presentation time.
+    plan.presentationBusTicks = 0;
+    plan.disposition = isData ? AMDTP::AmdtpPacketDisposition::Data : AMDTP::AmdtpPacketDisposition::NoData;
+
     AMDTP::PreparedTxPacket packet{};
-    if (!packetizer_.PrepareNextPacket(slot, timing, packet)) {
+    auto contentTiming = timing;
+    if (IsSytUnaware()) contentTiming.txClockValid = false;
+    if (!packetizer_.PrepareNextPacket(slot, contentTiming, plan, packet)) {
         return TxSlotPrepareResult::kPacketizerRejected;
+    }
+
+    if (timingStamper_ != nullptr && packet.isData && packet.framesInPacket > 0) {
+        const auto result = timingStamper_->StampPacket(slot, packet, timing);
+        if (result == ::ASFW::Audio::TxTimingStampResult::kTimingUnavailable) {
+            packetizer_.RevertToNoData(slot, packet);
+            counters_.timingUnavailableReverts.fetch_add(1, std::memory_order_relaxed);
+            if (consecutiveTimingReverts_ < kMaxConsecutiveTimingReverts) ++consecutiveTimingReverts_;
+            if (consecutiveTimingReverts_ >= kMaxConsecutiveTimingReverts && !timingLossReported_ && timingLossCallback_) {
+                timingLossReported_ = timingLossCallback_();
+                if (!timingLossReported_) consecutiveTimingReverts_ = 0;
+            }
+        } else {
+            consecutiveTimingReverts_ = 0;
+            timingLossReported_ = false;
+        }
     }
 
     if (!slotProvider_->PublishSlot(packet)) {
@@ -101,6 +165,7 @@ TxSlotPrepareResult DiceTxStreamEngine::PrepareNextTransmitSlot(
 
     counters_.packetsPrepared.fetch_add(1, std::memory_order_relaxed);
     if (packet.isData) {
+        nextAudioFrame_ += packet.framesInPacket;
         counters_.dataPacketsPrepared.fetch_add(1, std::memory_order_relaxed);
     } else {
         counters_.noDataPacketsPrepared.fetch_add(1, std::memory_order_relaxed);
@@ -112,10 +177,12 @@ bool DiceTxStreamEngine::NextPacketWouldCarryData() const noexcept {
     return packetizer_.NextPacketWouldCarryData();
 }
 
-void DiceTxStreamEngine::WriteHostOutputFloat32(
+void DiceTxStreamEngine::FillFromHostOutput(
     const AMDTP::HostAudioBufferView& hostBuffer,
-    uint64_t completionCursor) noexcept {
-    payloadWriter_.WriteFloat32Interleaved(hostBuffer, completionCursor);
+    uint64_t firstWritablePacket) noexcept {
+    if (activePayloadWriter_ != nullptr) {
+        activePayloadWriter_->WriteFloat32Interleaved(hostBuffer, firstWritablePacket);
+    }
 }
 
 AMDTP::AmdtpPacketTimeline& DiceTxStreamEngine::Timeline() noexcept {
@@ -130,26 +197,24 @@ const AMDTP::AmdtpStreamConfig& DiceTxStreamEngine::StreamConfig() const noexcep
     return packetizer_.StreamConfig();
 }
 
-AMDTP::AmdtpTxPacketizerTelemetrySnapshot
-DiceTxStreamEngine::PacketizerTelemetrySnapshot() const noexcept {
-    return packetizer_.TelemetrySnapshot();
-}
-
 const DiceTxEngineCounters& DiceTxStreamEngine::Counters() const noexcept {
     return counters_;
-}
-
-const AMDTP::AmdtpPayloadWriterCounters&
-DiceTxStreamEngine::PayloadWriterCounters() const noexcept {
-    return payloadWriter_.Counters();
 }
 
 AMDTP::AmdtpTxPolicy DiceTxStreamEngine::BuildTxPolicy(
     const ASFW::Isoch::Audio::AudioStreamTxPolicy& streamPolicy) const noexcept {
     AMDTP::AmdtpTxPolicy policy{};
-    policy.hostToDevicePcmEncoding = (streamPolicy.hostToDevicePcmEncoding == ASFW::Encoding::AudioWireFormat::kRawPcm24In32)
-                                     ? AMDTP::PcmSlotEncoding::RawSigned24In32BE
-                                     : AMDTP::PcmSlotEncoding::Am824MBLA;
+    switch (streamPolicy.hostToDevicePcmEncoding) {
+        case ASFW::Encoding::AudioWireFormat::kRawPcm24In32:
+            policy.hostToDevicePcmEncoding = AMDTP::PcmSlotEncoding::RawSigned24In32BE;
+            break;
+        case ASFW::Encoding::AudioWireFormat::kRawPcm24Upper24In32LE:
+            policy.hostToDevicePcmEncoding = AMDTP::PcmSlotEncoding::RawPcm24Upper24In32LE;
+            break;
+        default:
+            policy.hostToDevicePcmEncoding = AMDTP::PcmSlotEncoding::Am824MBLA;
+            break;
+    }
     policy.dbsPolicy = streamPolicy.variableDbs
                        ? AMDTP::DbsPolicy::VariablePerPacket
                        : AMDTP::DbsPolicy::Constant;
@@ -157,7 +222,12 @@ AMDTP::AmdtpTxPolicy DiceTxStreamEngine::BuildTxPolicy(
     policy.initializeNonAudioSlots = streamPolicy.initializeNonAudioSlots;
     policy.preserveFdfInNoDataPackets = streamPolicy.preserveFdfInNoDataPackets;
     policy.emptyPacketsDuringIdle = streamPolicy.emptyPacketsDuringIdle;
+    policy.cadencePacketsCarryDataBlocks =
+        streamPolicy.cadencePacketsCarryDataBlocks;
+    policy.cadenceSlotWord = streamPolicy.cadenceSlotWord;
+    policy.dbcIsEndEvent = streamPolicy.dbcIsEndEvent;
     policy.clearPayloadBeforeExposure = true;
+    policy.playbackChannelMap = streamPolicy.playbackChannelMap;
     return policy;
 }
 

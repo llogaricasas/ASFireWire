@@ -42,8 +42,8 @@ class BusResetCoordinatorTestPeer {
         coordinator.selfIdLatch_.stickyComplete = sticky;
     }
 
-    static void ClearConsumedSelfIDInterrupts(BusResetCoordinator& coordinator) {
-        coordinator.ClearConsumedSelfIDInterrupts();
+    static void ConsumeSelfIDLatch(BusResetCoordinator& coordinator) {
+        coordinator.ConsumeSelfIDLatch();
     }
 
     static void RequestRecoveryReset(BusResetCoordinator& coordinator, bool longReset = false) {
@@ -360,7 +360,6 @@ struct BusResetTestRig {
         hardware.SetTestInitiateBusResetResult(success);
     }
 
-  private:
     void TriggerIrq(uint32_t intEvent) {
         hardware.SetTestRegister(Register32::kIntEvent,
                                  hardware.GetTestRegister(Register32::kIntEvent) | intEvent);
@@ -397,6 +396,45 @@ TEST(BusResetCoordinatorTests, StableResetPublishesTopologyExactlyOnce) {
     EXPECT_TRUE(std::find(operations.begin(), operations.end(),
                           HardwareInterface::TestOperation::SendPhyGlobalResume) ==
                 operations.end());
+}
+
+// Regression (2026-09-24, LS-9000): the AT request context kept ACTIVE after
+// RUN was cleared and the reset FSM polled G_ATInactive() forever — no
+// topology, no discovery, no log line. Linux context_stop() bounds that wait
+// and proceeds (ohci.c:1164-1182); so must both waits here.
+TEST(BusResetCoordinatorTests, StuckActiveATContextDoesNotStallResetForever) {
+    BusResetTestRig rig;
+    rig.Initialize();
+    rig.hardware.SetTestRegister(
+        Register32FromOffsetUnchecked(DMAContextHelpers::AsReqTrContextControlSet),
+        kContextControlActiveBit);
+
+    rig.StartResetCycle();
+    const auto rawCapture = MakeRawSelfIDCapture(
+        7U, {MakeBaseSelfID(0U, 63U, true, true), MakeBaseSelfID(1U, 63U)});
+    rig.PrimeCapture(rawCapture, 7U);
+    rig.TriggerStickyCompletion();
+
+    // Inside the bound: still waiting, nothing published.
+    rig.AdvanceMs(50U);
+    EXPECT_EQ(rig.coordinator.GetState(), BusResetCoordinator::State::QuiescingAT);
+    EXPECT_TRUE(rig.publishedTopologies.empty());
+
+    // Past the bound for QuiescingAT and again for ClearingBusReset, plus the
+    // Apple scan delay: the reset completes and topology is published once.
+    rig.AdvanceMs(100U);
+    rig.AdvanceMs(150U);
+    rig.AdvanceMs(150U);
+
+    ASSERT_EQ(rig.publishedTopologies.size(), 1U);
+    EXPECT_EQ(rig.publishedTopologies.front().generation, 7U);
+    EXPECT_EQ(rig.coordinator.GetState(), BusResetCoordinator::State::Idle);
+    EXPECT_EQ(rig.coordinator.Diagnostics().lastRecoveryReasonCode,
+              BusResetCoordinator::RecoveryReasonCode::ATQuiesceTimeout);
+    ASSERT_TRUE(rig.coordinator.Metrics().lastFailureReason.has_value());
+    EXPECT_NE(rig.coordinator.Metrics().lastFailureReason->find("AT quiesce timeout"),
+              std::string::npos);
+    EXPECT_FALSE(rig.hardware.TestBusResetIssued());
 }
 
 TEST(BusResetCoordinatorTests, StableResetDelaysDiscoveryByAppleScanDelay) {
@@ -875,17 +913,82 @@ TEST(BusResetCoordinatorTests, LocalIRMRemoteRootWithoutPeerContenderForcesLocal
     EXPECT_EQ(rig.publishedTopologies.back().rootNodeId, 2U);
 }
 
-TEST(BusResetCoordinatorTests, ConsumedSelfIDComplete2IsClearedExplicitly) {
+// The interrupt handler acknowledges Self-ID completions as it latches them.
+// Consuming the latch must not clear them in hardware again: by then the bit
+// may belong to the next reset, whose interrupt has not been handled yet.
+TEST(BusResetCoordinatorTests, ConsumingASelfIDCompletionLeavesTheHardwareAlone) {
     BusResetCoordinator coordinator;
     HardwareInterface hardware;
 
     BusResetCoordinatorTestPeer::Attach(coordinator, hardware);
     BusResetCoordinatorTestPeer::SetSelfIDLatch(coordinator, true, true);
+    hardware.SetTestRegister(Register32::kIntEvent, IntEventBits::kSelfIDComplete);
 
-    BusResetCoordinatorTestPeer::ClearConsumedSelfIDInterrupts(coordinator);
+    BusResetCoordinatorTestPeer::ConsumeSelfIDLatch(coordinator);
 
-    EXPECT_EQ(hardware.GetTestRegister(Register32::kIntEventClear),
-              IntEventBits::kSelfIDComplete | IntEventBits::kSelfIDComplete2);
+    EXPECT_EQ(hardware.GetTestRegister(Register32::kIntEvent), IntEventBits::kSelfIDComplete);
+    EXPECT_EQ(hardware.GetTestRegister(Register32::kIntEventClear), 0U);
+}
+
+// IntEvent.busReset stays set until AT is quiesced, so it has to be masked
+// before the interrupt handler returns, not when the FSM next runs: while it
+// is pending and enabled, the MSI controller sends no message for any other
+// event (2026-10-01, the driver never heard a Duet join after an 1814 unplug).
+TEST(BusResetCoordinatorTests, BusResetIsMaskedInsideTheInterruptHandler) {
+    BusResetTestRig rig;
+    rig.Initialize();
+    rig.interrupts.UnmaskInterrupts(&rig.hardware, IntEventBits::kBusReset);
+
+    rig.TriggerIrq(IntEventBits::kBusReset);
+
+    EXPECT_EQ(rig.hardware.GetTestRegister(Register32::kIntMaskSet) & IntEventBits::kBusReset, 0U);
+    EXPECT_EQ(rig.interrupts.EnabledMask() & IntEventBits::kBusReset, 0U);
+
+    const auto rawCapture = MakeRawSelfIDCapture(
+        7U, {MakeBaseSelfID(0U, 63U, true, true), MakeBaseSelfID(1U, 63U)});
+    rig.PrimeCapture(rawCapture, 7U);
+    rig.TriggerIrq(IntEventBits::kSelfIDComplete);
+    rig.DrainReady();
+    rig.AdvanceMs(100U);
+
+    ASSERT_EQ(rig.publishedTopologies.size(), 1U);
+    EXPECT_NE(rig.hardware.GetTestRegister(Register32::kIntMaskSet) & IntEventBits::kBusReset, 0U);
+}
+
+// A slow handler reads busReset and selfIDComplete in one snapshot. The
+// completion belongs to that reset; starting the new cycle must not drop it.
+TEST(BusResetCoordinatorTests, SelfIDCompletionInTheResetSnapshotIsKept) {
+    BusResetTestRig rig;
+    rig.Initialize();
+    const auto rawCapture = MakeRawSelfIDCapture(
+        7U, {MakeBaseSelfID(0U, 63U, true, true), MakeBaseSelfID(1U, 63U)});
+    rig.PrimeCapture(rawCapture, 7U);
+
+    rig.TriggerIrq(IntEventBits::kBusReset | IntEventBits::kSelfIDComplete);
+    rig.DrainReady();
+    rig.AdvanceMs(100U);
+
+    ASSERT_EQ(rig.publishedTopologies.size(), 1U);
+    EXPECT_EQ(rig.publishedTopologies.front().generation, 7U);
+    EXPECT_FALSE(rig.hardware.TestBusResetIssued());
+}
+
+// The completion's interrupt can be handled before the FSM work queued by the
+// reset's interrupt runs. It must survive the FSM starting the cycle.
+TEST(BusResetCoordinatorTests, SelfIDCompletionHandledBeforeTheFsmRunsIsKept) {
+    BusResetTestRig rig;
+    rig.Initialize();
+    const auto rawCapture = MakeRawSelfIDCapture(
+        7U, {MakeBaseSelfID(0U, 63U, true, true), MakeBaseSelfID(1U, 63U)});
+    rig.PrimeCapture(rawCapture, 7U);
+
+    rig.TriggerIrq(IntEventBits::kBusReset);
+    rig.TriggerIrq(IntEventBits::kSelfIDComplete);
+    rig.DrainReady();
+    rig.AdvanceMs(100U);
+
+    ASSERT_EQ(rig.publishedTopologies.size(), 1U);
+    EXPECT_FALSE(rig.hardware.TestBusResetIssued());
 }
 
 TEST(BusResetCoordinatorTests, MultipleDeferredResetRequestsAreCoalescedLongWins) {
@@ -992,6 +1095,7 @@ TEST(BusResetCoordinatorTests, StableAcceptedGenerationDoesNotCommitSkippedTarge
                                                 MakeBaseSelfID(1U, 21U, true, true)}),
                      22U);
     rig.TriggerStickyCompletion();
+    rig.DrainReady();
     rig.AdvanceMs(100U);
 
     EXPECT_FALSE(rig.hardware.TestPhyConfigIssued());

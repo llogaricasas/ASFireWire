@@ -19,17 +19,15 @@ namespace ASFW::IsochTransport {
 //   ...Ticks    24.576 MHz FireWire ticks (3072/cycle)
 // Never compare a *Packets value to a *Frames value without an explicit
 // conversion (the cadence is the only bridge: 6 frames/packet average at 48k,
-// 5.5125 at 44.1k -- budgets use the worst case, kMinAvgCadence*).
+// 5.5125 at 44.1k).
 //
-// CURSOR MODEL (TX): three frame-domain cursors race --
-//   T hardware transmit pos,  W CoreAudio write frontier,  E exposure frontier.
-// A PCM frame survives iff  T <= W <= E. The only failure is W > E
-// (under-exposure = `withoutPkt` = Defect B). The cushion that prevents it is
-// kTxExposureLeadFrames below. See documentation/ZTS_AND_SYT.md and
-// tools/tx_payload_ownership_sim.py / tools/analyze_payloadwriter.py.
+// TX OWNERSHIP: PCM reaches packets through the audio-side fill, from the
+// HAL output ring, once (documentation/TX_OWNERSHIP.md). There is no
+// frame-exposure frontier and no W/E cushion any more (T4, T8).
 //
-// Rate-DEPENDENT geometry (safety offsets, frames-per-packet at 96/192 kHz,
-// reported latency) lives in AudioGeometryPolicy.hpp, not here.
+// Rate-DEPENDENT geometry (frames-per-packet, safety floor, declarations,
+// transfer delay) is resolved per rate by Audio/Runtime/ResolvedTimingGeometry.hpp
+// (documentation/TIMING_GEOMETRY_OWNERSHIP.md), not here.
 // -----------------------------------------------------------------------------
 struct AudioTimingGeometry final {
     static constexpr uint32_t kSampleRateHz = 48000;
@@ -40,100 +38,58 @@ struct AudioTimingGeometry final {
     static constexpr uint32_t kCadenceBlockPackets = 4;
     static constexpr uint32_t kCadenceBlockFrames = 24;
 
-    // Worst-case average cadence across supported 1x rates: the 44.1k family
-    // carries 441 frames per 80 packets (5.5125 frames/packet average), fewer
-    // than 48k's 6. Packet budgets that must cover a frame requirement are
-    // sized with this ratio so they hold at every supported rate
-    // (tools/amdtp_blocking_cadence_sim.py, production wiring item 4).
-    static constexpr uint32_t kMinAvgCadencePackets = 80;
-    static constexpr uint32_t kMinAvgCadenceFrames = 441;
-
-    // DMA completion cadence is deliberately independent from the HAL ZTS
-    // grid. Six FireWire cycles give 0.75 ms refill latency. Depending on the
-    // D/D/D/N starting phase, one interrupt carries 32 or 40 decoded frames.
-    static constexpr uint32_t kRxPacketsPerGroup = 6;
-    static constexpr uint32_t kTxPacketsPerGroup = 6;
+    // DMA completion cadence: one interrupt per 8 FireWire cycles (1.0 ms),
+    // the AppleFWAudio fNumPacketsPerBufferGroup value (see REFERENCE GEOMETRY
+    // below). Eight packets are two whole blocking cadence blocks, so every
+    // group carries exactly 6 DATA packets whatever its starting phase:
+    // 48 frames at 1x, 96 at 2x, 192 at 4x. A 6-packet group straddled the
+    // D/D/D/N block (32 or 40 frames) and did not tile the ZTS period
+    // (12288 / 36 is not an integer), which is why the group moved to 8.
+    static constexpr uint32_t kRxPacketsPerGroup = 8;
+    static constexpr uint32_t kTxPacketsPerGroup = 8;
     static constexpr uint32_t kTimingGroupPackets = kRxPacketsPerGroup;
 
-    static constexpr uint32_t kMinimumNominalFramesPerInterrupt = 32;
-    static constexpr uint32_t kMaximumNominalFramesPerInterrupt = 40;
+    // Fixed-phase frames per completion group at 48 kHz. Rate-general value:
+    // CompletionBatchFrames() in Audio/Runtime/ResolvedTimingGeometry.hpp.
     static constexpr uint32_t kNominalFramesPerTimingGroup =
-        36;
+        (kTimingGroupPackets / kCadenceBlockPackets) * kCadenceBlockFrames; // 48
 
-    // HAL-facing geometry is selected as one compile-time profile because the
-    // frame ring sizes cross-process shared memory.
-    static constexpr uint32_t kFrameRingFrames =
-        kActiveAudioHalBufferProfile.frameRingFrames;
-    static constexpr uint32_t kHalZeroTimestampPeriodFrames =
-        kActiveAudioHalBufferProfile.zeroTimestampPeriodFrames;
+    // HAL frame ring and ZTS period are per rate (HalBufferProfileForRate,
+    // AudioHalBufferProfiles.hpp); only the shared-memory allocation is fixed.
+    static constexpr uint32_t kAllocatedFrameRingFrames =
+        ::ASFW::IsochTransport::kAllocatedFrameRingFrames;
 
-    // Scheduling-jitter cushion (single Default-queue contention). Field runs
-    // showed producer wakes delayed by tens of packets; every "must lead by"
-    // budget adds this on top of its nominal requirement. Frames.
-    static constexpr uint32_t kSchedulingJitterFrames = 64;
+    // Nominal client IO budget (the profile's clientIoBudgetFrames). ADK may
+    // issue a different operation span; the callback validates that span
+    // against the active stream ring.
+    static constexpr uint32_t kHalIoPeriodFrames = kV3ClientIoBudgetFrames;
 
-    // The graph applies the complete profile/output/client-IO formula. This is
-    // only the interrupt-batch component of that calculation.
-    static constexpr uint32_t kInputSafetyFloorFrames =
-        kMaximumNominalFramesPerInterrupt + kSchedulingJitterFrames;
-
-    // Client IO sizing/safety budget. ADK may issue a different operation
-    // span; the callback validates that span against stream-ring capacity.
-    static constexpr uint32_t kHalIoPeriodFrames =
-        kActiveAudioHalBufferProfile.clientIoBudgetFrames;
+    // The largest client IO AudioDriverKit lets a client pick at the V3 period
+    // (min(zts * 3/8, 4096)). The IO budget is not enforced, so every TX
+    // budget that must hold one whole write window is sized for this, not for
+    // kHalIoPeriodFrames.
+    static constexpr uint32_t kMaxClientIoFrames =
+        AdkMaxClientIoFrames(kV3ZeroTimestampPeriodFrames1x);
 
     static constexpr uint32_t kFrameAlignment = 32;
 
     static constexpr uint32_t kRxDescriptorPackets = 504;
 
-    // === TX exposure lead (E - W) -- the audio-frame cushion ================
-    // Minimum audio frames the producer's exposure frontier (E) must keep ahead
-    // of CoreAudio's write-window end. TX analogue of RX's
-    // RequiredInputSafetyFrames cushion: RX had it, TX did not -- which is why
-    // TX shipped silence when the writer ran beyond ExposedFrameEnd()
-    // (Defect B = under-exposure, W > E). Conservative form = one full
-    // AppleFWAudio's AM824NuDCLWrite keeps its CIP insertion target roughly
-    // 400 FireWire cycles ahead of the client write frontier at 48 kHz.  This
-    // is content lead, not the much smaller OHCI descriptor/refill lead. Keep
-    // the invariant in packet time so it remains a 50 ms horizon at every 1x
-    // sample rate (the runtime converts it to frames for the active stream).
-    // See AVC_RECOVERY_AND_SYNC_ALGO_AND_BUGS.md, "Apple reference target".
-    static constexpr uint32_t kTxDataHorizonPackets = 400;
-    static constexpr uint32_t kTxExposureLeadFrames =
-        (kTxDataHorizonPackets * kSampleRateHz) / 8000; // 2,400 @ 48 kHz
-
-    [[nodiscard]] static constexpr uint32_t TxDataHorizonFrames(
-        uint32_t sampleRateHz) noexcept {
-        return (kTxDataHorizonPackets * sampleRateHz + 7999) / 8000;
-    }
-    // Packet lead deep enough to expose that many frames at the worst-case
-    // (44.1k) average cadence: ceil(2400 / 5.5125) = 436 packets, rounded up
-    // to a whole interrupt group (108) so every budget derived from it keeps
-    // the group- and cadence-block-aligned ring-wrap asserts below.
-    static constexpr uint32_t kTxExposureLeadPacketsRaw =
-        (kTxExposureLeadFrames * kMinAvgCadencePackets +
-         kMinAvgCadenceFrames - 1) /
-        kMinAvgCadenceFrames;
-    static constexpr uint32_t kTxExposureLeadPackets =
-        ((kTxExposureLeadPacketsRaw + kTxPacketsPerGroup - 1) /
-         kTxPacketsPerGroup) *
-        kTxPacketsPerGroup;
-
-    // Packet-domain TX ownership: 48 descriptors on hardware, plus two
-    // independent producer budgets:
+    // Packet-domain TX ownership (T5, documentation/TX_OWNERSHIP.md):
     //
-    // 1. Refill coverage: packets that keep the core from holing the OHCI
-    //    refill when the producer action is delayed.
-    // 2. Frame exposure: extra packets the producer may prepare so the AMDTP
-    //    timeline covers CoreAudio's latest WriteEnd plus kTxExposureLeadFrames.
+    // - Hardware ring: the finite IT queue maps this many packets ahead of
+    //   the newest completion. A refill later than the ring exhausts it and
+    //   stops the stream, so the ring is the refill-stall budget (63 ms).
+    // - Preparation slack: packets committed beyond the ring, so the refill
+    //   finds every packet it maps committed even when the producer action
+    //   is late. It is the producer-stall budget (63 ms).
     //
-    // COVERAGE INVARIANT (hardware-confirmed). The IT refill ISR checks slots
-    //   [completion + hardwareRing, completion + hardwareRing + deltaConsumed)
-    // and FATALs if any is not yet committed. The coverage target stays
-    // hardwareRing + slack (144 packets), but the total preparation limit is
-    // larger so the audio-frame invariant can be satisfied without reusing
-    // hardware-owned shared slots.
-    static constexpr uint32_t kTxHardwareRingPackets = 48;
+    // COVERAGE INVARIANT. A refill maps packets up to completion + ring and
+    //   FATALs on one that is not committed. The producer therefore keeps
+    //   committed packets up to completion + ring + slack (coverage). Since T4
+    //   the producer arms only up to coverage; PCM reaches packets from the
+    //   HAL ring through the fill, so no frame-exposure window is needed.
+    static constexpr uint32_t kTxHardwareRingPackets = 504;
     // [TxPrep] telemetry buckets intentionally track the immutable hardware
     // floor rather than the larger, tuneable preparation lead.  That keeps a
     // captured distribution meaningful if the lead changes during tuning.
@@ -155,38 +111,30 @@ struct AudioTimingGeometry final {
     static constexpr uint32_t kTxCommittedMargin16xFloorPackets =
         16 * kTxHardwareRingPackets;
     static constexpr uint32_t kTxPreparationSlackPackets =
-        2 * kTxHardwareRingPackets;
+        kTxHardwareRingPackets;
     static constexpr uint32_t kTxCoverageLeadPackets =
         kTxHardwareRingPackets + kTxPreparationSlackPackets;
-    // Covers a full client write window plus the output exposure cushion when
-    // the producer target is expressed as WriteEnd + kTxExposureLeadFrames.
-    // The producer needs to preserve a whole maximum CoreAudio write window
-    // in addition to the packet-time data horizon. Round the result to an
-    // interrupt group: ceil((512 + 2400) / 5.5125) = 529 -> 534 packets.
-    static constexpr uint32_t kTxFrameExposureWindowPacketsRaw =
-        ((kHalIoPeriodFrames + kTxExposureLeadFrames) *
-             kMinAvgCadencePackets +
-         kMinAvgCadenceFrames - 1) /
-        kMinAvgCadenceFrames;
-    static constexpr uint32_t kTxFrameExposureWindowPackets =
-        ((kTxFrameExposureWindowPacketsRaw + kTxPacketsPerGroup - 1) /
-         kTxPacketsPerGroup) *
-        kTxPacketsPerGroup;
+    // TX fill finality guard (documentation/TX_OWNERSHIP.md, T4 and E2):
+    // packets ahead of the projected hardware position that the fill still
+    // treats as taken. 2 is what Saffire.kext writes ahead of the playhead;
+    // with T5's descriptor-status completion the projection is exact at each
+    // refill, and E2 ran clean with it at 64/32/16-frame buffers on the Pro 24
+    // DSP (it was 3, from midi c3e27a53: ~2 packets of OHCI fetch + 1 slack).
+    static constexpr uint32_t kTxFillFinalityGuardPackets = 2;
+    // The producer's per-pass and total lead: coverage only (T5).
     static constexpr uint32_t kTxPreparationLeadPackets =
-        kTxCoverageLeadPackets + kTxFrameExposureWindowPackets;
-    // A 912-packet (114 ms) backing ring lets the 400-cycle content target
-    // occupy less than half the ring while retaining one OHCI ring depth
-    // before reuse. The 48-packet hardware descriptor ring remains a separate
-    // low-latency transport concern.
+        kTxCoverageLeadPackets;
+    // Backing ring: the preparation lead plus one hardware ring before a
+    // slot is reused (1008 + 504 = 1512 packets, 189 ms).
     static constexpr uint32_t kTxSharedSlotPackets =
-        912;
+        kTxPreparationLeadPackets + kTxHardwareRingPackets;
     // Largest single coalesced deltaConsumed a refill can absorb without holing.
     static constexpr uint32_t kTxMaxCoveredDeltaConsumedPackets =
         kTxPreparationLeadPackets - kTxHardwareRingPackets;
 
     // Backing packet-ring / timeline slot array length
     // (AmdtpPacketTimeline, DiceTxStreamEngine::timelineSlots_). Packets.
-    static constexpr uint32_t kTimelineSlots = 1024;
+    static constexpr uint32_t kTimelineSlots = kTxSharedSlotPackets;
 };
 
 static_assert(AudioTimingGeometry::kRxDescriptorPackets %
@@ -195,22 +143,41 @@ static_assert(AudioTimingGeometry::kRxDescriptorPackets %
 static_assert(AudioTimingGeometry::kRxDescriptorPackets %
                   AudioTimingGeometry::kCadenceBlockPackets ==
               0);
-static_assert(AudioTimingGeometry::kRxDescriptorPackets % 12 == 0);
-static_assert(AudioTimingGeometry::kFrameRingFrames %
-                  AudioTimingGeometry::kHalIoPeriodFrames ==
+static_assert(AudioTimingGeometry::kTimingGroupPackets %
+                  AudioTimingGeometry::kCadenceBlockPackets ==
               0,
-              "Frame ring must be an integer number of max HAL IO periods");
-static_assert(AudioTimingGeometry::kFrameRingFrames %
-                  AudioTimingGeometry::kHalZeroTimestampPeriodFrames ==
+              "A completion group must hold whole blocking cadence blocks so "
+              "every group carries the same frame count (fixed phase)");
+static_assert(AudioTimingGeometry::kNominalFramesPerTimingGroup == 48);
+
+// --- V3 HAL geometry against the completion grid (decision D2) -------------
+namespace detail {
+[[nodiscard]] constexpr bool V3GeometryHoldsAt(uint32_t sampleRateHz) noexcept {
+    const auto hal = HalBufferProfileForRate(sampleRateHz);
+    const uint32_t tier = HalRateTier(sampleRateHz);
+    const uint32_t groupFrames = AudioTimingGeometry::kNominalFramesPerTimingGroup * tier;
+    const uint32_t blockFrames = AudioTimingGeometry::kCadenceBlockFrames * tier;
+    return tier != 0 &&
+           hal.frameRingFrames == hal.zeroTimestampPeriodFrames &&
+           hal.frameRingFrames % hal.clientIoBudgetFrames == 0 &&
+           hal.frameRingFrames % AudioTimingGeometry::kFrameAlignment == 0 &&
+           hal.zeroTimestampPeriodFrames % blockFrames == 0 &&
+           hal.zeroTimestampPeriodFrames % groupFrames == 0 &&
+           hal.zeroTimestampPeriodFrames / groupFrames == 256 &&
+           AdkMaxClientIoFrames(hal.zeroTimestampPeriodFrames) ==
+               AudioTimingGeometry::kMaxClientIoFrames;
+}
+} // namespace detail
+// 48/96/192 kHz: 512 cadence blocks, 256 eight-packet groups (2048 cycles,
+// 256 ms) per ZTS period, ring == period, and the 4096-frame client ceiling.
+static_assert(detail::V3GeometryHoldsAt(48'000));
+static_assert(detail::V3GeometryHoldsAt(96'000));
+static_assert(detail::V3GeometryHoldsAt(192'000));
+static_assert(AudioTimingGeometry::kAllocatedFrameRingFrames %
+                  HalBufferProfileForRate(48'000).frameRingFrames ==
               0,
-              "Frame ring must be an integer number of ZTS periods");
-static_assert(AudioTimingGeometry::kFrameRingFrames %
-                  AudioTimingGeometry::kFrameAlignment ==
-              0,
-              "Frame ring must satisfy the 32-frame alignment contract");
-static_assert(AudioTimingGeometry::kFrameRingFrames >=
-                  AudioTimingGeometry::kHalIoPeriodFrames,
-              "Frame ring must hold one maximum HAL IO transfer");
+              "a rate change must reuse the allocation, not resize it");
+static_assert(AudioTimingGeometry::kMaxClientIoFrames == 4'096);
 static_assert(AudioTimingGeometry::kTimingGroupPackets != 0,
               "Timing group packet count must be non-zero");
 static_assert(AudioTimingGeometry::kRxPacketsPerGroup ==
@@ -219,12 +186,13 @@ static_assert(AudioTimingGeometry::kRxPacketsPerGroup ==
 static_assert(AudioTimingGeometry::kTxSharedSlotPackets >=
               AudioTimingGeometry::kTxPreparationLeadPackets,
               "TX shared slot ring must hold the full preparation lead");
-// COVERAGE: tolerate 16 six-packet groups without a producer wake. This covers
-// the observed 40-42 packet DriverKit dispatch stalls with more than 2x margin.
+// COVERAGE: tolerate 16 completion groups (128 packets, 16 ms) without a
+// producer wake. This covers the observed 40-42 packet DriverKit dispatch
+// stalls with more than 3x margin.
 static_assert(AudioTimingGeometry::kTxMaxCoveredDeltaConsumedPackets >=
                   16 * AudioTimingGeometry::kTxPacketsPerGroup,
               "TX preparation headroom must cover at least 12 ms of producer "
-              "dispatch latency at the current six-packet cadence");
+              "dispatch latency at the current eight-packet cadence");
 static_assert(AudioTimingGeometry::kTxCoverageLeadPackets ==
                   AudioTimingGeometry::kTxHardwareRingPackets +
                       AudioTimingGeometry::kTxPreparationSlackPackets,
@@ -251,29 +219,23 @@ static_assert(AudioTimingGeometry::kTxSharedSlotPackets %
               0,
               "TX shared slot wrap must preserve blocking-cadence phase");
 
-// --- TX exposure cushion (Defect B guard: the invariant whose absence let TX
-//     ship ~1% silence). E must lead W by a full IO window plus jitter. -------
-static_assert(AudioTimingGeometry::kTxExposureLeadFrames >=
-                  AudioTimingGeometry::kHalIoPeriodFrames +
-                      AudioTimingGeometry::kSchedulingJitterFrames,
-              "TX exposure lead must cover one full IO window plus scheduling "
-              "jitter (the cushion whose absence was Defect B)");
-static_assert(AudioTimingGeometry::kTxExposureLeadPackets <=
-                  AudioTimingGeometry::kTxSharedSlotPackets,
-              "TX packet lead must be able to hold the required exposure frames");
-static_assert(AudioTimingGeometry::kTxSharedSlotPackets >=
-                  2 * AudioTimingGeometry::kTxExposureLeadPackets,
-              "TX backing ring must keep the 400-cycle content target below half ring");
-static_assert(AudioTimingGeometry::kTxFrameExposureWindowPackets *
-                  AudioTimingGeometry::kMinAvgCadenceFrames >=
-              (AudioTimingGeometry::kHalIoPeriodFrames +
-               AudioTimingGeometry::kTxExposureLeadFrames) *
-                  AudioTimingGeometry::kMinAvgCadencePackets,
-              "TX frame-exposure packet window must cover WriteEnd plus the "
-              "exposure cushion at the worst-case (44.1k) cadence");
 static_assert(AudioTimingGeometry::kTxSharedSlotPackets <=
                   AudioTimingGeometry::kTimelineSlots,
               "shared packet ring must fit inside the timeline slot array");
+
+// --- Finite IT queue coverage (T5). A refill maps packets up to
+//     completion + ring and needs every one committed; the producer keeps
+//     coverage beyond that, and a slot is reused only a ring after coverage.
+//     AppleFWAudio's DCL ring is 100 groups of 8 packets (~100 ms, reference
+//     block below), the same order as this 63 ms ring. -------------------
+static_assert(AudioTimingGeometry::kTxCoverageLeadPackets >=
+                  AudioTimingGeometry::kTxHardwareRingPackets +
+                      AudioTimingGeometry::kTxPacketsPerGroup,
+              "the producer must commit past what one refill can map");
+static_assert(AudioTimingGeometry::kTxSharedSlotPackets >=
+                  AudioTimingGeometry::kTxCoverageLeadPackets +
+                      AudioTimingGeometry::kTxHardwareRingPackets,
+              "a shared slot must not be re-armed while its packet is mapped");
 
 } // namespace ASFW::IsochTransport
 
@@ -289,7 +251,7 @@ static_assert(AudioTimingGeometry::kTxSharedSlotPackets <=
 //
 // Shared by all three AND us: 8000 cycles/s, 3072 ticks/cycle, 24'576'000
 // ticks/s; blocking SYT interval (frames per DATA packet) = 8 @48k / 16 @96k /
-// 32 @192k  (== our kFramesPerDataPacket and AudioGeometryPolicy::FramesPerPacket).
+// 32 @192k  (== our kFramesPerDataPacket and AmdtpRateGeometry::sytIntervalFrames).
 //
 // --- Apple AppleFWAudio.kext  (AM824DCLWrite / AM824NuDCLWrite, x86 IDA) ------
 //   fNumBufferGroups          = 100        backing DCL ring depth (~100 ms)
@@ -297,11 +259,11 @@ static_assert(AudioTimingGeometry::kTxSharedSlotPackets <=
 //   48k cadence               = D,D,D,N    => 6 frames/cycle avg, 8-frame DATA
 //   CheckSYT target latency   = 2-3 cycles (~250-375 us) device presentation
 //                                          -- this is a SYT/presentation lead
-//                                          (cf. our TxTransferDelayTicks/SYT),
+//                                          (cf. our transfer delay/SYT),
 //                                          NOT the CoreAudio safety offset.
 //   servo update              = gated groupIndex==0 => ~100 ms / ring wrap
 //                                          (100 groups * 8 pkt * 125 us)
-//   our analogues: 8-pkt group ~ kTimingGroupPackets(6, 0.75 ms); 100*8=800-pkt
+//   our analogues: 8-pkt group == kTimingGroupPackets (8, 1.0 ms); 100*8=800-pkt
 //     backing ring ~ kTxSharedSlotPackets / kTimelineSlots.
 //   *** CAVEAT (load-bearing) ***  This is OS 9 / early-OS-X lineage code: the
 //   buffer routines are literally the classic-Mac "DV" (Digital Video FireWire)
@@ -320,7 +282,7 @@ static_assert(AudioTimingGeometry::kTxSharedSlotPackets <=
 //   minimum period            = 250 us = 2 pkt (hard floor)
 //   transfer_delay base       = 0x2e00 ticks (11776); effective on-wire SYT lead
 //                               re-added at encode vs the transmit cycle works
-//                               out to ~12800 @48k (== our TxTransferDelayTicks).
+//                               out to ~12800 @48k (== our applied transfer delay).
 //   Period-derived IRQ, close to the wire; no fixed deep lead-ahead.
 //
 // --- libffado-2.5.0  (IsoHandlerManager.cpp, util/cip.h, libieee1394/cycletimer.h)
@@ -333,10 +295,10 @@ static_assert(AudioTimingGeometry::kTxSharedSlotPackets <=
 //
 // TAKEAWAYS for our geometry:
 //   * Everyone services DMA far more often than a deep batch: 0.75-1.375 ms IRQ
-//     (6-11 pkt). Ours kTimingGroupPackets = 6 (0.75 ms) is in range.
+//     (6-11 pkt). Ours kTimingGroupPackets = 8 (1.0 ms, Apple's value) is in range.
 //   * Everyone keeps SYT/presentation in the 1394 tick domain, not host time.
 //   * Backing ring depth (Apple ~800 pkt, ffado 128) is decoupled from the
 //     active near-wire lead -- matches our capacity-is-not-latency rule. None of
-//     these exposes a direct AudioDriverKit ZTS analogue (see §9.F), so
-//     kTxExposureLeadFrames and the ZTS period are OURS to justify, not inherited.
+//     these exposes a direct AudioDriverKit ZTS analogue (see §9.F), so the
+//     ZTS period is OURS to justify, not inherited.
 // =============================================================================

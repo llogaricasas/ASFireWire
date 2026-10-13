@@ -54,6 +54,11 @@ public:
     [[nodiscard]] std::optional<DeviceRouteToken> CurrentRoute(Guid64 guid) const;
     [[nodiscard]] bool IsCurrent(const DeviceRouteToken& token) const noexcept;
 
+    // A successful lower-speed protocol read can tighten the link policy after
+    // ROM discovery. Reject callbacks from a retired route or old generation.
+    [[nodiscard]] bool LowerVerifiedLinkSpeed(const DeviceRouteToken& token,
+                                              FwSpeed speed) noexcept;
+
     // Export snapshot of all devices present in given generation
     std::vector<DeviceRecord> LiveDevices(Generation gen) const;
 
@@ -76,12 +81,17 @@ private:
     std::map<Guid64, uint64_t> lastDeviceIncarnationByGuid_;
     uint64_t nextRouteEpoch_{0};
 
+    // Device instance ids are globally monotonic, unlike deviceIncarnation
+    // which restarts at 1 per GUID and so cannot identify a device on its own.
+    uint64_t nextDeviceInstanceId_{0};
+
     // Secondary index: (generation, nodeId) → GUID for fast per-generation lookup
     using GenNodeKey = uint32_t;
     static GenNodeKey MakeKey(Generation gen, uint8_t nodeId);
     std::map<GenNodeKey, Guid64> genNodeToGuid_;
 
     [[nodiscard]] uint64_t AllocateRouteEpochLocked() noexcept;
+    [[nodiscard]] DeviceInstanceId AllocateDeviceInstanceIdLocked() noexcept;
     [[nodiscard]] static bool HasLiveRoute(const DeviceRecord& device) noexcept;
     [[nodiscard]] static DeviceRouteToken MakeRouteToken(const DeviceRecord& device) noexcept;
 };

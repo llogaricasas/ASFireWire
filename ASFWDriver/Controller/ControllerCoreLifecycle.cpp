@@ -35,7 +35,6 @@
 #include "../Bus/IRM/IRMClient.hpp"
 #include "../Protocols/AVC/AVCDiscovery.hpp"
 #include "../Protocols/AVC/CMP/CMPClient.hpp"
-#include "../Audio/Protocols/DeviceProtocolFactory.hpp"
 #include "../Scheduling/Scheduler.hpp"
 #include "../Version/DriverVersion.hpp"
 #include "BringupOverrides.hpp"
@@ -124,9 +123,11 @@ bool ConfigurePhyOperationalRegisters(ASFW::Driver::HardwareInterface& hw,
                                       const ASFW::Driver::RolePolicy& policy) {
     // ClientOnly is intentionally absent here: a pure client that advertises no
     // BM/IRM capability also does NOT set the Self-ID/PHY contender bit, so it can
-    // never win an IRM/BM election. ServiceContext now seeds the live driver with
-    // FullBusManager/ForceRootAllowed for hardware validation, matching the
-    // reference stacks' contender posture and exercising root/gap BM duties.
+    // never win an IRM/BM election -- the bit is actively cleared for it below.
+    // The live default is IRMResourceHost (ControllerConfig::MakeLiveDefault), the
+    // lowest rung that contends: an audio host must be able to become the IRM, because
+    // a bus with no IRM can allocate no isochronous channel at all. FullBusManager
+    // stays the hardware-validation opt-in that also exercises root/gap BM duties.
     // cross-validated with Linux: ohci.c:2510-2511
     const bool shouldAdvertiseContender =
         (policy.roleMode == ASFW::FW::RoleMode::FullBusManager &&
@@ -306,19 +307,19 @@ void SeedInitialInterruptMask(ASFW::Driver::HardwareInterface& hw,
 //
 // If you are adding a new software reset, it does NOT belong here — see
 // BusResetCoordinator::RequestConfigRomRestageReset for the pattern to copy.
-void MaybeForceInitialBusReset(ASFW::Driver::HardwareInterface& hw,
-                               bool phyProgramSupported,
-                               bool phyConfigOk) {
-    if (phyProgramSupported && phyConfigOk) {
-        ASFW_LOG(Hardware, "Forcing bus reset via PHY to guarantee Config ROM shadow activation");
-        const bool forced = hw.InitiateBusReset(false);
-        if (!forced) {
-            ASFW_LOG(Hardware, "WARNING: Forced bus reset failed; will rely on auto reset");
-        }
-        return;
+//
+// The reset is unconditional. programPhyEnable gates only the 1394a enhancement
+// programming (OHCI §5.7.2); writing IBR through PhyControl is not part of it, and
+// Linux ohci_enable() schedules this reset with no condition at all. Gating it on
+// programPhyEnable left the bus without a reset whenever the previous instance had
+// already cleared that bit (HCControl=0x004c0000): setting linkEnable alone did not
+// reset the bus, and the 828 Mk3 stayed unseen until the cable was replugged.
+void ForceInitialBusReset(ASFW::Driver::HardwareInterface& hw) {
+    ASFW_LOG(Hardware, "Forcing bus reset via PHY to guarantee Config ROM shadow activation");
+    const bool forced = hw.InitiateBusReset(false);
+    if (!forced) {
+        ASFW_LOG(Hardware, "WARNING: Forced bus reset failed; will rely on auto reset");
     }
-
-    ASFW_LOG(Hardware, "Skipping forced reset; relying on auto reset from linkEnable");
 }
 
 kern_return_t ArmAsyncReceiveContexts(ASFW::Async::IAsyncControllerPort* asyncController) {
@@ -406,7 +407,8 @@ ControllerCore::ControllerCore(ControllerConfig config, RolePolicy initialPolicy
 
     if (deps_.asyncController && deps_.topology) {
         busImpl_ =
-            std::make_unique<Async::FireWireBusImpl>(*deps_.asyncController, *deps_.topology);
+            std::make_unique<Async::FireWireBusImpl>(*deps_.asyncController, *deps_.topology,
+                                                     deps_.speedPolicy.get());
         ASFW_LOG(Controller, "✅ FireWireBusImpl facade created");
         bmPolicyCoordinator_ = std::make_unique<Bus::BusManagerPolicyCoordinator>(
             Bus::BusManagerPolicyCoordinator::Deps{
@@ -764,7 +766,7 @@ kern_return_t ControllerCore::EnableInterruptsAndStartBus() {
     ASFW_LOG(Hardware,
              "Setting linkEnable + BIBimageValid atomically - will trigger auto bus reset");
     hw.SetHCControlBits(HCControlBits::kLinkEnable | HCControlBits::kBibImageValid);
-    MaybeForceInitialBusReset(hw, phyProgramSupported_, phyConfigOk_);
+    ForceInitialBusReset(hw);
 
     const kern_return_t armStatus = ArmAsyncReceiveContexts(deps_.asyncController.get());
     if (armStatus != kIOReturnSuccess) {

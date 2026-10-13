@@ -2,7 +2,8 @@
 #include <algorithm>
 #include <limits>
 #include "../Logging/Logging.hpp"
-#include "../DeviceProfiles/Audio/AudioProfileRegistry.hpp"
+#include "../DeviceProfiles/Audio/AudioDeviceCatalog.hpp"
+#include "../DeviceProfiles/Audio/ResolvedDevicePolicy.hpp"
 
 namespace ASFW::Discovery {
 
@@ -17,14 +18,68 @@ constexpr uint32_t kUnitSwVersion_SBP2 = 0x010483; // SBP-2 Unit_Sw_Version
 
 namespace {
 
-void PopulateDeviceIdentity(DeviceRecord& device, const ConfigROM& rom) {
+// Fill DeviceRecord::identity — the raw Config-ROM evidence — from the parsed
+// ROM. Presence is recorded as presence: an optional is engaged when the ROM
+// carried the key, whatever its value. A device that publishes model_id 0
+// (MOTU does) is therefore distinguishable from one that publishes no model_id
+// at all, which a uint32_t{0} cannot express.
+void PopulateIdentityEvidence(DeviceRecord& device, const ConfigROM& rom) {
+    DeviceIdentityEvidence evidence{};
+    evidence.observedGuid = rom.bib.guid;
+    evidence.nodeVendorOui = static_cast<uint32_t>((rom.bib.guid >> 40) & 0xFFFFFFULL);
+
+    // The bus info block is the leading quadlets of the ROM image, in wire order.
+    constexpr size_t kBusInfoQuadlets = 5;
+    const size_t busInfoCount = (rom.rawQuadlets.size() < kBusInfoQuadlets)
+                                    ? rom.rawQuadlets.size()
+                                    : kBusInfoQuadlets;
+    evidence.rawBusInfoQuadlets.assign(rom.rawQuadlets.begin(),
+                                       rom.rawQuadlets.begin() +
+                                           static_cast<std::ptrdiff_t>(busInfoCount));
+
     for (const auto& entry : rom.rootDirMinimal) {
         if (entry.key == CfgKey::VendorId) {
-            device.vendorId = entry.value;
+            evidence.rootVendorId = entry.value;
         } else if (entry.key == CfgKey::ModelId) {
-            device.modelId = entry.value;
+            evidence.rootModelId = entry.value;
         }
     }
+    evidence.rootVendorName = rom.vendorName;
+    evidence.rootModelName = rom.modelName;
+
+    // Every unit directory, kept separate. The flat unitSpecId/unitSwVersion
+    // pair below can only describe one unit, and worse, can take the two halves
+    // from different ones; TC Applied Technologies devices publish an audio unit
+    // and a MIDI unit.
+    evidence.units.reserve(rom.unitDirectories.size());
+    for (const auto& unit : rom.unitDirectories) {
+        UnitIdentityEvidence unitEvidence{};
+        unitEvidence.unitDirectoryOffset = unit.offsetQuadlets;
+        if (unit.unitSpecId != 0) {
+            unitEvidence.specifierId = unit.unitSpecId;
+        }
+        if (unit.unitSwVersion != 0) {
+            unitEvidence.version = unit.unitSwVersion;
+        }
+        unitEvidence.modelId = unit.modelId;
+        unitEvidence.modelName = unit.modelName;
+        unitEvidence.logicalUnitNumber = unit.logicalUnitNumber;
+        evidence.units.push_back(std::move(unitEvidence));
+    }
+
+    device.identity = std::move(evidence);
+}
+
+void PopulateDeviceIdentity(DeviceRecord& device, const ConfigROM& rom) {
+    PopulateIdentityEvidence(device, rom);
+
+    // ---- Flat compatibility shim, seeded from the evidence above ----
+    // These flat fields are legacy convenience mirrors of the raw ROM evidence
+    // kept for non-catalog consumers and logging. Identity resolution and variant
+    // determination (including GUID quirks such as Focusrite Saffire Pro 40 TCD3070)
+    // are owned exclusively by AudioDeviceCatalog::Resolve() using device.identity.
+    device.vendorId = device.identity.rootVendorId.value_or(0);
+    device.modelId = device.identity.rootModelId.value_or(0);
 
     device.unitSpecId.reset();
     device.unitSwVersion.reset();
@@ -42,37 +97,6 @@ void PopulateDeviceIdentity(DeviceRecord& device, const ConfigROM& rom) {
 
     device.vendorName = rom.vendorName;
     device.modelName = rom.modelName;
-}
-
-void MaybeInferKnownIdentityFromGuid(DeviceRecord& device, Guid64 guid) {
-    const DeviceProfiles::DeviceProfileQuery query{
-        .guid = guid, .vendorId = device.vendorId, .modelId = device.modelId};
-
-    const auto identity = DeviceProfiles::Audio::AudioProfileRegistry::LookupIdentity(query);
-    if (!identity.has_value()) {
-        return;
-    }
-
-    // A GUID-based match refines the vendor/model identity when the Config ROM did not
-    // surface usable IDs (e.g. Focusrite DICE boards encode the model in the GUID). A
-    // direct vendor/model match leaves the IDs unchanged.
-    if (identity->vendorId != device.vendorId || identity->modelId != device.modelId) {
-        const uint32_t prevVendorId = device.vendorId;
-        const uint32_t prevModelId = device.modelId;
-        device.vendorId = identity->vendorId;
-        device.modelId = identity->modelId;
-        ASFW_LOG(Discovery,
-                 "Inferred known device identity from GUID=0x%016llx: vendor 0x%06x->0x%06x model "
-                 "0x%06x->0x%06x",
-                 guid, prevVendorId, device.vendorId, prevModelId, device.modelId);
-    }
-
-    if (identity->vendorName) {
-        device.vendorName = identity->vendorName;
-    }
-    if (identity->modelName) {
-        device.modelName = identity->modelName;
-    }
 }
 
 const char* DeviceKindString(DeviceKind kind) noexcept {
@@ -115,6 +139,7 @@ DeviceRegistry::DeviceRegistry()
     : lock_(IOLockAlloc()) {}
 
 DeviceRegistry::~DeviceRegistry() {
+    ASFW_LOG(Controller, "[Teardown] DeviceRegistry destructor object=%p", this);
     if (lock_) {
         IOLockFree(lock_);
         lock_ = nullptr;
@@ -129,6 +154,7 @@ DeviceRecord DeviceRegistry::UpsertFromROM(const ConfigROM& rom, const LinkPolic
     auto [it, inserted] = devicesByGuid_.try_emplace(guid);
     auto& device = it->second;
     if (inserted) {
+        device.instanceId = AllocateDeviceInstanceIdLocked();
         device.deviceIncarnation = ++lastDeviceIncarnationByGuid_[guid];
         device.routeEpoch = AllocateRouteEpochLocked();
     } else if (device.gen != rom.gen || device.nodeId != rom.nodeId ||
@@ -136,41 +162,66 @@ DeviceRecord DeviceRegistry::UpsertFromROM(const ConfigROM& rom, const LinkPolic
         device.routeEpoch = AllocateRouteEpochLocked();
     }
     device.guid = guid;
+    device.gen = rom.gen;
+    device.nodeId = rom.nodeId;
     PopulateDeviceIdentity(device, rom);
-    MaybeInferKnownIdentityFromGuid(device, guid);
 
-    // Known device profiles can choose their integration mode:
-    // - kHardcodedNub: vendor-specific audio backend (DICE/TCAT, no AV/C).
-    // - kAVCDriven: AV/C discovery drives audio topology; vendor protocol is for extra controls only.
-    const auto audioProfile = DeviceProfiles::Audio::AudioProfileRegistry::LookupBestAudioProfile(
-        DeviceProfiles::DeviceProfileQuery{.vendorId = device.vendorId, .modelId = device.modelId});
-    const auto integrationMode = audioProfile.has_value()
-                                     ? audioProfile->mode
-                                     : DeviceProfiles::Audio::AudioIntegrationMode::kNone;
-
-    if (integrationMode != DeviceProfiles::Audio::AudioIntegrationMode::kNone) {
-        ASFW_LOG(Discovery,
-                 "Known device profile available for vendor=0x%06x model=0x%06x integration=%u",
-                 device.vendorId,
-                 device.modelId,
-                 static_cast<unsigned>(integrationMode));
-        if (integrationMode == DeviceProfiles::Audio::AudioIntegrationMode::kHardcodedNub) {
+    // Ask the unified AudioDeviceCatalog for resolution (identity enrichment and candidacy).
+    const auto endpointPlan =
+        DeviceProfiles::Audio::AudioDeviceCatalog::Resolve(device);
+    if (endpointPlan.has_value()) {
+        device.avcCommandFilter =
+            DeviceProfiles::Audio::AudioDeviceCatalog::CommandFilterFor(*endpointPlan);
+        device.audioPolicy =
+            std::make_shared<const DeviceProfiles::Audio::ResolvedDevicePolicy>(
+                DeviceProfiles::Audio::ResolvedDevicePolicy{*endpointPlan,
+                                                            MakeRouteToken(device)});
+        device.quarantineReason = QuarantineReason::None;
+        if (device.vendorName.empty() && !endpointPlan->vendorName.empty()) {
+            device.vendorName = endpointPlan->vendorName;
+        }
+        if (!endpointPlan->modelName.empty()) {
+            device.modelName = endpointPlan->modelName;
+        }
+        if (endpointPlan->family == DeviceProfiles::Audio::AudioFamilyProviderId::DICE ||
+            endpointPlan->family == DeviceProfiles::Audio::AudioFamilyProviderId::MotuRegister ||
+            endpointPlan->family == DeviceProfiles::Audio::AudioFamilyProviderId::RmeRegister) {
             device.kind = DeviceKind::VendorSpecificAudio;
             device.isAudioCandidate = true;
         } else {
             device.kind = ClassifyDevice(rom);
             device.isAudioCandidate = IsAudioCandidate(rom);
         }
+        ASFW_LOG(Discovery,
+                 "Catalog resolved plan for GUID=0x%016llx: family=%u support=%u builder=%u candidate=%d",
+                 guid,
+                 static_cast<unsigned>(endpointPlan->family),
+                 static_cast<unsigned>(endpointPlan->support),
+                 static_cast<unsigned>(endpointPlan->profileBuilder),
+                 device.isAudioCandidate);
     } else {
+        device.audioPolicy.reset();
+        device.avcCommandFilter =
+            DeviceProfiles::Audio::AudioDeviceCatalog::CommandFilterFor(endpointPlan.error());
         device.kind = ClassifyDevice(rom);
-        device.isAudioCandidate = IsAudioCandidate(rom);
+        if (endpointPlan.error() ==
+            DeviceProfiles::Audio::CatalogResolutionError::HazardousIdentity) {
+            device.isAudioCandidate = false;
+            device.quarantineReason = QuarantineReason::HazardousNoProbe;
+            ASFW_LOG(Discovery, "Device GUID=0x%016llx quarantined by catalog safety rule", guid);
+        } else if (endpointPlan.error() ==
+                   DeviceProfiles::Audio::CatalogResolutionError::AmbiguousIdentity) {
+            device.isAudioCandidate = false;
+            device.quarantineReason = QuarantineReason::AmbiguousIdentity;
+            ASFW_LOG(Discovery, "Device GUID=0x%016llx rejected due to ambiguous catalog identity", guid);
+        } else {
+            device.quarantineReason = QuarantineReason::None;
+            device.isAudioCandidate = IsAudioCandidate(rom);
+        }
     }
 
     // TODO: Generic AV/C devices should work purely via MusicSubunit discovery; vendor protocols are only for extra controls.
-    // TODO: Generic DICE/TCAT discovery (non-hardcoded vendor/model) is not implemented yet.
     
-    device.gen = rom.gen;
-    device.nodeId = rom.nodeId;
     device.link = link;
 
     // Clamp max async payload by remote MaxRec code (BIB bus options).
@@ -181,7 +232,11 @@ DeviceRecord DeviceRegistry::UpsertFromROM(const ConfigROM& rom, const LinkPolic
     if (device.link.maxPayloadBytes > maxFromRec) {
         device.link.maxPayloadBytes = maxFromRec;
     }
-    device.state = LifeState::Identified;
+    if (device.quarantineReason != QuarantineReason::None) {
+        device.state = LifeState::Quarantined;
+    } else {
+        device.state = LifeState::Identified;
+    }
 
     if (operationalNodeId.has_value()) {
         GenNodeKey key = MakeKey(rom.gen, *operationalNodeId);
@@ -222,6 +277,8 @@ void DeviceRegistry::MarkDuplicateGuid(Generation gen, Guid64 guid, uint8_t node
     auto it = devicesByGuid_.find(guid);
     if (it != devicesByGuid_.end()) {
         it->second.state = LifeState::Quarantined;
+        it->second.audioPolicy.reset();
+        it->second.avcCommandFilter = AvcCommandFilterId::BlockAll;
         ASFW_LOG(Discovery, "⚠️  Duplicate GUID detected: 0x%016llx node=%u gen=%u (quarantined)",
                  guid, nodeId, gen.value);
     }
@@ -240,6 +297,8 @@ void DeviceRegistry::MarkLost(Generation gen, uint8_t nodeId) {
             devIt->second.state = LifeState::Lost;
             devIt->second.nodeId = kInvalidNodeId;
             devIt->second.routeEpoch = AllocateRouteEpochLocked();
+            devIt->second.audioPolicy.reset();
+            devIt->second.avcCommandFilter = AvcCommandFilterId::BlockAll;
             ASFW_LOG(Discovery, "Device lost: GUID=0x%016llx node=%u gen=%u",
                      guid, nodeId, gen.value);
         }
@@ -273,6 +332,8 @@ void DeviceRegistry::InvalidateLiveMappingsForBusReset() {
 
         device.nodeId = kInvalidNodeId;
         device.routeEpoch = AllocateRouteEpochLocked();
+        device.audioPolicy.reset();
+        device.avcCommandFilter = AvcCommandFilterId::BlockAll;
         ++invalidatedCount;
     }
 
@@ -328,13 +389,49 @@ bool DeviceRegistry::IsCurrent(const DeviceRouteToken& token) const noexcept {
     return current;
 }
 
+bool DeviceRegistry::LowerVerifiedLinkSpeed(const DeviceRouteToken& token,
+                                            FwSpeed speed) noexcept {
+    if (!token) {
+        return false;
+    }
+    IOLockLock(lock_);
+    const auto it = devicesByGuid_.find(token.guid);
+    const bool current = it != devicesByGuid_.end() && HasLiveRoute(it->second) &&
+                         it->second.deviceIncarnation == token.deviceIncarnation &&
+                         it->second.routeEpoch == token.routeEpoch &&
+                         it->second.gen == token.generation &&
+                         it->second.nodeId == token.nodeId;
+    if (current) {
+        auto& link = it->second.link;
+        if (static_cast<uint8_t>(speed) < static_cast<uint8_t>(link.localToNode)) {
+            link.localToNode = speed;
+        }
+        if (static_cast<uint8_t>(speed) < static_cast<uint8_t>(link.isochToNode)) {
+            link.isochToNode = speed;
+        }
+        uint16_t speedPayload = 0;
+        switch (speed) {
+        case FwSpeed::S100: speedPayload = FW::MaxPayload::kS100; break;
+        case FwSpeed::S200: speedPayload = FW::MaxPayload::kS200; break;
+        case FwSpeed::S400: speedPayload = FW::MaxPayload::kS400; break;
+        case FwSpeed::S800: speedPayload = FW::MaxPayload::kS800; break;
+        }
+        if (link.halvePackets) {
+            speedPayload /= 2;
+        }
+        link.maxPayloadBytes = std::min(link.maxPayloadBytes, speedPayload);
+    }
+    IOLockUnlock(lock_);
+    return current;
+}
+
 std::vector<DeviceRecord> DeviceRegistry::LiveDevices(Generation gen) const {
     IOLockLock(lock_);
     std::vector<DeviceRecord> result;
     
     for (const auto& entry : devicesByGuid_) {
         const auto& device = entry.second;
-        if (device.gen == gen && TryOperationalNodeId(device.nodeId).has_value()) {
+        if (device.gen == gen && HasLiveRoute(device)) {
             result.push_back(device);
         }
     }
@@ -395,8 +492,18 @@ uint64_t DeviceRegistry::AllocateRouteEpochLocked() noexcept {
     return nextRouteEpoch_;
 }
 
+DeviceInstanceId DeviceRegistry::AllocateDeviceInstanceIdLocked() noexcept {
+    // Zero means "no instance", so it is never handed out.
+    ++nextDeviceInstanceId_;
+    if (nextDeviceInstanceId_ == 0) {
+        ++nextDeviceInstanceId_;
+    }
+    return DeviceInstanceId{nextDeviceInstanceId_};
+}
+
 bool DeviceRegistry::HasLiveRoute(const DeviceRecord& device) noexcept {
     return device.state != LifeState::Lost && device.state != LifeState::Quarantined &&
+           device.quarantineReason == QuarantineReason::None &&
            TryOperationalNodeId(device.nodeId).has_value();
 }
 

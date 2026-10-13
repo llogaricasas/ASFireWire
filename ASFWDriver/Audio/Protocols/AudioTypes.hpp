@@ -37,7 +37,19 @@ struct AudioStreamRuntimeCaps {
     uint32_t deviceToHostAm824Slots{0}; // DICE TX stream slots (capture wire format)
     uint32_t hostToDeviceAm824Slots{0}; // DICE RX stream slots (playback wire format)
 
+    // Wire-chunk counts for families whose samples are not quadlet slots. MOTU packs
+    // 3-byte PCM chunks from byte offset 10 of a data block, so its per-direction unit
+    // count is neither an AM824 slot count nor equal to the data block size in quadlets
+    // -- a 14-chunk stream has dbs 13. Kept separate from the AM824 fields so nothing
+    // can mistake one for the other; zero for families that use AM824 slots.
+    uint32_t deviceToHostPcmChunks{0}; // MOTU capture chunks per data block
+    uint32_t hostToDevicePcmChunks{0}; // MOTU playback chunks per data block
+
     uint32_t sampleRateHz{0};
+
+    // Rates the device says it supports, as DICE CLOCK_CAPABILITIES rate bits
+    // (bit 0 = 32 kHz ... bit 6 = 192 kHz). Zero: not reported by this family.
+    uint32_t deviceRateMask{0};
 
     // First active DICE isochronous channel per direction (stream[0]).
     uint8_t deviceToHostIsoChannel{kInvalidIsoChannel}; // DICE TX / host IR
@@ -51,6 +63,11 @@ struct AudioStreamRuntimeCaps {
     uint32_t hostToDeviceStreamCount{0}; // # DICE RX streams (host IT)
     AudioStreamWireInfo deviceToHostStreams[kMaxAudioStreamsPerDirection]{};
     AudioStreamWireInfo hostToDeviceStreams[kMaxAudioStreamsPerDirection]{};
+};
+
+struct RateHardwareObservation {
+    AudioStreamRuntimeCaps caps{};
+    bool clockConfirmed{false};
 };
 
 struct AudioDuplexChannels {

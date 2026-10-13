@@ -10,6 +10,7 @@
 #include <mach/kern_return.h>
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -49,16 +50,63 @@ public:
     virtual ~OSObject() = default;
     virtual bool init() { return true; }
     virtual void free() { delete this; }
-    void retain() {}
-    void release() {}
+
+    // Real refcounting, so the ~160 retain/release/AdoptRetained sites in driver
+    // code are actually exercised on the host. const like the DriverKit original
+    // (OSObject.iig: `retain() const override`), hence the mutable counter.
+    //
+    // free() deletes, so instances must be heap-allocated exactly as they are in
+    // production. A stack-allocated stub released to zero deletes a stack
+    // address; that was harmless while release() did nothing, and is not now.
+    void retain() const { refCount_.fetch_add(1, std::memory_order_relaxed); }
+
+    void release() const {
+        const int previous = refCount_.fetch_sub(1, std::memory_order_acq_rel);
+        if (previous == 1) {
+            const_cast<OSObject*>(this)->free();
+            return;
+        }
+        // A cheap tripwire, NOT a detector -- do not rely on it. release()
+        // destroys on the 1->0 edge, so by the time a count could go negative the
+        // object is already freed and this fetch_sub has itself touched dangling
+        // memory. The check can therefore only fire *through* undefined
+        // behaviour, and assert() is compiled out under NDEBUG
+        // (`./build.sh --config Release` would do it; CI builds Debug).
+        //
+        // The real detector for this class is AddressSanitizer, which reports
+        // heap-use-after-free on the fetch_sub above with a stack trace. The
+        // project has no sanitizer build today; wiring one is the actual fix.
+        assert(previous > 0 && "OSObject::release() below zero (over-release)");
+    }
+
+    [[nodiscard]] int GetRetainCount() const {
+        return refCount_.load(std::memory_order_relaxed);
+    }
+
+private:
+    mutable std::atomic<int> refCount_{1};
 };
 
-class OSAction : public OSObject {};
+class OSAction : public OSObject {
+public:
+    virtual kern_return_t Cancel(void (^handler)(void)) {
+        if (handler) {
+            handler();
+        }
+        return kIOReturnSuccess;
+    }
+};
+
+class OSDictionary;
 
 class IOService : public OSObject {
 public:
     virtual kern_return_t Start(IOService*) { return kIOReturnSuccess; }
     virtual void Stop(IOService*) {}
+    virtual kern_return_t Create(IOService*, const char*, IOService**) { return kIOReturnUnsupported; }
+    virtual kern_return_t CopyProperties(OSDictionary**) { return kIOReturnUnsupported; }
+    virtual kern_return_t SetProperties(OSDictionary*) { return kIOReturnSuccess; }
+    virtual kern_return_t Terminate(uint64_t) { return kIOReturnSuccess; }
 };
 
 using IODispatchQueueName = const char*;
@@ -113,8 +161,12 @@ public:
         std::function<void()> work;
     };
 
-    static kern_return_t Create(const char*, uint64_t, uint64_t, IODispatchQueue**) {
-        return kIOReturnUnsupported;
+    static kern_return_t Create(const char*, uint64_t, uint64_t, IODispatchQueue** queue) {
+        if (!queue) {
+            return kIOReturnBadArgument;
+        }
+        *queue = new IODispatchQueue();
+        return kIOReturnSuccess;
     }
 
     void DispatchAsync(const std::function<void()>& work) {
@@ -147,9 +199,14 @@ public:
     }
 
     void DispatchSync(const std::function<void()>& work) {
+        std::scoped_lock lock(executionMutex_);
         if (work) {
             work();
         }
+    }
+
+    [[nodiscard]] std::mutex& ExecutionMutexForTesting() noexcept {
+        return executionMutex_;
     }
 
     void SetManualDispatchForTesting(bool manual) {
@@ -229,6 +286,7 @@ private:
 
     bool manualDispatchForTesting_{false};
     mutable std::mutex pendingLock_;
+    mutable std::mutex executionMutex_;
     std::deque<PendingWorkItem> pending_;
 };
 
@@ -255,7 +313,12 @@ public:
     }
 
     kern_return_t SetTimeout(uint64_t, uint64_t, void*) { return kIOReturnUnsupported; }
-    kern_return_t Cancel(void*) { return kIOReturnUnsupported; }
+    virtual kern_return_t Cancel(void (^handler)(void)) {
+        if (handler) {
+            handler();
+        }
+        return kIOReturnSuccess;
+    }
 };
 
 class IODataQueueDispatchSource : public OSObject {
@@ -269,7 +332,10 @@ public:
     }
     
     kern_return_t SetEnable(bool) { return kIOReturnUnsupported; }
-    kern_return_t Cancel(void*) { return kIOReturnUnsupported; }
+    virtual kern_return_t Cancel(void (^handler)(void)) {
+        if (handler) handler();
+        return kIOReturnSuccess;
+    }
 };
 
 class IOPCIDevice : public IOService {
@@ -427,32 +493,57 @@ class OSSharedPtr {
 public:
     OSSharedPtr() = default;
     OSSharedPtr(T* ptr, OSNoRetainTag) : ptr_(ptr) {}
-    OSSharedPtr(T* ptr, OSRetainTag) : ptr_(ptr) {}
+    OSSharedPtr(T* ptr, OSRetainTag) : ptr_(ptr) { if (ptr_) { ptr_->retain(); } }
     OSSharedPtr(std::nullptr_t) : ptr_(nullptr) {}
 
-    T* get() const { return ptr_.get(); }
-    T* operator->() const { return ptr_.get(); }
+    OSSharedPtr(const OSSharedPtr& other) : ptr_(other.ptr_) {
+        if (ptr_) { ptr_->retain(); }
+    }
+    OSSharedPtr(OSSharedPtr&& other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullptr; }
+    OSSharedPtr& operator=(const OSSharedPtr& other) {
+        if (this != &other) {
+            if (other.ptr_) { other.ptr_->retain(); }
+            reset();
+            ptr_ = other.ptr_;
+        }
+        return *this;
+    }
+    OSSharedPtr& operator=(OSSharedPtr&& other) noexcept {
+        if (this != &other) {
+            reset();
+            ptr_ = other.ptr_;
+            other.ptr_ = nullptr;
+        }
+        return *this;
+    }
+    ~OSSharedPtr() { reset(); }
+
+    T* get() const { return ptr_; }
+    T* operator->() const { return ptr_; }
     T& operator*() const { return *ptr_; }
     explicit operator bool() const { return ptr_ != nullptr; }
 
-    void reset() { ptr_.reset(); }
-    void reset(T* ptr, OSNoRetainTag) { ptr_.reset(ptr); }
-    void reset(T* ptr, OSRetainTag) { ptr_.reset(ptr); }
+    void reset() {
+        if (ptr_) { ptr_->release(); }
+        ptr_ = nullptr;
+    }
+    void reset(T* ptr, OSNoRetainTag) { reset(); ptr_ = ptr; }
+    void reset(T* ptr, OSRetainTag) {
+        if (ptr) { ptr->retain(); }
+        reset();
+        ptr_ = ptr;
+    }
 
-    // Ownership transfer to the caller. Stub OSObject::release() is a no-op,
-    // so keep one strong ref alive (intentional leak) instead of letting the
-    // shared_ptr destroy an object the caller still holds.
+    // Ownership transfer: the caller takes our reference. No leak needed now
+    // that release() really decrements.
     T* detach() {
-        T* raw = ptr_.get();
-        if (raw) {
-            new std::shared_ptr<T>(ptr_);
-        }
-        ptr_.reset();
+        T* raw = ptr_;
+        ptr_ = nullptr;
         return raw;
     }
 
 private:
-    std::shared_ptr<T> ptr_;
+    T* ptr_{nullptr};
 };
 
 #endif // ASFW_HOST_TEST

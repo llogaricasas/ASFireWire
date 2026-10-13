@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <memory>
 #include <vector>
 
 #include "ApogeeTypes.hpp"
@@ -29,8 +30,8 @@
 #include "../../../../Async/Interfaces/IFireWireBusOps.hpp"
 #include "../../../../Discovery/DeviceRouteToken.hpp"
 
-namespace ASFW::Protocols::AVC {
-class FCPTransport;
+namespace ASFW::AVC {
+class IAvcUnit;
 }
 
 namespace ASFW::Audio::Oxford::Apogee {
@@ -53,7 +54,7 @@ using SequenceCallback = std::function<void(IOReturn, const std::vector<ApogeeVe
 ///
 /// `isStatus` selects the AV/C ctype: a status query omits the value operands
 /// and expects them back, a control command carries them.
-void Send(Protocols::AVC::FCPTransport* transport,
+void Send(const std::shared_ptr<AVC::IAvcUnit>& unit,
           const ApogeeVendorCommand& command,
           bool isStatus,
           ResultCallback callback);
@@ -62,7 +63,7 @@ void Send(Protocols::AVC::FCPTransport* transport,
 /// first failure. The Duet's params groups are read and written as sequences,
 /// and a partially applied group is worse than a failed one - so an error
 /// aborts rather than continuing with the rest.
-void ExecuteSequence(Protocols::AVC::FCPTransport* transport,
+void ExecuteSequence(const std::shared_ptr<AVC::IAvcUnit>& unit,
                      const std::vector<ApogeeVendorCommand>& commands,
                      bool isStatus,
                      SequenceCallback callback);
@@ -86,10 +87,7 @@ inline constexpr uint32_t kMixerBlockBytes = 16;
 
 [[nodiscard]] constexpr Async::FWAddress AddressFor(uint32_t offset) noexcept {
     const uint64_t address = kBaseAddress + offset;
-    return Async::FWAddress{Async::FWAddress::AddressParts{
-        .addressHi = static_cast<uint16_t>((address >> 32U) & 0xFFFFU),
-        .addressLo = static_cast<uint32_t>(address & 0xFFFFFFFFU),
-    }};
+    return FW::Unpack(address);  // 48-bit address, node ID 0
 }
 
 [[nodiscard]] constexpr Async::FWAddress InputAddress() noexcept {

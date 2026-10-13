@@ -48,7 +48,42 @@ Run these commands from the ASFireWire repository root.
    python3 skills/asfw-mcp-control-plane/scripts/asfw_mcp.py call asfw_read_quadlet '{"nodeId":0,"generation":9,"addressHigh":65535,"addressLow":4026532864}'
    ```
 
+## Running driver build
+
+Before comparing live behavior with the checkout, read the commit embedded in
+the **running dext**. This uses the driver user client's version method and
+issues no FireWire transaction, so it is safe during active audio:
+
+```bash
+python3 skills/asfw-mcp-control-plane/scripts/asfw_mcp.py call asfw_get_driver_version '{}'
+```
+
+Use `gitCommitFull`, `gitBranch`, `gitDirty`, and `buildTimestamp` from the
+response. The checkout's `DriverVersion.hpp` describes a build artifact and
+does not prove which dext is currently running.
+
 Pass `--endpoint` or set `ASFW_MCP_ENDPOINT` when the server uses a non-default loopback port.
+
+## M-Audio 1814 Virtual UART diagnostics
+
+The 1814 shell can report its own isochronous counters, sync state, routing,
+and peak meters. Use the current physical `nodeId` and `expectedGeneration`
+from `summary`. These tools send FireWire mailbox writes even though the shell
+commands only read diagnostic state. They are gated as `developerWrite`, so do
+not call them without authorization for live device control.
+
+```bash
+python3 tools/1814/bebob_shell.py --node <nodeId> --gen <expectedGeneration> \
+  'sys stat' 'sys avstat all' 'fw show' 'fw mix show' 'fw vol peak'
+```
+
+The MCP tool `asfw_bebob_shell_execute` accepts any single printable ASCII
+shell command and checks the 1814 identity and bus generation before each
+transaction. Commands may change device settings, so treat each call as a
+developer write. The five convenience tools `asfw_bebob_get_streaming_stats`,
+`asfw_bebob_get_silicon_status`, `asfw_bebob_get_sync_state`,
+`asfw_bebob_get_mixer_routing`, and `asfw_bebob_get_meter_peaks` use the same
+guarded path. `fw mix show` is routing readback; it does not change routing.
 
 ## Config-ROM explorer
 
@@ -213,25 +248,31 @@ timed.  A small, targeted driver-ring query is permitted only when requested;
 it is read-only and never changes stream state.  Do not run broad or parallel
 queries while audio is playing.
 
-For a live TX-content incident, use the retained `DirectAudio` anomaly record:
+For a live TX-content incident, query the retained `DirectAudio` lines. The
+`[TxPrep]` heartbeat carries the fill's health (`missedFinality`: frames that
+reached their packet too late and went out silent; `sOutMinPk`: the smallest
+margin, in packets, between a filled packet and the first packet the fill may
+still write, which is the projected hardware position plus 2). `[TxPrepRange]`
+is the refill-hole evidence (a producer pass that stopped below the descriptor
+floor):
 
 ```bash
 python3 skills/asfw-mcp-control-plane/scripts/asfw_mcp.py call asfw_log_query \
-  '{"categories":["DirectAudio"],"contains":"[PayloadWriter] anomaly","maxLevel":"debug","maxRecords":20}'
+  '{"categories":["DirectAudio"],"contains":"[TxPrep","maxLevel":"debug","maxRecords":20}'
 ```
 
-`[PayloadWriter] anomaly` is already MCP-visible because `ASFW_LOG` writes to
-the driver-owned ring.  The first-deficit and last-callback sections include:
+`[TxPrepFrame]` and `[TxExposure]` no longer exist (milestone 6,
+`documentation/TX_OWNERSHIP.md`); an older log that has them came from a
+driver before the audio-side fill.
 
-- host range, exposed timeline end, and exposure deficit;
-- `firstPacketizer` / `lastPacketizer`: absolute `next` cursor, alignment bit,
-  cursor epoch, last DATA packet index, and its `[first,end)` audio range;
-- `prepared`: total, DATA, NODATA, and slot-acquisition-failure counters.
+These lines are ring-only (`ASFW_LOG_RING_ONLY`), so read them through the
+driver log ring as above rather than `log show`. A healthy run shows only the
+periodic `[TxPrep]` heartbeat.
 
-The packetizer snapshot is intentionally best-effort and read-only across the
-audio callback/TX-preparation boundary.  Interpret a cursor mismatch or a
-cursor-epoch change as evidence for a timeline transition; do not treat the
-diagnostic snapshot as a synchronization primitive.
+The former `[PayloadWriter]` record was retired in FW-171: it was recorded
+from the real-time IO callback into the shared control block and drained on
+the receive path, and its query string (`[PayloadWriter] anomaly`) never
+matched an emitted line.
 
 ### Stream will not start: attribute it before theorising
 
@@ -265,6 +306,24 @@ imply a host-side handshake obligation. Report the counters; do not infer intent
 `packetsSeen == noDataPackets` is the only sound basis for "the device is sending
 only NO-DATA". A non-zero reject counter with `packetsSeen > 0` means the device
 did send us something we threw away.
+
+### Stream runs but sounds wrong: the stable telemetry summary
+
+Once a stream is up, `asfw_get_audio_telemetry` returns the full per-endpoint
+summary (wire v4, read-only, no transaction): TX preparation latency and
+committed-margin histograms, RX capture-ring occupancy/overrun/starvation, and
+for each completed interval **its duration and end time** — so counts can be
+turned into rates. `completedIntervalDurationNs: null` means the duration is
+unknown (first interval after a reset); do not divide by it. The `rxAttribution`
+member carries the same verdict as `asfw_get_audio_stream_health`.
+
+```bash
+python3 skills/asfw-mcp-control-plane/scripts/asfw_mcp.py call asfw_get_audio_telemetry '{}'
+```
+
+This summary is deliberately small and stable. It is not a research trace: new
+experiments go to the log ring, never into this contract
+(`documentation/OBSERVABILITY_INVENTORY.md`).
 
 Pair it with the bring-up records, which are emitted for a stream that has **not**
 established yet (bounded per start, so a healthy stream stays silent):

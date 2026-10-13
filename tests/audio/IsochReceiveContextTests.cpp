@@ -6,7 +6,6 @@
 #include "Isoch/Memory/IsochDMAMemoryManager.hpp"
 #include "Hardware/HardwareInterface.hpp"
 #include "Hardware/OHCIConstants.hpp"
-#include "Audio/DriverKit/Runtime/PayloadWriterTelemetry.hpp"
 
 // Use a mock or stub for HardwareInterface
 namespace ASFW::Driver {
@@ -44,57 +43,6 @@ class RecordingReceiveConsumer final : public IIsochReceiveConsumer {
     uint32_t quiesceCount{0};
     IsochReceiveBatch lastBatch{};
 };
-
-TEST(PayloadWriterTelemetryTests,
-     HistoricalStartupCountersDoNotMakeTheHealthySteadyStateNoisy) {
-    using ASFW::Audio::Runtime::PayloadWriterTelemetryAnomalyAggregator;
-    using ASFW::Audio::Runtime::PayloadWriterTelemetryRecord;
-
-    PayloadWriterTelemetryAnomalyAggregator aggregator;
-    PayloadWriterTelemetryRecord record{};
-    record.visited = 1'000;
-    record.written = 900;
-    record.withoutPacket = 100;
-
-    aggregator.BeginDrain();
-    aggregator.Observe(record);
-    EXPECT_FALSE(aggregator.Summary().HasAnomaly());
-
-    aggregator.BeginDrain();
-    record.visited += 512;
-    record.written += 512;
-    aggregator.Observe(record);
-    EXPECT_FALSE(aggregator.Summary().HasAnomaly());
-
-    aggregator.BeginDrain();
-    ++record.visited;
-    ++record.withoutPacket;
-    aggregator.Observe(record);
-    EXPECT_TRUE(aggregator.Summary().HasAnomaly());
-    EXPECT_EQ(aggregator.Summary().withoutPacketDelta, 1u);
-    EXPECT_EQ(aggregator.Summary().visitedDelta, 1u);
-    EXPECT_EQ(aggregator.Summary().writtenDelta, 0u);
-}
-
-TEST(PayloadWriterTelemetryTests, DrainVisitsAllRetainedRecordsOffTheCallbackPath) {
-    using ASFW::Audio::Runtime::PayloadWriterTelemetryRecord;
-    using ASFW::Audio::Runtime::PayloadWriterTelemetryRing;
-
-    PayloadWriterTelemetryRing ring;
-    for (uint64_t sampleTime = 1; sampleTime <= 3; ++sampleTime) {
-        PayloadWriterTelemetryRecord record{};
-        record.sampleTime = sampleTime;
-        ring.Record(record);
-    }
-
-    uint64_t visited = 0;
-    EXPECT_EQ(ring.Drain([&visited](const PayloadWriterTelemetryRecord&) {
-                  ++visited;
-              }),
-              0u);
-    EXPECT_EQ(visited, 3u);
-    EXPECT_EQ(ring.PendingCount(), 0u);
-}
 
 TEST(ZtsTelemetryLogGateTests,
      EmitsSeedThenEveryFourSecondsAndRearmsOnGridReset) {
@@ -186,14 +134,19 @@ TEST_F(IsochReceiveContextTest, ConfigurationAllocatesRings) {
     EXPECT_GT(dmaMemory_->TotalSize(), 2000000);
 }
 
+// Start clears the whole ContextControl and only this context's stale event
+// bit (a stop leaves it set, OHCI 1.2 draft §3.1.1.3), then unmasks it, as
+// Linux ohci_start_iso does.
 TEST_F(IsochReceiveContextTest, StartProgramsRegisters) {
     context_->Configure(0, 0);
     auto kr = context_->Start();
     EXPECT_EQ(kr, kIOReturnSuccess);
-    
-    // We would need to inspect HardwareInterface stub state to verify writes
-    // Since we are using the simple Stub, we trust it returns success.
-    // Ideally we'd use a MockHardwareInterface to verify ::Write calls.
+
+    const auto reg = [](uint32_t offset) { return static_cast<::ASFW::Driver::Register32>(offset); };
+    EXPECT_EQ(hardware_->GetTestRegister(reg(::DMAContextHelpers::IsoRcvContextControlClear(0))),
+              0xFFFFFFFFu);
+    EXPECT_EQ(hardware_->GetTestRegister(::ASFW::Driver::Register32::kIsoRecvIntEventClear), 1u);
+    EXPECT_EQ(hardware_->GetTestRegister(::ASFW::Driver::Register32::kIsoRecvIntMaskSet) & 1u, 1u);
 }
 
 TEST_F(IsochReceiveContextTest, StopFlushesRunClearAndOnlyThenMarksStopped) {
@@ -255,4 +208,22 @@ TEST_F(IsochReceiveContextTest, PollPublishesTheBatchToAContentConsumer) {
     hardware_->SetTestRegister(controlSet, 0);
     EXPECT_EQ(context_->Stop(), kIOReturnSuccess);
     EXPECT_EQ(consumer.quiesceCount, 1u);
+}
+
+TEST_F(IsochReceiveContextTest, BusyPollRetainsBindingUntilStopCanAcquireOwnership) {
+    ASSERT_EQ(context_->Configure(3, 0), kIOReturnSuccess);
+    RecordingReceiveConsumer consumer;
+    context_->SetReceiveConsumer(&consumer);
+    ASSERT_EQ(context_->Start(), kIOReturnSuccess);
+    ASSERT_TRUE(context_->AcquirePollGateForTesting());
+    EXPECT_EQ(context_->Stop(), kIOReturnTimeout);
+    EXPECT_EQ(consumer.quiesceCount, 0U);
+    EXPECT_FALSE(context_->AcquirePollGateForTesting());
+    context_->ReleasePollGateForTesting();
+    const auto controlSet = static_cast<::ASFW::Driver::Register32>(
+        ::DMAContextHelpers::IsoRcvContextControlSet(0));
+    hardware_->SetTestRegister(controlSet, 0);
+    EXPECT_EQ(context_->Stop(), kIOReturnSuccess);
+    EXPECT_EQ(consumer.quiesceCount, 1U);
+    context_->SetReceiveConsumer(nullptr);
 }

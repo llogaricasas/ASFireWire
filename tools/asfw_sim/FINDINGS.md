@@ -3,7 +3,34 @@
 Run against HEAD `e5e0c1f` (`audio/stabilize`), constants parsed live from
 `AudioTimingGeometry.hpp` / `AudioHalBufferProfiles.hpp` / `RxSequenceReplay.hpp`.
 
-## Constants, as the driver actually defines them
+> **V3 update (FW-183c, 2026-09).** The findings below were derived at the
+> pre-V3 geometry shown in the next table; `tests/test_stall_cliff.py` pins
+> F3/F4 to it (`g48_f3`). At V3 (12288-frame ring/ZTS at 48 kHz, horizon
+> floored at 4096 + 64 frames, lead 1648, store and timeline 1696) the
+> header scrape gives the values in `tests/test_constants_match_headers.py`,
+> and the dynamics move: the stall cliff is ~129 ms (was 78), a 100 ms stall
+> is survived, replay capacity up to 2048 no longer sets the cliff, and the
+> start-up prefill leaves ~0.24 s unwritten per run (was ~0.12 s). The F5
+> prediction for a 4096-frame IO (lead 1650, store 1704) matches V3's
+> 1648/1696 within rounding.
+
+> **T4/T5 update (documentation/TX_OWNERSHIP.md, 2026-09-26). Do not use the
+> conclusions below without re-deriving them.** T4 removed the W/E rendezvous
+> this simulator models: PCM is copied once from the HAL ring by the fill, so
+> the frame-exposure window and data horizon no longer size anything. T5 made
+> the IT queue finite (ring 504, coverage 1008, shared slots 1512) and grew the
+> RX replay history to 2048 with the read delay kept at 256. The simulator's
+> `replay_headroom_packets = kReadDelay - lead` does not match the live
+> mechanism: the RX-to-TX replay distance is kReadDelay plus the TX lead when
+> the reader began, and history minus read delay is the producer-stall budget.
+> `tests/test_constants_match_headers.py` records the new constants.
+>
+> Against the live headers 22 of the simulator's own tests now fail (stall
+> cliff 13, clock drift 3, diagnose 3, scenarios 3): they encode the pre-T5
+> geometry on top of the pre-T4 model. All 110 passed at `dcf04127`. The
+> simulator is not in ctest or CI. Whether to retire or rework it is open.
+
+## Constants, as the driver actually defined them (pre-V3)
 
 Profile `dice-working-1536`. Every derived value reproduced by `headers.py`:
 

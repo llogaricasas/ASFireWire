@@ -1,5 +1,8 @@
 #include "Audio/DriverKit/Runtime/AudioTransportControlBlock.hpp"
+#include "Audio/DriverKit/Runtime/MotuRxSphRateMeter.hpp"
+#include "Audio/DriverKit/Runtime/MotuServoStallDetector.hpp"
 #include "Audio/Runtime/AudioTelemetrySnapshot.hpp"
+#include "Audio/Wire/MOTU/MotuSph.hpp"
 
 #include <gtest/gtest.h>
 
@@ -15,17 +18,23 @@ using ASFW::Audio::Runtime::TxProducerFaultReason;
 using ASFW::Audio::Runtime::TxProducerFaultRecord;
 using ASFW::Audio::Runtime::TxProducerFaultStage;
 using ASFW::Audio::Runtime::AudioTelemetryEndpointSnapshot;
+using ASFW::Audio::Runtime::MotuPhaseTraceCadenceSample;
+using ASFW::Audio::Runtime::MotuRelPhaseSampleRecord;
+using ASFW::Audio::Runtime::MotuRxSphClockSample;
+using ASFW::Audio::Runtime::MotuRxSphRateMeter;
+using ASFW::Audio::Runtime::MotuServoStallDetector;
+using ASFW::Audio::Runtime::MotuServoStallEvent;
+using ASFW::Encoding::Motu::SphFromTick;
 
 TEST(AudioTransportControlBlockTests, PreparationRequestsAreMonotonicAndCoalescible) {
     TxPreparationRequestState requests{};
 
     EXPECT_FALSE(requests.NeedsHandling());
-    EXPECT_EQ(requests.PublishRequest(100, 600), 1U);
-    EXPECT_EQ(requests.PublishRequest(200, 1200), 2U);
+    EXPECT_EQ(requests.PublishRequest(100), 1U);
+    EXPECT_EQ(requests.PublishRequest(200), 2U);
     EXPECT_TRUE(requests.NeedsHandling());
     EXPECT_EQ(requests.RequestedGeneration(), 2U);
     EXPECT_EQ(requests.requestHostTicks.load(std::memory_order_relaxed), 200U);
-    EXPECT_EQ(requests.requestedTargetFrameEnd.load(std::memory_order_acquire), 1200U);
     EXPECT_TRUE(requests.TryScheduleWake());
     EXPECT_FALSE(requests.TryScheduleWake());
 
@@ -37,7 +46,7 @@ TEST(AudioTransportControlBlockTests, PreparationRequestsAreMonotonicAndCoalesci
     EXPECT_TRUE(requests.TryScheduleWake());
     requests.FinishWake();
 
-    EXPECT_EQ(requests.PublishRequest(300, 1800), 3U);
+    EXPECT_EQ(requests.PublishRequest(300), 3U);
     EXPECT_TRUE(requests.NeedsHandling());
 }
 
@@ -107,7 +116,7 @@ TEST(AudioTransportControlBlockTests, RxCaptureTelemetryCapturesIntervalWatermar
     telemetry.RecordOverrun(32);
     telemetry.RecordStarvation(16);
     telemetry.RecordReaderBeginRead();
-    telemetry.CompleteInterval();
+    telemetry.CompleteInterval(1000);
 
     AudioTelemetryEndpointSnapshot snapshot{};
     ASFW::Audio::Runtime::CopyAudioTelemetrySnapshot(control, snapshot);
@@ -128,7 +137,7 @@ TEST(AudioTransportControlBlockTests, RxCaptureTelemetryCapturesIntervalWatermar
 
 TEST(AudioTransportControlBlockTests, RxCaptureReaderActivityIsScopedToTheCompletedInterval) {
     AudioTransportControlBlock control{};
-    control.rxCaptureBufferTelemetry.CompleteInterval();
+    control.rxCaptureBufferTelemetry.CompleteInterval(1000);
 
     AudioTelemetryEndpointSnapshot snapshot{};
     ASFW::Audio::Runtime::CopyAudioTelemetrySnapshot(control, snapshot);
@@ -137,38 +146,12 @@ TEST(AudioTransportControlBlockTests, RxCaptureReaderActivityIsScopedToTheComple
     EXPECT_EQ(snapshot.flags & ASFW::Audio::Runtime::kAudioTelemetryRxCaptureReaderActive, 0U);
 }
 
-TEST(AudioTransportControlBlockTests, WirePayloadTelemetryStaysInAudioAndFlagsDropout) {
-    AudioTransportControlBlock control{};
-    const uint8_t dataPacket[] = {
-        0, 0, 0, 0, 0, 0, 0, 0,
-        0x40, 0x00, 0x00, 0x01,
-    };
-    const uint8_t zeroPacket[] = {
-        0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0,
-    };
-
-    const auto first = control.txWirePayloadTelemetry.Observe(
-        12, dataPacket, sizeof(dataPacket));
-    EXPECT_TRUE(first.firstInfo);
-    EXPECT_FALSE(first.dropout);
-    EXPECT_EQ(first.infoQuads, 1U);
-
-    const auto dropout = control.txWirePayloadTelemetry.Observe(
-        13, zeroPacket, sizeof(zeroPacket));
-    EXPECT_FALSE(dropout.firstInfo);
-    EXPECT_TRUE(dropout.dropout);
-    EXPECT_EQ(control.txWirePayloadTelemetry.firstInfoPacketIndex.load(), 12U);
-    EXPECT_EQ(control.txWirePayloadTelemetry.pcmDropouts.load(), 1U);
-}
-
 TEST(AudioTransportControlBlockTests, ResetForStartClearsNestedStateAndIncrementsGeneration) {
     AudioTransportControlBlock control{};
 
     control.generation.store(41, std::memory_order_relaxed);
     control.client.PublishBeginRead(2000, 456, 64);
     control.client.PublishWriteEnd(1000, 123, 128);
-    control.device.Publish(3000, 789, 55);
     control.counters.CountBeginRead();
     control.counters.CountWriteEnd();
     control.counters.CountZtsPublished();
@@ -183,8 +166,6 @@ TEST(AudioTransportControlBlockTests, ResetForStartClearsNestedStateAndIncrement
     control.discontinuities.store(5, std::memory_order_relaxed);
     control.playbackRingOldestValidFrame.store(123, std::memory_order_relaxed);
     control.playbackRingDiscontinuityGeneration.store(6, std::memory_order_relaxed);
-    control.txScheduledSampleFrame.store(456, std::memory_order_relaxed);
-    control.txCompletedSampleFrame.store(400, std::memory_order_relaxed);
     control.txMinimumPreparationDistance.store(70, std::memory_order_relaxed);
     control.txMinimumCommittedMarginPackets.store(
         12, std::memory_order_relaxed);
@@ -205,9 +186,6 @@ TEST(AudioTransportControlBlockTests, ResetForStartClearsNestedStateAndIncrement
     for (auto& bucket : control.txIntervalCommittedMarginHistogram) {
         bucket.store(11, std::memory_order_relaxed);
     }
-    control.txLastLeadTicks.store(40, std::memory_order_relaxed);
-    control.txMinimumLeadTicks.store(10, std::memory_order_relaxed);
-    control.txMaximumLeadTicks.store(70, std::memory_order_relaxed);
     control.counters.txPhaseRebases.store(1, std::memory_order_relaxed);
     control.counters.txSilenceFallback.store(2, std::memory_order_relaxed);
     control.counters.txStaleOverwrittenReads.store(3, std::memory_order_relaxed);
@@ -219,11 +197,8 @@ TEST(AudioTransportControlBlockTests, ResetForStartClearsNestedStateAndIncrement
     (void)control.txPreparationRequests.PublishRequest(1000);
     control.txPreparationRequests.MarkHandled(1, 1100);
     control.counters.txPreparationWakeRequests.store(1, std::memory_order_relaxed);
-    control.counters.txCompletedPayloadHashMatches.store(4, std::memory_order_relaxed);
-    control.counters.txCompletedPayloadHashMismatches.store(5, std::memory_order_relaxed);
     control.counters.txPayloadMismatchFaults.store(6, std::memory_order_relaxed);
     control.counters.txPostLockNoDataPackets.store(8, std::memory_order_relaxed);
-    control.txFatalSnapshot.packetIndex.store(12, std::memory_order_relaxed);
     control.fatalGeneration.store(13, std::memory_order_relaxed);
     control.fatalReason.store(FatalStreamReason::TxReadAhead, std::memory_order_relaxed);
 
@@ -240,11 +215,6 @@ TEST(AudioTransportControlBlockTests, ResetForStartClearsNestedStateAndIncrement
     EXPECT_EQ(control.client.outputWriteEndFrames.load(std::memory_order_relaxed), 0U);
     EXPECT_EQ(control.client.OutputWrittenEndFrame(), 0U);
 
-    EXPECT_EQ(control.device.sampleFrame.load(std::memory_order_relaxed), 0U);
-    EXPECT_EQ(control.device.hostTicks.load(std::memory_order_relaxed), 0U);
-    EXPECT_EQ(control.device.hostNanosPerSampleQ8.load(std::memory_order_relaxed), 0U);
-    EXPECT_EQ(control.device.generation.load(std::memory_order_acquire), 0U);
-
     EXPECT_EQ(control.counters.ioBeginReadCount.load(std::memory_order_relaxed), 0U);
     EXPECT_EQ(control.counters.ioWriteEndCount.load(std::memory_order_relaxed), 0U);
     EXPECT_EQ(control.counters.txPackets.load(std::memory_order_relaxed), 0U);
@@ -260,8 +230,6 @@ TEST(AudioTransportControlBlockTests, ResetForStartClearsNestedStateAndIncrement
     EXPECT_EQ(control.discontinuities.load(std::memory_order_acquire), 0U);
     EXPECT_EQ(control.playbackRingOldestValidFrame.load(std::memory_order_acquire), 0U);
     EXPECT_EQ(control.playbackRingDiscontinuityGeneration.load(std::memory_order_acquire), 0U);
-    EXPECT_EQ(control.txScheduledSampleFrame.load(std::memory_order_acquire), 0U);
-    EXPECT_EQ(control.txCompletedSampleFrame.load(std::memory_order_acquire), 0U);
     EXPECT_EQ(control.txMinimumPreparationDistance.load(std::memory_order_acquire),
               UINT32_MAX);
     EXPECT_EQ(
@@ -288,11 +256,6 @@ TEST(AudioTransportControlBlockTests, ResetForStartClearsNestedStateAndIncrement
     for (const auto& bucket : control.txIntervalCommittedMarginHistogram) {
         EXPECT_EQ(bucket.load(std::memory_order_acquire), 0U);
     }
-    EXPECT_EQ(control.txLastLeadTicks.load(std::memory_order_acquire), 0);
-    EXPECT_EQ(control.txMinimumLeadTicks.load(std::memory_order_acquire),
-              INT64_MAX);
-    EXPECT_EQ(control.txMaximumLeadTicks.load(std::memory_order_acquire),
-              INT64_MIN);
     EXPECT_EQ(control.counters.txPhaseRebases.load(std::memory_order_relaxed), 0U);
     EXPECT_EQ(control.counters.txSilenceFallback.load(std::memory_order_relaxed), 0U);
     EXPECT_EQ(control.counters.txStaleOverwrittenReads.load(std::memory_order_relaxed), 0U);
@@ -308,22 +271,269 @@ TEST(AudioTransportControlBlockTests, ResetForStartClearsNestedStateAndIncrement
     EXPECT_EQ(control.counters.txPreparationWakeRequests.load(
                   std::memory_order_relaxed),
               0U);
-    EXPECT_EQ(control.counters.txCompletedPayloadHashMatches.load(
-                  std::memory_order_relaxed),
-              0U);
-    EXPECT_EQ(control.counters.txCompletedPayloadHashMismatches.load(
-                  std::memory_order_relaxed),
-              0U);
     EXPECT_EQ(control.counters.txPayloadMismatchFaults.load(
                   std::memory_order_relaxed),
               0U);
     EXPECT_EQ(control.counters.txPostLockNoDataPackets.load(
                   std::memory_order_relaxed),
               0U);
-    EXPECT_EQ(control.txFatalSnapshot.packetIndex.load(std::memory_order_relaxed), 0U);
     EXPECT_EQ(control.fatalGeneration.load(std::memory_order_acquire), 0U);
     EXPECT_EQ(control.fatalReason.load(std::memory_order_acquire),
               FatalStreamReason::None);
+}
+
+// The MOTU RX clock bridge carries one cumulative measurement per publication,
+// for the armed start generation only, and only forward.
+TEST(AudioTransportControlBlockTests, MotuRxSphClockBridgePublishesOnlyMonotonicCurrentGeneration) {
+    AudioTransportControlBlock control{};
+    control.ResetForStart();
+    const uint64_t streamGeneration = control.generation.load(std::memory_order_acquire);
+
+    MotuRxSphClockSample observed{};
+    uint64_t updates = 0;
+    EXPECT_FALSE(control.motuRxSphClock.ReadLatest(observed, updates));
+
+    // Four seconds at exactly 512 ticks per frame (48 kHz).
+    ASSERT_TRUE(control.motuRxSphClock.Publish(
+        {.streamGeneration = streamGeneration, .rxFrames = 192000, .rxTicks = 98304000}));
+    ASSERT_TRUE(control.motuRxSphClock.ReadLatest(observed, updates));
+    EXPECT_EQ(updates, 1U);
+    EXPECT_EQ(observed.streamGeneration, streamGeneration);
+    EXPECT_EQ(observed.rxFrames, 192000U);
+    EXPECT_EQ(observed.rxTicks, 98304000);
+
+    // Backwards in the same generation, and a generation that is not armed.
+    EXPECT_FALSE(control.motuRxSphClock.Publish(
+        {.streamGeneration = streamGeneration, .rxFrames = 191992, .rxTicks = 98299904}));
+    EXPECT_FALSE(control.motuRxSphClock.Publish(
+        {.streamGeneration = streamGeneration + 1, .rxFrames = 192008, .rxTicks = 98308096}));
+    // Frames forward with ticks standing still is not a measurement either.
+    EXPECT_FALSE(control.motuRxSphClock.Publish(
+        {.streamGeneration = streamGeneration, .rxFrames = 192008, .rxTicks = 98304000}));
+    // Empty samples are refused outright.
+    EXPECT_FALSE(control.motuRxSphClock.Publish(
+        {.streamGeneration = 0, .rxFrames = 192008, .rxTicks = 98308096}));
+    EXPECT_FALSE(control.motuRxSphClock.Publish(
+        {.streamGeneration = streamGeneration, .rxFrames = 0, .rxTicks = 98308096}));
+    ASSERT_TRUE(control.motuRxSphClock.ReadLatest(observed, updates));
+    EXPECT_EQ(updates, 1U);
+    EXPECT_EQ(observed.rxFrames, 192000U);
+
+    ASSERT_TRUE(control.motuRxSphClock.Publish(
+        {.streamGeneration = streamGeneration, .rxFrames = 192008, .rxTicks = 98308096}));
+    ASSERT_TRUE(control.motuRxSphClock.ReadLatest(observed, updates));
+    EXPECT_EQ(updates, 2U);
+    EXPECT_EQ(observed.rxFrames, 192008U);
+    EXPECT_EQ(observed.rxTicks, 98308096);
+}
+
+// A new start empties the bridge, re-arms it with the new generation, and
+// refuses a late publication from the stream before it.
+TEST(AudioTransportControlBlockTests, MotuRxSphClockBridgeRebasesOnStartGeneration) {
+    AudioTransportControlBlock control{};
+    control.ResetForStart();
+    const uint64_t firstGeneration = control.generation.load(std::memory_order_acquire);
+    ASSERT_TRUE(control.motuRxSphClock.Publish(
+        {.streamGeneration = firstGeneration, .rxFrames = 192000, .rxTicks = 98304000}));
+
+    control.ResetForStart();
+    const uint64_t secondGeneration = control.generation.load(std::memory_order_acquire);
+    ASSERT_EQ(secondGeneration, firstGeneration + 1);
+
+    MotuRxSphClockSample observed{};
+    uint64_t updates = 0;
+    EXPECT_FALSE(control.motuRxSphClock.ReadLatest(observed, updates));
+    EXPECT_FALSE(control.motuRxSphClock.Publish(
+        {.streamGeneration = firstGeneration, .rxFrames = 192008, .rxTicks = 98308096}));
+
+    // The counters start over: a small sample is accepted in the new stream.
+    ASSERT_TRUE(control.motuRxSphClock.Publish(
+        {.streamGeneration = secondGeneration, .rxFrames = 8, .rxTicks = 4096}));
+    ASSERT_TRUE(control.motuRxSphClock.ReadLatest(observed, updates));
+    EXPECT_EQ(updates, 1U);
+    EXPECT_EQ(observed.streamGeneration, secondGeneration);
+    EXPECT_EQ(observed.rxFrames, 8U);
+    EXPECT_EQ(observed.rxTicks, 4096);
+}
+
+// An internal receive-context restart does not run ResetForStart, so the
+// bridge stays armed for the same generation. Re-anchoring the meter breaks
+// only the step across the gap; its cumulative totals stay monotonic and the
+// bridge keeps accepting them.
+TEST(AudioTransportControlBlockTests,
+     ReceiveReactivationWithinSameGenerationPreservesMotuClockBridgeProgress) {
+    AudioTransportControlBlock control{};
+    control.ResetForStart();
+    const uint64_t streamGeneration = control.generation.load(std::memory_order_acquire);
+
+    MotuRxSphRateMeter meter{};
+    meter.Observe(SphFromTick(0), 8U, 48000U);
+    meter.Observe(SphFromTick(4096), 8U, 48000U);
+    meter.Observe(SphFromTick(8192), 8U, 48000U);
+    const auto beforeRestart = meter.CumulativeSnapshot();
+    ASSERT_TRUE(beforeRestart.valid);
+    ASSERT_EQ(beforeRestart.frames, 16U);
+    ASSERT_EQ(beforeRestart.ticks, 8192);
+    ASSERT_TRUE(control.motuRxSphClock.Publish({
+        .streamGeneration = streamGeneration,
+        .rxFrames = beforeRestart.frames,
+        .rxTicks = beforeRestart.ticks,
+    }));
+
+    meter.Reanchor();
+    meter.Observe(SphFromTick(1048576), 8U, 48000U);
+    meter.Observe(SphFromTick(1052672), 8U, 48000U);
+    const auto afterReactivation = meter.CumulativeSnapshot();
+    ASSERT_TRUE(afterReactivation.valid);
+    ASSERT_EQ(afterReactivation.frames, 24U);
+    ASSERT_EQ(afterReactivation.ticks, 12288);
+
+    EXPECT_TRUE(control.motuRxSphClock.Publish({
+        .streamGeneration = streamGeneration,
+        .rxFrames = afterReactivation.frames,
+        .rxTicks = afterReactivation.ticks,
+    }));
+
+    MotuRxSphClockSample observed{};
+    uint64_t updates = 0;
+    ASSERT_TRUE(control.motuRxSphClock.ReadLatest(observed, updates));
+    EXPECT_EQ(updates, 2U);
+    EXPECT_EQ(observed.streamGeneration, streamGeneration);
+    EXPECT_EQ(observed.rxFrames, afterReactivation.frames);
+    EXPECT_EQ(observed.rxTicks, afterReactivation.ticks);
+}
+
+// A meter that fell behind the bridge in the bridge's own generation means
+// every later publication is refused: reported once until Reset().
+TEST(AudioTransportControlBlockTests, MotuServoStallDetectorReportsMeterRegressionOncePerReset) {
+    MotuServoStallDetector detector{};
+    MotuServoStallEvent event{};
+    const MotuRxSphClockSample bridge{.streamGeneration = 7, .rxFrames = 16000, .rxTicks = 8192000};
+
+    EXPECT_FALSE(detector.Observe(7, {.valid = true, .frames = 16000, .ticks = 8192000}, bridge, 2000,
+                                  event));
+    ASSERT_TRUE(detector.Observe(7, {.valid = true, .frames = 8000, .ticks = 4096000}, bridge, 2000,
+                                 event));
+    EXPECT_EQ(event.streamGeneration, 7U);
+    EXPECT_EQ(event.bridgeUpdates, 2000U);
+    EXPECT_EQ(event.bridgeFrames, 16000U);
+    EXPECT_EQ(event.bridgeTicks, 8192000);
+    EXPECT_EQ(event.meterFrames, 8000U);
+    EXPECT_EQ(event.meterTicks, 4096000);
+
+    EXPECT_FALSE(detector.Observe(7, {.valid = true, .frames = 8016, .ticks = 4104192}, bridge, 2000,
+                                  event));
+
+    detector.Reset();
+    EXPECT_TRUE(detector.Observe(7, {.valid = true, .frames = 8, .ticks = 4096}, bridge, 2000, event));
+}
+
+TEST(AudioTransportControlBlockTests,
+     MotuServoStallDetectorIgnoresIncompleteOrDifferentGenerationSnapshots) {
+    MotuServoStallDetector detector{};
+    MotuServoStallEvent event{};
+    const MotuRxSphClockSample bridge{.streamGeneration = 9, .rxFrames = 16000, .rxTicks = 8192000};
+
+    EXPECT_FALSE(detector.Observe(9, {.valid = false, .frames = 0, .ticks = 0}, bridge, 2000, event));
+    EXPECT_FALSE(detector.Observe(8, {.valid = true, .frames = 8000, .ticks = 4096000}, bridge, 2000,
+                                  event));
+    EXPECT_FALSE(detector.Observe(9, {.valid = true, .frames = 8000, .ticks = 4096000}, bridge, 0,
+                                  event));
+    EXPECT_FALSE(detector.Observe(0, {.valid = true, .frames = 8000, .ticks = 4096000}, bridge, 2000,
+                                  event));
+}
+
+// One phase-trace publication is a whole cadence period, so the round trip
+// carries every bucket and the OUTPUT_LAST reference, not just the newest.
+TEST(AudioTransportControlBlockTests, MotuPhaseTraceBridgeCarriesTheWholePeriodForItsGeneration) {
+    AudioTransportControlBlock control{};
+    control.ResetForStart();
+    const uint64_t streamGeneration = control.generation.load(std::memory_order_acquire);
+
+    MotuPhaseTraceCadenceSample period{};
+    uint64_t updates = 0;
+    EXPECT_FALSE(control.motuPhaseTrace.ReadLatest(period, updates));
+
+    MotuPhaseTraceCadenceSample published{
+        .streamGeneration = streamGeneration,
+        .packetIndex = {410, 411, 412},
+        .firstSph = {0x0f123454u, 0x0f123455u, 0x0f123456u},
+        .outputLastPacketIndex = 400,
+        .outputLastCycleTimer = 0x04234000u,
+        .hasOutputLast = true,
+        .count = 3,
+        .presentationLeadTicks = 9216,
+    };
+    ASSERT_TRUE(control.motuPhaseTrace.Publish(published));
+    ASSERT_TRUE(control.motuPhaseTrace.ReadLatest(period, updates));
+    EXPECT_EQ(updates, 1U);
+    EXPECT_EQ(period.streamGeneration, streamGeneration);
+    EXPECT_EQ(period.count, 3U);
+    for (uint32_t bucket = 0; bucket < ASFW::Audio::Runtime::kMotuPhaseTraceCadenceBuckets;
+         ++bucket) {
+        EXPECT_EQ(period.packetIndex[bucket], published.packetIndex[bucket]);
+        EXPECT_EQ(period.firstSph[bucket], published.firstSph[bucket]);
+    }
+    EXPECT_EQ(period.outputLastPacketIndex, 400U);
+    EXPECT_EQ(period.outputLastCycleTimer, 0x04234000u);
+    EXPECT_TRUE(period.hasOutputLast);
+    EXPECT_EQ(period.presentationLeadTicks, 9216U);
+
+    // A period from another generation, or claiming more buckets than exist.
+    auto stale = published;
+    stale.streamGeneration = streamGeneration + 1;
+    stale.packetIndex[2] = 999;
+    EXPECT_FALSE(control.motuPhaseTrace.Publish(stale));
+    auto oversized = published;
+    oversized.count = ASFW::Audio::Runtime::kMotuPhaseTraceCadenceBuckets + 1;
+    EXPECT_FALSE(control.motuPhaseTrace.Publish(oversized));
+    ASSERT_TRUE(control.motuPhaseTrace.ReadLatest(period, updates));
+    EXPECT_EQ(updates, 1U);
+    EXPECT_EQ(period.packetIndex[2], 412U);
+
+    // A new start empties it and refuses the previous stream's periods.
+    control.ResetForStart();
+    EXPECT_FALSE(control.motuPhaseTrace.ReadLatest(period, updates));
+    EXPECT_FALSE(control.motuPhaseTrace.Publish(published));
+    published.streamGeneration = control.generation.load(std::memory_order_acquire);
+    ASSERT_TRUE(control.motuPhaseTrace.Publish(published));
+    ASSERT_TRUE(control.motuPhaseTrace.ReadLatest(period, updates));
+    EXPECT_EQ(updates, 1U);
+    EXPECT_EQ(period.streamGeneration, published.streamGeneration);
+}
+
+TEST(AudioTransportControlBlockTests, MotuRelPhaseBridgePublishesOnlyForItsGeneration) {
+    AudioTransportControlBlock control{};
+    control.ResetForStart();
+    const uint64_t streamGeneration = control.generation.load(std::memory_order_acquire);
+
+    MotuRelPhaseSampleRecord observed{};
+    uint64_t updates = 0;
+    EXPECT_FALSE(control.motuRelPhase.ReadLatest(observed, updates));
+
+    ASSERT_TRUE(control.motuRelPhase.Publish(
+        {.streamGeneration = streamGeneration, .ticks = -2048, .centerTicks = -1900}));
+    ASSERT_TRUE(control.motuRelPhase.ReadLatest(observed, updates));
+    EXPECT_EQ(updates, 1U);
+    EXPECT_EQ(observed.streamGeneration, streamGeneration);
+    EXPECT_EQ(observed.ticks, -2048);
+    EXPECT_EQ(observed.centerTicks, -1900);
+
+    EXPECT_FALSE(control.motuRelPhase.Publish(
+        {.streamGeneration = streamGeneration - 1, .ticks = 77, .centerTicks = 0}));
+    EXPECT_FALSE(control.motuRelPhase.Publish({.streamGeneration = 0, .ticks = 77}));
+
+    // Unlike the cumulative clock, `rel` may move either way.
+    ASSERT_TRUE(control.motuRelPhase.Publish(
+        {.streamGeneration = streamGeneration, .ticks = 512, .centerTicks = -1900}));
+    ASSERT_TRUE(control.motuRelPhase.ReadLatest(observed, updates));
+    EXPECT_EQ(updates, 2U);
+    EXPECT_EQ(observed.ticks, 512);
+
+    control.ResetForStart();
+    EXPECT_FALSE(control.motuRelPhase.ReadLatest(observed, updates));
+    EXPECT_FALSE(control.motuRelPhase.Publish(
+        {.streamGeneration = streamGeneration, .ticks = 512, .centerTicks = -1900}));
 }
 
 } // namespace

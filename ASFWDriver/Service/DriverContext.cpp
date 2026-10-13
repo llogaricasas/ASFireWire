@@ -1,6 +1,7 @@
+#include "../Common/ActionTeardown.hpp"
 #include "DriverContext.hpp"
 
-#include <net.mrmidi.ASFW.ASFWDriver/ASFWDriver.h>
+#include <net.asfw.driver/ASFWDriver.h>
 
 #include <PCIDriverKit/IOPCIFamilyDefinitions.h>
 
@@ -11,6 +12,7 @@
 #include "../Async/Tx/ResponseSender.hpp"
 #include "../Audio/Core/AudioCoordinator.hpp"
 #include "../Audio/Core/AudioRuntimeRegistry.hpp"
+#include "../Audio/Protocols/DICE/Core/DiceNotificationRouter.hpp"
 #include "../Bus/BusManager.hpp"
 #include "../Bus/BusResetCoordinator.hpp"
 #include "../Bus/SelfIDCapture.hpp"
@@ -46,17 +48,17 @@ void ServiceContext::DisarmProviderNotifications() {
         // DriverKit reports that all queued notification handlers completed.
         auto* source = providerNotifications.detach();
         auto* action = providerNotificationAction.detach();
+        ASFW_LOG(Controller, "[Teardown] provider notifications cancel requested source=%p action=%p", source, action);
+        auto done = teardownCompletion->Begin();
         const kern_return_t kr = source->Cancel(^{
-            if (action) {
-                action->release();
-            }
+            ASFW_LOG(Controller, "[Teardown] provider notifications cancel completed source=%p action=%p", source, action);
             source->release();
+            ASFW::Common::CancelAndReleaseOwnedAction(action, "provider notifications", done);
         });
         if (kr != kIOReturnSuccess) {
-            if (action) {
-                action->release();
-            }
+            ASFW_LOG_ERROR(Controller, "[Teardown] provider notifications cancel failed kr=0x%x", kr);
             source->release();
+            ASFW::Common::CancelAndReleaseOwnedAction(action, "provider notifications", done);
         }
         return;
     }
@@ -65,6 +67,7 @@ void ServiceContext::DisarmProviderNotifications() {
 }
 
 void ServiceContext::Reset(ResetMode mode) {
+    ASFW_LOG(Controller, "[Teardown] ServiceContext reset begin full=%d", mode == ResetMode::Full);
     // Runtime stopping is owned by RuntimeLifecycleCoordinator. Reset only
     // releases resources after its quiesce executor has stopped them.
     if (mode == ResetMode::Full && sbp2NubPublisher) {
@@ -81,7 +84,9 @@ void ServiceContext::Reset(ResetMode mode) {
     // The registry is co-owned by the controller's own deps_ copy, which must be dropped
     // explicitly: ~ControllerCore destroys busImpl_ before deps_, so letting the registry
     // die with the controller would call through a dangling bus.
+    ASFW_LOG(Controller, "[Teardown] release audio coordinator begin");
     audioCoordinator.reset();
+    ASFW_LOG(Controller, "[Teardown] release audio coordinator complete");
     if (controller) {
         controller->ReleaseAudioRuntimeRegistry();
         // ROMScanner borrows the controller-owned IFireWireBus. Drop the
@@ -89,9 +94,22 @@ void ServiceContext::Reset(ResetMode mode) {
         controller->AttachROMScanner(nullptr);
     }
     deps.audioRuntimeRegistry.reset();
+    // Same hazard for SBP-2: SessionRegistry and every LoginSession borrow the
+    // controller-owned bus (EnsureSbp2Deps passes controller->Bus()).
+    // ~SessionRegistry logs out still-logged-in sessions and ~LoginSession
+    // cancels its outstanding writes (e.g. the logout the bridge's quiesce
+    // Shutdown just issued) through that bus. Drop the controller's co-owning
+    // copy and destroy the registry while busImpl_ is still alive.
+    if (controller) {
+        controller->SetSbp2SessionRegistry(nullptr);
+    }
+    ASFW_LOG(Controller, "[Teardown] release SBP2 session registry begin");
+    deps.sbp2SessionRegistry.reset();
+    ASFW_LOG(Controller, "[Teardown] release SBP2 session registry complete");
     // Drop the context's remaining scanner reference before destroying the
     // controller. EnsureRomScanner will bind a fresh scanner after rebuild.
     deps.romScanner.reset();
+    ASFW_LOG(Controller, "[Teardown] release controller and bus dependencies begin");
     controller.reset();
     deps.hardware.reset();
     deps.busReset.reset();
@@ -108,13 +126,27 @@ void ServiceContext::Reset(ResetMode mode) {
     deps.topologyMapService.reset();
     deps.busManagerElectionDriver.reset();
     deps.fcpResponseRouter.reset(); // Clean up FCP router
-    deps.sbp2SessionRegistry.reset();
+    ASFW_LOG(Controller, "[Teardown] release controller and bus dependencies complete");
+    ASFW_LOG(Controller, "[Teardown] release SBP2 scheduler and address space begin");
     deps.sbp2SessionScheduler.reset();
     deps.sbp2AddressSpaceManager.reset();
+    ASFW_LOG(Controller, "[Teardown] release SBP2 scheduler and address space complete");
+    ASFW_LOG(Controller, "[Teardown] release AVC discovery begin");
     deps.avcDiscovery.reset();      // Clean up AV/C discovery
+    ASFW_LOG(Controller, "[Teardown] release AVC discovery complete");
+    ASFW_LOG(Controller, "[Teardown] release IRM client begin");
     deps.irmClient.reset();         // Clean up IRM client
+    ASFW_LOG(Controller, "[Teardown] release IRM client complete");
+    ASFW_LOG(Controller, "[Teardown] release async subsystem begin");
     deps.asyncController.reset();
     deps.asyncSubsystem.reset(); // Stop and cleanup asyncSubsystem
+    ASFW_LOG(Controller, "[Teardown] release async subsystem complete");
+    // No local request is delivered once the async subsystem is gone, and the
+    // DICE protocols and backend that register with the router went with the
+    // audio runtime above. The router borrows the device registry, so it goes
+    // before it.
+    ASFW_LOG(Controller, "[Teardown] release discovery graph begin");
+    deps.diceNotifications.reset();
     if (mode == ResetMode::Full) {
         // A new provider incarnation must rediscover remote hardware. Retaining
         // old FWDevice/FWUnit objects here would let a new SBP-2 nub publisher
@@ -124,14 +156,20 @@ void ServiceContext::Reset(ResetMode mode) {
     }
     deps.busResetStartedCallback = {};
     deps.cycleInconsistentCallback = {};
+    ASFW_LOG(Controller, "[Teardown] release discovery graph complete");
+    ASFW_LOG(Controller, "[Teardown] release status publisher and watchdog begin");
     statusPublisher.Reset();
     watchdog.Reset();
+    ASFW_LOG(Controller, "[Teardown] release status publisher and watchdog complete");
     DisarmProviderNotifications();
     if (mode == ResetMode::Full) {
+        ASFW_LOG(Controller, "[Teardown] release work queue, interrupt action and lifecycle begin");
         workQueue.reset();
         interruptAction.reset();
         lifecycle.reset();
+        ASFW_LOG(Controller, "[Teardown] release work queue, interrupt action and lifecycle complete");
     }
+    ASFW_LOG(Controller, "[Teardown] ServiceContext reset complete full=%d", mode == ResetMode::Full);
 }
 
 namespace ASFW::Driver {
@@ -208,6 +246,13 @@ void DriverWiring::EnsureDeps(ASFWDriver* driver, ::ServiceContext& ctx) {
     if (!d.audioRuntimeRegistry) {
         d.audioRuntimeRegistry = std::make_shared<ASFW::Audio::AudioRuntimeRegistry>();
     }
+    if (!d.diceNotifications && d.deviceRegistry) {
+        d.diceNotifications =
+            std::make_shared<ASFW::Audio::DICE::DiceNotificationRouter>(*d.deviceRegistry);
+    }
+    if (d.audioRuntimeRegistry) {
+        d.audioRuntimeRegistry->SetDiceNotificationRouter(d.diceNotifications.get());
+    }
 
     // Provide genuinely-deferred one-shot timers to protocol control planes.
     // BeBoB uses this for the post-format settle delay instead of IOSleep.
@@ -216,10 +261,10 @@ void DriverWiring::EnsureDeps(ASFWDriver* driver, ::ServiceContext& ctx) {
     }
 
     if (!ctx.audioCoordinator && d.deviceManager && d.deviceRegistry && d.hardware &&
-        d.audioRuntimeRegistry) {
+        d.audioRuntimeRegistry && d.diceNotifications) {
         ctx.audioCoordinator = std::make_shared<ASFW::Audio::AudioCoordinator>(
             driver, *d.deviceManager, *d.deviceRegistry, *d.audioRuntimeRegistry, ctx.isoch,
-            *d.hardware);
+            *d.hardware, *d.diceNotifications);
         ASFW_LOG(Controller, "[Controller] ✅ AudioCoordinator initialized");
     }
 
@@ -235,6 +280,7 @@ void DriverWiring::EnsureDeps(ASFWDriver* driver, ::ServiceContext& ctx) {
     }
 
     d.busResetStartedCallback = [&ctx] {
+        if (ctx.audioCoordinator) ctx.audioCoordinator->HandleBusReset();
         ctx.dvCapture.HandleBusReset(ctx.isoch);
     };
 
@@ -254,7 +300,7 @@ kern_return_t DriverWiring::EnsureSbp2Deps(ASFWDriver& service, ::ServiceContext
     if (!d.sbp2SessionScheduler) {
         d.sbp2SessionScheduler =
             std::make_shared<ASFW::Protocols::SBP2::DriverKitSessionScheduler>();
-        const auto kr = d.sbp2SessionScheduler->Prepare(service, ctx.workQueue);
+        const auto kr = d.sbp2SessionScheduler->Prepare(service, ctx.workQueue, ctx.teardownCompletion);
         if (kr != kIOReturnSuccess) {
             d.sbp2SessionScheduler.reset();
             return kr;
@@ -264,6 +310,10 @@ kern_return_t DriverWiring::EnsureSbp2Deps(ASFWDriver& service, ::ServiceContext
 
     if (d.audioRuntimeRegistry && d.sbp2SessionScheduler) {
         d.audioRuntimeRegistry->SetTimerScheduler(d.sbp2SessionScheduler.get());
+    }
+    // Keeps the DICE restart quiet period (AUDIO_SESSION_REDESIGN.md S4a).
+    if (ctx.audioCoordinator && d.sbp2SessionScheduler) {
+        ctx.audioCoordinator->SetSessionTimer(d.sbp2SessionScheduler.get());
     }
 
     if (!d.sbp2SessionRegistry && ctx.controller && d.sbp2AddressSpaceManager &&
@@ -370,7 +420,7 @@ kern_return_t DriverWiring::PrepareInterrupts(ASFWDriver& service, IOService* pr
         ctx.interruptAction = OSSharedPtr(action, OSNoRetain);
     }
 
-    auto kr = intrMgr->Initialise(provider, ctx.workQueue, ctx.interruptAction);
+    auto kr = intrMgr->Initialise(provider, ctx.workQueue, ctx.interruptAction, ctx.teardownCompletion);
     if (kr != kIOReturnSuccess) {
         ctx.interruptAction.reset();
         return kr;
@@ -379,7 +429,7 @@ kern_return_t DriverWiring::PrepareInterrupts(ASFWDriver& service, IOService* pr
 }
 
 kern_return_t DriverWiring::PrepareWatchdog(ASFWDriver& service, ::ServiceContext& ctx) {
-    return ctx.watchdog.Prepare(service, ctx.workQueue);
+    return ctx.watchdog.Prepare(service, ctx.workQueue, ctx.teardownCompletion);
 }
 
 } // namespace ASFW::Driver

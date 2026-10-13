@@ -36,49 +36,36 @@ TEST(AmdtpRateGeometryTests, StandardRatesKeepNominalAndSytIntervalDistinct) {
 TEST(AudioTimingGeometryTests, SaffireGeometryIsUnified) {
     using Geometry =
         ASFW::IsochTransport::AudioTimingGeometry;
-    const auto profile =
-        ASFW::IsochTransport::kActiveAudioHalBufferProfile;
-    EXPECT_EQ(Geometry::kFrameRingFrames, profile.frameRingFrames);
+    const auto profile = ASFW::IsochTransport::HalBufferProfileForRate(48000);
+    EXPECT_EQ(Geometry::kAllocatedFrameRingFrames, 24576U);
     EXPECT_EQ(Geometry::kHalIoPeriodFrames, profile.clientIoBudgetFrames);
-    EXPECT_EQ(
-        Geometry::kHalZeroTimestampPeriodFrames,
-        profile.zeroTimestampPeriodFrames);
+    EXPECT_EQ(Geometry::kMaxClientIoFrames, 4096U);
     EXPECT_EQ(Geometry::kFrameAlignment, 32U);
-    EXPECT_EQ(Geometry::kRxPacketsPerGroup, 6U);
-    EXPECT_EQ(Geometry::kTxPacketsPerGroup, 6U);
-    EXPECT_EQ(Geometry::kMinimumNominalFramesPerInterrupt, 32U);
-    EXPECT_EQ(Geometry::kMaximumNominalFramesPerInterrupt, 40U);
-    EXPECT_EQ(Geometry::kNominalFramesPerTimingGroup, 36U);
-    EXPECT_EQ(Geometry::kInputSafetyFloorFrames, 104U);
+    EXPECT_EQ(Geometry::kRxPacketsPerGroup, 8U);
+    EXPECT_EQ(Geometry::kTxPacketsPerGroup, 8U);
+    EXPECT_EQ(Geometry::kNominalFramesPerTimingGroup, 48U);
     EXPECT_EQ(Geometry::kRxDescriptorPackets, 504U);
-    // TX budgets are sized for the worst-case (44.1k) average cadence of
-    // 441 frames / 80 packets, exposure lead rounded to a whole interrupt
-    // Apple-comparable 400-cycle content horizon: ceil(2400 / 5.5125) =
-    // 436 -> 438 packets, plus a full 512-frame write window.
-    EXPECT_EQ(Geometry::kTxDataHorizonPackets, 400U);
-    EXPECT_EQ(Geometry::TxDataHorizonFrames(48000), 2400U);
-    EXPECT_EQ(Geometry::TxDataHorizonFrames(44100), 2205U);
-    EXPECT_EQ(Geometry::kTxSharedSlotPackets, 912U);
-    EXPECT_EQ(Geometry::kTxHardwareRingPackets, 48U);
+    EXPECT_EQ(Geometry::kTxSharedSlotPackets, 1512U);
+    EXPECT_EQ(Geometry::kTimelineSlots, Geometry::kTxSharedSlotPackets);
+    EXPECT_EQ(Geometry::kTxHardwareRingPackets, 504U);
     EXPECT_EQ(Geometry::kTxPreparationLatencyHistogramBuckets, 6U);
     EXPECT_EQ(Geometry::kTxCommittedMarginHistogramBuckets, 5U);
     EXPECT_EQ(Geometry::kTxPreparationLatency250Us, 250U);
     EXPECT_EQ(Geometry::kTxPreparationLatency1500Us, 1500U);
-    EXPECT_EQ(Geometry::kTxCommittedMargin2xFloorPackets, 96U);
-    EXPECT_EQ(Geometry::kTxCommittedMargin16xFloorPackets, 768U);
-    EXPECT_EQ(Geometry::kTxPreparationSlackPackets, 96U);
-    EXPECT_EQ(Geometry::kTxCoverageLeadPackets, 144U);
-    EXPECT_EQ(Geometry::kTxExposureLeadPackets, 438U);
-    EXPECT_EQ(Geometry::kTxFrameExposureWindowPackets, 534U);
-    EXPECT_EQ(Geometry::kTxPreparationLeadPackets, 678U);
+    EXPECT_EQ(Geometry::kTxCommittedMargin2xFloorPackets, 1008U);
+    EXPECT_EQ(Geometry::kTxCommittedMargin16xFloorPackets, 8064U);
+    EXPECT_EQ(Geometry::kTxPreparationSlackPackets, 504U);
+    EXPECT_EQ(Geometry::kTxCoverageLeadPackets, 1008U);
+    EXPECT_EQ(Geometry::kTxPreparationLeadPackets, 1008U);
 
-    // DMA completion cadence and the ZTS grid are intentionally independent.
-    EXPECT_NE(Geometry::kHalZeroTimestampPeriodFrames,
-              Geometry::kNominalFramesPerTimingGroup);
-    EXPECT_EQ(Geometry::kFrameRingFrames %
-                  Geometry::kHalZeroTimestampPeriodFrames, 0U);
-    EXPECT_EQ(Geometry::kFrameRingFrames %
-                  Geometry::kHalIoPeriodFrames, 0U);
+    // DMA completion cadence and the ZTS grid are intentionally independent,
+    // but the V3 period is a whole number of completion groups (256).
+    EXPECT_EQ(profile.zeroTimestampPeriodFrames %
+                  Geometry::kNominalFramesPerTimingGroup, 0U);
+    EXPECT_EQ(profile.zeroTimestampPeriodFrames /
+                  Geometry::kNominalFramesPerTimingGroup, 256U);
+    EXPECT_EQ(Geometry::kAllocatedFrameRingFrames %
+                  profile.zeroTimestampPeriodFrames, 0U);
     EXPECT_EQ(Geometry::kRxDescriptorPackets %
                   Geometry::kTimingGroupPackets, 0U);
     EXPECT_EQ(Geometry::kRxDescriptorPackets %
@@ -87,34 +74,35 @@ TEST(AudioTimingGeometryTests, SaffireGeometryIsUnified) {
               2U * Geometry::kTxPacketsPerGroup);
 }
 
-TEST(AudioTimingGeometryTests, HalBufferProfilesPreserveKnownGeometries) {
+TEST(AudioTimingGeometryTests, V3HalBufferProfilePerRateTier) {
     using namespace ASFW::IsochTransport;
 
-    EXPECT_EQ(kAudioHalBufferProfileAligned512.frameRingFrames, 512U);
-    EXPECT_EQ(kAudioHalBufferProfileAligned512.clientIoBudgetFrames, 512U);
-    EXPECT_EQ(kAudioHalBufferProfileAligned512.zeroTimestampPeriodFrames, 512U);
-
-    EXPECT_EQ(kAudioHalBufferProfilePreDiceZts192.frameRingFrames, 1536U);
-    EXPECT_EQ(
-        kAudioHalBufferProfilePreDiceZts192.clientIoBudgetFrames,
-        512U);
-    EXPECT_EQ(
-        kAudioHalBufferProfilePreDiceZts192.zeroTimestampPeriodFrames,
-        192U);
-
-    EXPECT_EQ(kAudioHalBufferProfileDiceWorking1536.frameRingFrames, 1536U);
-    EXPECT_EQ(
-        kAudioHalBufferProfileDiceWorking1536.clientIoBudgetFrames,
-        512U);
-    EXPECT_EQ(
-        kAudioHalBufferProfileDiceWorking1536.zeroTimestampPeriodFrames,
-        1536U);
-
-    EXPECT_TRUE(IsValidAudioHalBufferProfile(kActiveAudioHalBufferProfile));
-#if !defined(ASFW_AUDIO_HAL_BUFFER_PROFILE)
-    EXPECT_EQ(kActiveAudioHalBufferProfileId,
-              AudioHalBufferProfileId::DiceWorking1536);
-#endif
+    struct Expected {
+        uint32_t rate;
+        uint32_t ring;
+        bool fits;
+    };
+    constexpr std::array expected{
+        Expected{32000, 12288, true},  Expected{44100, 12288, true},
+        Expected{48000, 12288, true},  Expected{88200, 24576, true},
+        Expected{96000, 24576, true},  Expected{176400, 49152, false},
+        Expected{192000, 49152, false},
+    };
+    for (const auto& value : expected) {
+        const auto profile = HalBufferProfileForRate(value.rate);
+        EXPECT_TRUE(IsValidAudioHalBufferProfile(profile)) << value.rate;
+        EXPECT_EQ(profile.frameRingFrames, value.ring) << value.rate;
+        EXPECT_EQ(profile.zeroTimestampPeriodFrames, value.ring) << value.rate;
+        EXPECT_EQ(profile.clientIoBudgetFrames, 1024U) << value.rate;
+        EXPECT_EQ(ProfileFitsAllocation(profile), value.fits) << value.rate;
+        EXPECT_EQ(AdkMaxClientIoFrames(profile.zeroTimestampPeriodFrames), 4096U)
+            << value.rate;
+    }
+    EXPECT_FALSE(IsValidAudioHalBufferProfile(HalBufferProfileForRate(22050)));
+    EXPECT_EQ(HalRateTier(22050), 0U);
+    EXPECT_EQ(kAllocatedFrameRingFrames, 24576U);
+    // A smaller period caps AudioDriverKit clients below 4096 frames.
+    EXPECT_EQ(AdkMaxClientIoFrames(8192), 3072U);
 }
 
 } // namespace

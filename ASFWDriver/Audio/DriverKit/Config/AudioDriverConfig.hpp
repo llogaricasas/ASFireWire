@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include "../../Model/AvcVolumeMapping.hpp"
+#include "../../Wire/AMDTP/PcmSlotMap.hpp"
+#include "../../Runtime/ResolvedAudioConfiguration.hpp"
 
 // Forward declarations to avoid pulling in DriverKit headers
 class OSArray;
@@ -14,11 +17,15 @@ namespace ASFW::Isoch::Audio {
 constexpr double kDefaultSampleRate = 48000.0;
 constexpr uint32_t kDefaultChannelCount = 2;
 constexpr uint32_t kMaxSampleRates = 8;
-// Covers high-channel-count interfaces (e.g. Midas Venice F32 = 32x32 duplex)
+// Covers the largest host format, including 34-channel packed MOTU capture.
 // so per-channel device labels can be carried for every element, not just the
 // first 8. Each name is at most 64 bytes (see ParsedAudioDriverConfig).
-constexpr uint32_t kMaxNamedChannels = 32;
+constexpr uint32_t kMaxNamedChannels = ::ASFW::Audio::Runtime::kMaxHostPcmChannels;
 constexpr uint32_t kMaxBoolControls = 16;
+/// Must equal kMaxAudioStreamsPerDirection (Audio/Protocols/AudioTypes.hpp).
+/// Duplicated rather than included so this header stays on the AudioDriverKit
+/// side of the nub; DiceFamilyAdapter static_asserts the two agree.
+constexpr uint32_t kMaxConfiguredStreams = 4;
 
 constexpr uint32_t kClassIdPhantomPower = static_cast<uint32_t>('phan');
 constexpr uint32_t kClassIdPhaseInvert = static_cast<uint32_t>('phsi');
@@ -37,10 +44,29 @@ struct BoolControlDescriptor {
     bool initialValue{false};
 };
 
+/// One isochronous stream's resolved wire shape, parsed from the nub.
+/// `channelOffset` is the running sum of preceding stream widths, not
+/// index * width -- see AudioPropertyKeys.hpp.
+struct ParsedWireStream {
+    uint32_t pcmChannels{0};
+    uint32_t am824Slots{0};
+    uint32_t midiPorts{0};
+    uint32_t channelOffset{0};
+    ::ASFW::Audio::Wire::PcmSlotMap pcmSlotMap{};
+    bool hasPcmSlotMap{false};
+};
+
 struct ParsedAudioDriverConfig {
     uint64_t guid{0};
+    uint64_t rateRouteIncarnation{0};
+    uint64_t rateRouteEpoch{0};
+    uint32_t rateBusGeneration{0};
+    bool usesRateFormations{false};
     uint32_t vendorId{0};
     uint32_t modelId{0};
+    /// The device catalog's resolved ProfileBuilderId, carried across the nub.
+    /// Zero means the publishing side did not resolve one.
+    uint32_t profileBuilderId{0};
 
     char deviceName[128]{};
     uint32_t channelCount{kDefaultChannelCount};
@@ -54,7 +80,25 @@ struct ParsedAudioDriverConfig {
     double currentSampleRate{kDefaultSampleRate};
 
     StreamMode streamMode{StreamMode::kNonBlocking};
+    std::vector<::ASFW::Audio::Runtime::RateFormation> rateFormationCandidates;
 
+    // Resolved per-stream geometry from the publisher. A count of zero means
+    // none was published and the profile's constants are the only description
+    // available -- correct for a uniform device, wrong for an asymmetric one.
+    ParsedWireStream playbackStreams[kMaxConfiguredStreams]{};
+    uint32_t playbackStreamCount{0};
+    ParsedWireStream captureStreams[kMaxConfiguredStreams]{};
+    uint32_t captureStreamCount{0};
+    /// The publisher resolved geometry and the profile's constants must NOT be
+    /// used instead. With this set and a zero stream count, the arrays were
+    /// lost in transit and starting would silently reinstate the mismatch the
+    /// resolution removed -- so it must fail instead.
+    bool resolvedGeometryRequired{false};
+    /// The sample rates above came from the device; keep them over a profile's.
+    bool deviceSampleRates{false};
+
+    uint32_t avcControlCount{0};
+    ::ASFW::Audio::Model::AvcPublishedControl avcControls[::ASFW::Audio::Model::kMaxAvcControls]{};
     uint32_t boolControlCount{0};
     BoolControlDescriptor boolControls[kMaxBoolControls]{};
 

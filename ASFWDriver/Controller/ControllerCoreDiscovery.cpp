@@ -10,8 +10,10 @@
 #include "../Async/FireWireBusImpl.hpp"
 #include "../Async/Interfaces/IFireWireBusOps.hpp"
 #include "../Bus/BusResetCoordinator.hpp"
+#include "../DeviceProfiles/Audio/AudioDeviceCatalog.hpp"
 #include "../Bus/SelfIDCapture.hpp"
 #include "../Bus/TopologyManager.hpp"
+#include "../Bus/TopologySpeed.hpp"
 #include "../Bus/CSR/TopologyMapService.hpp"
 #include "../Bus/CSR/SpeedMapService.hpp"
 #include "../Bus/BusManager/BusManagerElectionDriver.hpp"
@@ -43,7 +45,6 @@
 #include "../Protocols/AVC/AVCDiscovery.hpp"
 #include "../Protocols/SBP2/Session/SessionRegistry.hpp"
 #include "../Protocols/AVC/CMP/CMPClient.hpp"
-#include "../Audio/Protocols/DeviceProtocolFactory.hpp"
 #include "../Scheduling/Scheduler.hpp"
 #include "../Version/DriverVersion.hpp"
 #include "ControllerStateMachine.hpp"
@@ -144,6 +145,7 @@ const char* CyclePolicyActionString(Bus::CyclePolicyAction action) {
     }
     return "unknown";
 }
+
 
 const TopologyNodeRecord* FindTopologyNode(const TopologySnapshot& topology,
                                            uint8_t physicalId) noexcept {
@@ -536,6 +538,38 @@ void ControllerCore::OnDiscoveryScanComplete(Discovery::Generation gen,
         }
     }
 
+    // Resolve isochronous speed bounded by the verified operational link speed.
+    //
+    // History & Rationale:
+    // Commit 86324deef previously decoupled isoch speed from async speed, forcing
+    // isoch to the maximum PHY Self-ID speed (S400) under the assumption that
+    // "charging isoch at S200 costs twice the bandwidth units of S400 for a device
+    // whose PHY was never the problem."
+    //
+    // That assumption was flawed:
+    // 1. The IRM bandwidth blowout at S200 was actually caused by an erroneous 512-unit
+    //    per-stream gap overhead charge against BANDWIDTH_AVAILABLE on unoptimized buses.
+    //    With Apple IOFWIsochChannel wire parity restored (commit 84426354), 4 streams
+    //    at S200 take only 3,232 units out of 4,915, fitting comfortably on any bus.
+    // 2. Real-world links and device link layers may fail when driven faster than their
+    //    verified operational speed. Forcing S400 when the physical link or hardware
+    //    cannot reliably sustain S400 (e.g. Midas Venice F24, which runs stably at S200
+    //    under Apple's native IOFireWireFamily) causes packet loss, timestamp timeouts,
+    //    and bus reset loops.
+    //
+    // Reference Stack Alignment:
+    // - Linux (drivers/firewire/core-device.c:615-641, sound/firewire/amdtp-stream.c, dice-stream.c:194):
+    //   `device->max_speed` is stepped down if Config ROM `link_spd` is lower or if quadlet
+    //   reads fail, and sound drivers use `device->max_speed` for isochronous streams.
+    // - Apple IOFireWireFamily (IOFireWireDevice.cpp:2097-2102, IOFireWireController.cpp:2746-2760,
+    //   IOFWIsochChannel.cpp:653):
+    //   The special unknown-speed ROM scan can step down `setNodeSpeed()` after
+    //   a failed read; a device driver can separately cap speed via `fMaxSpeed`.
+    //
+    // Therefore, ResolveIsochSpeed() bounds the topology PHY path speed by policy.localToNode.
+    const auto topologyForSpeed = deps_.topology ? deps_.topology->LatestSnapshot()
+                                                 : std::nullopt;
+
     for (const auto& rom : roms) {
         const auto nodeId = ASFW::Discovery::TryOperationalNodeId(rom.nodeId);
         if (!nodeId.has_value()) {
@@ -566,10 +600,54 @@ void ControllerCore::OnDiscoveryScanComplete(Discovery::Generation gen,
         deps_.romStore->Insert(rom);
 
         auto policy = deps_.speedPolicy->ForNode(*nodeId);
+        policy.isochToNode = ResolveIsochSpeed(topologyForSpeed, *nodeId, policy.localToNode);
 
         auto& bus = this->Bus();
-        const auto deviceRecord = deps_.deviceRegistry->UpsertFromROM(rom, policy);
+        auto deviceRecord = deps_.deviceRegistry->UpsertFromROM(rom, policy);
         discoveredGuids.insert(deviceRecord.guid);
+
+        // One per-device decision record, before any protocol can probe registers.
+        // Keep raw evidence separate from the selected speeds: BIB link_spd is
+        // recorded but is not currently used as a policy ceiling.
+        int localPhyCode = -1;
+        int remotePhyCode = -1;
+        int pathCode = -1;
+        if (topologyForSpeed && topologyForSpeed->localNodeId != kInvalidPhysicalId) {
+            for (const auto& node : topologyForSpeed->physical.nodes) {
+                if (node.physicalId == topologyForSpeed->localNodeId) {
+                    localPhyCode = static_cast<int>(node.speedCode);
+                }
+                if (node.physicalId == *nodeId) {
+                    remotePhyCode = static_cast<int>(node.speedCode);
+                }
+            }
+            if (const auto path = PathSpeedCodeBetween(
+                    *topologyForSpeed, topologyForSpeed->localNodeId, *nodeId)) {
+                pathCode = static_cast<int>(*path);
+            }
+        }
+        const auto observed = deps_.speedPolicy->ObservedSpeed(FW::NodeId{*nodeId});
+        ASFW_LOG(Discovery,
+                 "[SpeedDecision] guid=0x%016llx gen=%u node=%u "
+                 "selfIdLocalCode=%d selfIdRemoteCode=%d pathCode=%d "
+                 "bibLinkSpdCode=%u bibApplied=0 observedAsyncCode=%d "
+                 "selectedAsync=S%u selectedIsoch=S%u maxAsyncPayload=%u",
+                 rom.bib.guid, rom.gen.value, *nodeId, localPhyCode, remotePhyCode,
+                 pathCode, rom.bib.linkSpd,
+                 observed ? static_cast<int>(static_cast<uint8_t>(*observed)) : -1,
+                 100u << static_cast<uint8_t>(deviceRecord.link.localToNode),
+                 100u << static_cast<uint8_t>(deviceRecord.link.isochToNode),
+                 deviceRecord.link.maxPayloadBytes);
+
+        // DeviceRegistry stamped the command gate from the same catalog
+        // decision it used for classification, before any protocol traffic.
+        if (deviceRecord.avcCommandFilter !=
+            Discovery::AvcCommandFilterId::Unrestricted) {
+            ASFW_LOG(Discovery,
+                     "[DeviceIdentity] instance=%llu carries a filtered AV/C command "
+                     "set; unlisted frames will be refused at submit",
+                     deviceRecord.instanceId.value);
+        }
 
         // Create the device-specific runtime protocol here, at the orchestrator layer,
         // where the bus + IRM are already in scope. No-op for unknown devices. This is the

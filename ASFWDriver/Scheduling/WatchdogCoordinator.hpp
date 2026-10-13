@@ -1,4 +1,5 @@
 #pragma once
+#include "../Common/TeardownCompletion.hpp"
 
 #include <cstdint>
 
@@ -32,7 +33,8 @@ class WatchdogCoordinator {
     WatchdogCoordinator() = default;
     ~WatchdogCoordinator() = default;
 
-    kern_return_t Prepare(::ASFWDriver& service, OSSharedPtr<IODispatchQueue> workQueue);
+    kern_return_t Prepare(::ASFWDriver& service, OSSharedPtr<IODispatchQueue> workQueue,
+                                        std::shared_ptr<ASFW::Common::TeardownCompletion> completion = {});
     void Stop();
     void Reset();
 
@@ -44,6 +46,7 @@ class WatchdogCoordinator {
                     StatusPublisher& statusPublisher);
 
   private:
+    std::shared_ptr<ASFW::Common::TeardownCompletion> teardownCompletion_;
     void TickAsyncSubsystem(ASFW::Async::IAsyncSubsystemPort* asyncSubsystem,
                             StatusPublisher& statusPublisher) const;
     void TickIsochReceive(ASFW::Isoch::IsochReceiveContext* isochReceiveContext);
@@ -51,11 +54,8 @@ class WatchdogCoordinator {
 
     OSSharedPtr<IOTimerDispatchSource> timer_;
     OSSharedPtr<OSAction> action_;
-    uint32_t isochLogDivider_{0};
-    uint32_t itLogDivider_{0};
     uint32_t ztsLogDivider_{0};
-    uint32_t payloadWriterLogDivider_{0};
-    uint32_t txSytTraceDivider_{0};
+    uint32_t consumerDiagnosticsDivider_{0};
     // Edge-triggered so a permanently ineligible drain reports once, not at
     // 1 kHz. Starts true: the interesting event is the drop to false.
     bool lastDrainEligible_{true};

@@ -35,7 +35,7 @@ struct AVCUnitInfoWire {
     uint8_t  isoOutputPlugs;
     uint8_t  extInputPlugs;
     uint8_t  extOutputPlugs;
-    uint8_t  _reserved;    // Padding to 24 bytes
+    uint8_t  discoveryStatus; // bit 7: supported; bits 0-2: 0 idle, 1 running, 2 complete, 3 failed, 4 skipped
     // Followed by variable length AVCSubunitInfoWire array
     // AVCSubunitInfoWire subunits[0];
 } __attribute__((packed));
@@ -107,8 +107,8 @@ struct AVCMusicCapabilitiesWire {
     
     // Global Rates (from first valid plug)
     uint8_t currentRate;          ///< Current sample rate code (0x03=44.1k, 0x04=48k)
+    uint8_t _padding[2];          ///< Pads supportedRatesMask to a 4-byte boundary
     uint32_t supportedRatesMask;  ///< Bitmask: Bit 3=44.1k, 4=48k, 5=96k, 0xA=88.2k
-    uint8_t _padding[2];          ///< Alignment to 8 bytes
 
     // Port Counts (from descriptor)
     uint8_t audioInputPorts;
@@ -129,41 +129,18 @@ struct AVCMusicCapabilitiesWire {
     //       Each SignalBlockWire followed by ChannelDetailWire[numChannelDetails]
 } __attribute__((packed));
 
+// The padding above used to sit AFTER supportedRatesMask, which left the only
+// 32-bit field in this struct at offset 2 -- permanently misaligned, on a struct
+// both the driver and the Swift app cast raw buffers to. UBSan caught it as
+// "reference binding to misaligned address" the first time the test suite ran
+// sanitized. Pinned here so it cannot drift back, and so the total size (which
+// the Swift parser hard-codes as its header stride) cannot change unnoticed.
+static_assert(offsetof(AVCMusicCapabilitiesWire, supportedRatesMask) % alignof(uint32_t) == 0,
+              "supportedRatesMask must be naturally aligned within the wire struct");
+static_assert(sizeof(AVCMusicCapabilitiesWire) == 18,
+              "AVCMusicCapabilitiesWire is parsed by fixed offsets in "
+              "ASFW/Models/DriverConnectorModels.swift; update both together");
+
 } // namespace Shared
 
-// -----------------------------------------------------------------------------
-// Metrics Snapshot (for UserClient export to Swift GUI)
-// -----------------------------------------------------------------------------
-namespace Metrics {
-
-/// Isoch Receive metrics snapshot for GUI display
-/// Wire format - must match Swift exactly
-struct IsochRxSnapshot {
-    // Counters
-    uint64_t totalPackets;
-    uint64_t dataPackets;     // 80-byte with samples
-    uint64_t emptyPackets;    // 16-byte empty
-    uint64_t drops;           // DBC discontinuities
-    uint64_t errors;          // CIP parse errors
-    
-    // Latency histogram [<100µs, 100-500µs, 500-1000µs, >1000µs]
-    uint64_t latencyHist[4];
-    
-    // Last poll cycle
-    uint32_t lastPollLatencyUs;
-    uint32_t lastPollPackets;
-    
-    // CIP header snapshot
-    uint8_t cipSID;
-    uint8_t cipDBS;
-    uint8_t cipFDF;
-    uint8_t _pad1;
-    uint16_t cipSYT;
-    uint8_t cipDBC;
-    uint8_t _pad2;
-} __attribute__((packed));
-
-static_assert(sizeof(IsochRxSnapshot) == 88, "IsochRxSnapshot must be 88 bytes");
-
-} // namespace Metrics
 } // namespace ASFW

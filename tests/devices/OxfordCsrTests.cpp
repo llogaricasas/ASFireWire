@@ -141,8 +141,9 @@ TEST_F(OxfordCsrReadTests, ProtocolBuiltWithoutACmpClientStillReadsCsrs) {
     // authority both construction sites can supply.
     ASFW::IRM::IRMClient irm(rig.Bus());
     ASFW::Audio::Oxford::Apogee::ApogeeDuetProtocol protocol(
-        rig.Bus(), rig.Bus(), rig.Route(), &rig.Routes(), rig.Transport(),
+        rig.Bus(), rig.Bus(), rig.Route(), &rig.Routes(),
         /*irmClient=*/nullptr, /*cmpClient=*/nullptr);
+    protocol.UpdateRuntimeContext(rig.Route(), rig.Transport());
 
     MapId(Oxford::HardwareIdAddress(), Oxford::kHardwareIdFw971);
 
@@ -162,7 +163,8 @@ TEST_F(OxfordCsrReadTests, ProtocolBuiltWithoutARegistryReportsTheWiringFault) {
     // The other half: with no route authority at all, the read must name that
     // as its own fault rather than reporting it as "device has no live route".
     ASFW::Audio::Oxford::Apogee::ApogeeDuetProtocol protocol(
-        rig.Bus(), rig.Bus(), rig.Route(), /*routeRegistry=*/nullptr, rig.Transport());
+        rig.Bus(), rig.Bus(), rig.Route(), /*routeRegistry=*/nullptr);
+    protocol.UpdateRuntimeContext(rig.Route(), rig.Transport());
 
     IOReturn status = kIOReturnSuccess;
     protocol.GetFirmwareId([&status](IOReturn s, uint32_t) { status = s; });
@@ -201,7 +203,9 @@ TEST_F(OxfordCsrReadTests, RouteReboundBeforeTheReadIsResolvedFreshNotFromASnaps
     rom.gen = snapshot.generation;
     rom.nodeId = static_cast<uint8_t>(snapshot.nodeId);
     rig.Routes().InvalidateLiveMappingsForBusReset();
-    rig.Routes().UpsertFromROM(rom, ASFW::Discovery::LinkPolicy{});
+    // Returns the resulting record; this test wants only the side effect of
+    // registering the device.
+    (void)rig.Routes().UpsertFromROM(rom, ASFW::Discovery::LinkPolicy{});
 
     const auto rebound = rig.Route();
     ASSERT_NE(rebound.routeEpoch, snapshot.routeEpoch) << "test must actually rebind the route";

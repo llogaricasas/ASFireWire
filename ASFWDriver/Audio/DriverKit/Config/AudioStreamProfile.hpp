@@ -4,8 +4,11 @@
 // AudioStreamProfile.hpp - Protocol-neutral ADK stream geometry contract.
 
 #pragma once
+#include "../../Wire/MOTU/MotuModel.hpp"
 
 #include "IAudioDeviceProfile.hpp"
+#include "../../Wire/AMDTP/PcmSlotMap.hpp"
+#include "../../Wire/MOTU/MotuPortLayout.hpp"
 
 #include <cstdint>
 
@@ -27,7 +30,13 @@ struct AudioStreamConfig final {
     uint8_t framesPerDataPacket{8};
     uint8_t fdf{0x02};
     uint8_t fmt{0x10};
+    bool cipSph{false};
+    uint8_t motuMessageChunks{2};
+    uint8_t motuPcmByteOffset{10};
     uint8_t sourceChannelOffset{0};
+    Encoding::AudioPacketFraming packetFraming{Encoding::AudioPacketFraming::kCip};
+    ::ASFW::Audio::Wire::PcmSlotMap pcmSlotMap{};
+    bool hasPcmSlotMap{false};
 };
 
 struct AudioStreamTxPolicy final {
@@ -37,6 +46,35 @@ struct AudioStreamTxPolicy final {
     bool initializeNonAudioSlots{true};
     bool preserveFdfInNoDataPackets{false};
     bool emptyPacketsDuringIdle{false};
+    /// M-Audio special firmware: blocking cadence NO-DATA packets still carry
+    /// all scheduled blocks, with audio slots marked as CF and DBC advanced.
+    bool cadencePacketsCarryDataBlocks{false};
+    uint32_t cadenceSlotWord{0xCF000000};
+    bool dbcIsEndEvent{false};
+    /// MOTU only: chunk behind each host output channel. Empty encodes in wire order.
+    Encoding::Motu::MotuPortMap motuPlaybackPorts{};
+    /// MOTU only: the model's transmit presentation lead (RuntimePolicy).
+    uint32_t motuPresentationLeadTicks{Encoding::Motu::kDefaultPresentationLeadTicks};
+    /// MOTU only: the model's absolute-phase setpoint at 48 kHz (RuntimePolicy).
+    int32_t motuAbsolutePhaseSetpointTicks48k{
+        Encoding::Motu::kDefaultAbsolutePhaseSetpointTicks48k};
+    ::ASFW::Audio::Wire::PcmSlotMap playbackChannelMap{};
+
+};
+
+/// Where the host transmit stream takes its timing from.
+enum class TxClockSource : uint8_t {
+    /// Replay the device's receive timing (SYT and cadence) onto transmit;
+    /// the HAL clock is anchored from RX. Every family except M-Audio special.
+    kRxReplay = 0,
+    /// Run the host's own fixed cadence and anchor the HAL clock from transmit
+    /// completions. M-Audio special firmware idles in NO-DATA until it has
+    /// received host DATA, so transmit cannot wait for RX timing.
+    kInternalCadence,
+    /// Start TX from a nominal blocking cadence, then replay timestamped RX
+    /// data-block counts once the receive clock has a bounded stable history.
+    /// Used only by the synthetic RME profile until its Stage 5 publication.
+    kRxReplayAfterBootstrap,
 };
 
 // ADK packet allocation and AMDTP encoding are shared by multiple protocol
@@ -51,12 +89,28 @@ public:
     [[nodiscard]] virtual uint32_t TxStreamCount() const noexcept { return 1; }
     [[nodiscard]] virtual uint32_t RxStreamCount() const noexcept { return 1; }
     [[nodiscard]] virtual AudioStreamTxPolicy TxStreamPolicy() const noexcept { return {}; }
+    [[nodiscard]] virtual TxClockSource TransmitClockSource() const noexcept {
+        return TxClockSource::kRxReplay;
+    }
 
     // Profiles with unequal playback streams override this geometry. Uniform
     // streams retain their default shape at successive channel offsets.
     [[nodiscard]] virtual bool BuildTxStreamConfig(
         uint32_t streamIndex, AudioStreamConfig& outConfig) const noexcept {
         if (streamIndex >= TxStreamCount() || !BuildDefaultTxStreamConfig(outConfig)) {
+            return false;
+        }
+        outConfig.sourceChannelOffset = streamIndex * outConfig.pcmChannels;
+        return true;
+    }
+
+    // Capture's counterpart. It existed only as a default, so every capture
+    // stream was assumed to share stream 0's shape with nothing able to say
+    // otherwise -- the recorded StudioLive 24.4.2 carries 16 + 10 on playback,
+    // so unequal streams are real, not hypothetical.
+    [[nodiscard]] virtual bool BuildRxStreamConfig(
+        uint32_t streamIndex, AudioStreamConfig& outConfig) const noexcept {
+        if (streamIndex >= RxStreamCount() || !BuildDefaultRxStreamConfig(outConfig)) {
             return false;
         }
         outConfig.sourceChannelOffset = streamIndex * outConfig.pcmChannels;
@@ -72,14 +126,41 @@ public:
     // (Linux waits 4 s; cross-validated with Linux bebob_stream.c:10,636-666).
     [[nodiscard]] virtual uint32_t InitialClockAnchorTimeoutMs() const noexcept { return 500; }
 
+    // Keep the device's wire running across CoreAudio StopIO, and keep a
+    // warming wire when a start's first timestamp is late, so the HAL's
+    // StopIO/StartIO churn and retries cost no bus traffic and do not restart
+    // the device's own warm-up (Runtime/WireRetention.hpp; AppleFWAudio keeps
+    // streams from device start to device stop). Opt-in per profile until each
+    // family is verified on hardware.
+    [[nodiscard]] virtual bool RetainsWireAcrossStopIO() const noexcept { return false; }
+
+    // Sum the streams the device actually carries. The previous form was
+    // pcmChannels * StreamCount(), which silently assumes every stream has
+    // stream 0's width: the recorded Venice F24 carries 16 + 8, so that form
+    // reports 32 where the device means 24, and the StudioLive 24.4.2's
+    // 16 + 10 playback reports 32 where the device means 26. Profiles with
+    // unequal streams had to override these to be correct; summing means they
+    // no longer have to, and a profile that forgets is no longer wrong.
     [[nodiscard]] uint32_t TxChannelCount() const noexcept override {
-        AudioStreamConfig config{};
-        return BuildDefaultTxStreamConfig(config) ? config.pcmChannels * TxStreamCount() : 0;
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < TxStreamCount(); ++i) {
+            AudioStreamConfig config{};
+            if (BuildTxStreamConfig(i, config)) {
+                total += config.pcmChannels;
+            }
+        }
+        return total;
     }
 
     [[nodiscard]] uint32_t RxChannelCount() const noexcept override {
-        AudioStreamConfig config{};
-        return BuildDefaultRxStreamConfig(config) ? config.pcmChannels * RxStreamCount() : 0;
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < RxStreamCount(); ++i) {
+            AudioStreamConfig config{};
+            if (BuildRxStreamConfig(i, config)) {
+                total += config.pcmChannels;
+            }
+        }
+        return total;
     }
 
     [[nodiscard]] uint32_t TxMidiSlots() const noexcept override {

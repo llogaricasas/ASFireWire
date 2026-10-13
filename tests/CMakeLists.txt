@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.23)
 
 project(ASFWHostTests LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -34,6 +34,51 @@ set(ASFW_COMMON_INCLUDES
     "${ASFW_ROOT_DIR}/AppleHeaders"
 )
 
+# ---------------------------------------------------------------------------
+# Sanitizers
+#
+# The recurring bug class in this driver is lifetime: cross-service
+# use-after-free on teardown, refcount imbalance, borrows that outlive what they
+# borrow from. The host stubs refcount for real, which surfaces imbalance as a
+# leaked object, but over-release cannot be caught from inside an object that has
+# already been freed -- the detector for that is ASan, which reports
+# heap-use-after-free at the exact access.
+#
+#   cmake -S tests -B build/tests_asan -DASFW_ENABLE_ASAN=ON
+#
+# Leak detection is off by default because LeakSanitizer is unsupported on
+# macOS/arm64; set ASFW_ENABLE_LSAN=ON where it is available.
+option(ASFW_ENABLE_ASAN "Build the host tests with AddressSanitizer + UBSan" OFF)
+option(ASFW_ENABLE_TSAN "Build the host tests with ThreadSanitizer" OFF)
+option(ASFW_ENABLE_LSAN "Also enable LeakSanitizer (unsupported on macOS/arm64)" OFF)
+
+if(ASFW_ENABLE_ASAN AND ASFW_ENABLE_TSAN)
+    message(FATAL_ERROR "ASan and TSan require separate build directories")
+endif()
+
+if(ASFW_ENABLE_TSAN)
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=thread)
+    message(STATUS "ASFW: ThreadSanitizer enabled for host tests")
+endif()
+
+if(ASFW_ENABLE_ASAN)
+    set(ASFW_SANITIZER_FLAGS
+        -fsanitize=address
+        -fsanitize=undefined
+        -fno-omit-frame-pointer
+        -fno-optimize-sibling-calls
+        # A sanitizer report is worthless without the line it points at.
+        -g
+    )
+    if(ASFW_ENABLE_LSAN)
+        list(APPEND ASFW_SANITIZER_FLAGS -fsanitize=leak)
+    endif()
+    add_compile_options(${ASFW_SANITIZER_FLAGS})
+    add_link_options(${ASFW_SANITIZER_FLAGS})
+    message(STATUS "ASFW: AddressSanitizer + UBSan enabled for host tests")
+endif()
+
 enable_testing()
 
 # Find or fetch GoogleTest
@@ -55,7 +100,12 @@ include(GoogleTest)
 add_library(asfw_test_common_interface INTERFACE)
 target_include_directories(asfw_test_common_interface INTERFACE ${ASFW_COMMON_INCLUDES})
 target_compile_definitions(asfw_test_common_interface INTERFACE ASFW_HOST_TEST)
-target_compile_features(asfw_test_common_interface INTERFACE cxx_std_23)
+target_compile_features(asfw_test_common_interface INTERFACE cxx_std_26)
+
+# Compiled into every test binary so the sanitizer settings do not depend on the
+# caller's environment -- see the file's header for why that matters.
+target_sources(asfw_test_common_interface INTERFACE
+    "${ASFW_TESTS_DIR}/support/SanitizerDefaults.cpp")
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU")
   target_compile_options(asfw_test_common_interface INTERFACE -Wno-character-conversion)
@@ -105,6 +155,33 @@ add_library(asfw_discovery_host STATIC
 )
 target_link_libraries(asfw_discovery_host PUBLIC asfw_test_support)
 
+# 5. Audio device catalog host library
+add_library(asfw_catalog_host STATIC
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceCatalog.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceResolver.cpp"
+    "${ASFW_DRIVER_DIR}/DeviceProfiles/Audio/AudioDeviceValidation.cpp"
+)
+target_link_libraries(asfw_catalog_host PUBLIC asfw_test_common_interface)
+target_link_libraries(asfw_test_support PUBLIC asfw_catalog_host)
+
+# 6. AVC codecs host library
+add_library(asfw_avc_codecs STATIC
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Core/AvcFrame.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Protocols/AVC/DiscoveryCoordinator.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Graph/DiscoveryGraph.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Discovery/DiscoveryReducer.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Discovery/DiscoveryLog.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Discovery/DiscoverySession.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Descriptors/DescriptorAccessor.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Descriptors/AVCInfoBlock.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Descriptors/MusicSubunitDescriptor.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Descriptors/AudioSubunitDescriptor.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Commands/StreamFormatCommand.cpp"
+    "${ASFW_DRIVER_DIR}/Protocols/AVC/Extensions/BridgeCoPlugInfo.cpp"
+)
+target_link_libraries(asfw_avc_codecs PUBLIC asfw_test_common_interface)
+target_link_libraries(asfw_test_support PUBLIC asfw_avc_codecs)
+
 # Include modular test subdirectories
 add_subdirectory(support)
 add_subdirectory(core)
@@ -115,3 +192,4 @@ add_subdirectory(protocols)
 add_subdirectory(audio)
 add_subdirectory(devices)
 add_subdirectory(common)
+add_subdirectory(tools)

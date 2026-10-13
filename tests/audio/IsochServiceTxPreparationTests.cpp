@@ -20,6 +20,20 @@ using ASFW::Isoch::ExpectedTxCommitGeneration;
 using ASFW::Isoch::IsochTxPacketMeta;
 using ASFW::Isoch::IsochTxQueueControl;
 
+// The ring reads completion from OUTPUT_LAST xferStatus (T5). A test that only
+// moves the CommandPtr describes a controller that finished nothing, so it must
+// also mark the packets it says went out.
+void MarkPacketsSent(ASFW::Isoch::IsochTransmitContext& context,
+                     uint64_t firstAbs, uint32_t count) {
+    auto& slab = context.RingForTesting().Slab();
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t slot = static_cast<uint32_t>((firstAbs + i) % Layout::kNumPackets);
+        auto* completion = slab.GetDescriptorPtr(
+            slot * Layout::kBlocksPerPacket + Layout::kCompletionBlock);
+        completion->statusWord = (0x0011u << 16) | (completion->statusWord & 0xFFFFu);
+    }
+}
+
 class RecordingReceiveConsumer final : public ASFW::Isoch::IIsochReceiveConsumer {
   public:
     void OnReceiveActivated() noexcept override { ++activated; }
@@ -65,8 +79,11 @@ TEST(IsochServiceTxPreparation, CallbackRegisteredBeforeContextCreationSurvivesS
     for (uint64_t packetIndex = 0; packetIndex < AudioTimingGeometry::kTxSharedSlotPackets;
          ++packetIndex) {
         auto& meta = metadata[packetIndex % AudioTimingGeometry::kTxSharedSlotPackets];
+        meta.immediateHeader[0] = 0;
+        meta.immediateHeader[1] = 0;
         meta.packetIndex = packetIndex;
         meta.payloadLength = 8;
+        meta.operation = ASFW::Isoch::IsochTxOperation::Packet;
         meta.commitGeneration.store(
             ExpectedTxCommitGeneration(packetIndex, AudioTimingGeometry::kTxSharedSlotPackets),
             std::memory_order_release);
@@ -80,7 +97,7 @@ TEST(IsochServiceTxPreparation, CallbackRegisteredBeforeContextCreationSurvivesS
                                 std::memory_order_release);
 
     ASSERT_EQ(service.StartTransmit(/*channel=*/3, hardware,
-                                    /*sid=*/0x3f),
+                                    /*sid=*/0x3f, ASFW::FW::FwSpeed::S400),
               kIOReturnSuccess);
     auto* context = service.TransmitContext();
     ASSERT_NE(context, nullptr);
@@ -94,6 +111,7 @@ TEST(IsochServiceTxPreparation, CallbackRegisteredBeforeContextCreationSurvivesS
     const uint32_t nextCommandPtr =
         descriptorBase + completedPackets * Layout::kBlocksPerPacket * Layout::kDescriptorStride;
     hardware.SetTestRegister(commandPtrRegister, nextCommandPtr | Layout::kBlocksPerPacket);
+    MarkPacketsSent(*context, 0, completedPackets);
 
     context->HandleInterrupt();
 
@@ -121,8 +139,11 @@ TEST(IsochServiceTxPreparation, ActiveTransmitStopRetainsQueueUntilHardwareQuies
          packetIndex < AudioTimingGeometry::kTxSharedSlotPackets;
          ++packetIndex) {
         auto& meta = metadata[packetIndex % AudioTimingGeometry::kTxSharedSlotPackets];
+        meta.immediateHeader[0] = 0;
+        meta.immediateHeader[1] = 0;
         meta.packetIndex = packetIndex;
         meta.payloadLength = 8;
+        meta.operation = ASFW::Isoch::IsochTxOperation::Packet;
         meta.commitGeneration.store(
             ExpectedTxCommitGeneration(
                 packetIndex, AudioTimingGeometry::kTxSharedSlotPackets),
@@ -135,10 +156,18 @@ TEST(IsochServiceTxPreparation, ActiveTransmitStopRetainsQueueUntilHardwareQuies
     queue->committedEnd.store(AudioTimingGeometry::kTxPreparationLeadPackets,
                               std::memory_order_release);
 
-    ASSERT_EQ(service.StartTransmit(3, hardware, 0x3f), kIOReturnSuccess);
+    ASSERT_EQ(service.StartTransmit(3, hardware, 0x3f, ASFW::FW::FwSpeed::S400),
+              kIOReturnSuccess);
     auto* context = service.TransmitContext();
     ASSERT_NE(context, nullptr);
     EXPECT_EQ(context->GetState(), ASFW::Isoch::ITState::Running);
+
+    ASSERT_TRUE(context->AcquireRefillGateForTesting());
+    EXPECT_EQ(service.StopAll(), kIOReturnTimeout);
+    EXPECT_TRUE(context->NeedsQuiesce());
+    // Timeout must not clear a gate still owned by the dispatched refill.
+    EXPECT_FALSE(context->AcquireRefillGateForTesting());
+    context->ReleaseRefillGateForTesting();
 
     const Register32 controlSet = static_cast<Register32>(
         DMAContextHelpers::IsoXmitContextControlSet(0));
@@ -149,6 +178,131 @@ TEST(IsochServiceTxPreparation, ActiveTransmitStopRetainsQueueUntilHardwareQuies
     hardware.LatchProviderRevokedAndDrain();
     EXPECT_EQ(service.StopAll(), kIOReturnSuccess);
     EXPECT_EQ(context->GetState(), ASFW::Isoch::ITState::Stopped);
+}
+
+// A refill fault clears RUN, but the context may still be ACTIVE. It must stay
+// Faulted -- refusing new memory -- until Stop() has seen ACTIVE clear, the same
+// barrier a running context gets (Linux ohci.c context_stop).
+TEST(IsochServiceTxPreparation, FaultedTransmitIsQuiescedByStopBeforeReuse) {
+    IsochService service;
+    HardwareInterface hardware;
+    IOMemoryDescriptor* payloadDescriptor = nullptr;
+    IOMemoryDescriptor* metadataDescriptor = nullptr;
+    IOMemoryDescriptor* controlDescriptor = nullptr;
+    ASSERT_EQ(service.AllocateTxIsochResources(
+                  0, AudioTimingGeometry::kTxSharedSlotPackets, 512,
+                  AudioTimingGeometry::kTxPacketsPerGroup, &payloadDescriptor,
+                  &metadataDescriptor, &controlDescriptor),
+              kIOReturnSuccess);
+
+    IOAddressSegment metadataRange{};
+    ASSERT_EQ(metadataDescriptor->GetAddressRange(&metadataRange), kIOReturnSuccess);
+    auto* metadata = reinterpret_cast<IsochTxPacketMeta*>(metadataRange.address);
+    for (uint64_t packetIndex = 0; packetIndex < AudioTimingGeometry::kTxSharedSlotPackets;
+         ++packetIndex) {
+        auto& meta = metadata[packetIndex];
+        meta.immediateHeader[0] = 0;
+        meta.immediateHeader[1] = 0;
+        meta.packetIndex = packetIndex;
+        meta.payloadLength = 8;
+        meta.operation = ASFW::Isoch::IsochTxOperation::Packet;
+        meta.commitGeneration.store(
+            ExpectedTxCommitGeneration(packetIndex, AudioTimingGeometry::kTxSharedSlotPackets),
+            std::memory_order_release);
+    }
+    IOAddressSegment controlRange{};
+    ASSERT_EQ(controlDescriptor->GetAddressRange(&controlRange), kIOReturnSuccess);
+    auto* queue = reinterpret_cast<IsochTxQueueControl*>(controlRange.address);
+    queue->ResetProducerForStart();
+    queue->committedEnd.store(AudioTimingGeometry::kTxPreparationLeadPackets,
+                              std::memory_order_release);
+
+    ASSERT_EQ(service.StartTransmit(3, hardware, 0x3f, ASFW::FW::FwSpeed::S400),
+              kIOReturnSuccess);
+    auto* context = service.TransmitContext();
+    ASSERT_NE(context, nullptr);
+
+    // Start primes one ring (packets 0..503). The first refill after one
+    // interrupt group maps from 504 on; an uncommitted packet there is a
+    // refill fault.
+    const uint32_t completed = AudioTimingGeometry::kTxPacketsPerGroup;
+    const uint64_t uncommitted = Layout::kNumPackets;
+    metadata[uncommitted].commitGeneration.store(0, std::memory_order_release);
+    const Register32 commandPtrRegister =
+        static_cast<Register32>(DMAContextHelpers::IsoXmitCommandPtr(0));
+    const uint32_t descriptorBase = hardware.GetTestRegister(commandPtrRegister) & 0xfffffff0U;
+    hardware.SetTestRegister(commandPtrRegister,
+                             (descriptorBase + completed * Layout::kBlocksPerPacket *
+                                                   Layout::kDescriptorStride) |
+                                 Layout::kBlocksPerPacket);
+    MarkPacketsSent(*context, 0, completed);
+    context->HandleInterrupt();
+    ASSERT_EQ(context->GetState(), ASFW::Isoch::ITState::Faulted);
+    EXPECT_TRUE(context->NeedsQuiesce());
+
+    // Still ACTIVE: the memory stays, and Stop() reports it.
+    const Register32 controlSet = static_cast<Register32>(
+        DMAContextHelpers::IsoXmitContextControlSet(0));
+    hardware.SetTestRegister(controlSet, ASFW::Driver::ContextControl::kActive);
+    EXPECT_EQ(context->SetSharedMemoryDescriptors(payloadDescriptor, metadataDescriptor,
+                                                  controlDescriptor,
+                                                  AudioTimingGeometry::kTxPacketsPerGroup),
+              kIOReturnBusy);
+    EXPECT_EQ(service.StopTransmit(), kIOReturnTimeout);
+    EXPECT_EQ(context->GetState(), ASFW::Isoch::ITState::Faulted);
+
+    hardware.SetTestRegister(controlSet, 0);
+    EXPECT_EQ(service.StopTransmit(), kIOReturnSuccess);
+    EXPECT_EQ(context->GetState(), ASFW::Isoch::ITState::Stopped);
+    EXPECT_FALSE(context->NeedsQuiesce());
+}
+
+// Start clears every ContextControl bit: cycleMatchEnable (bit 31) has an
+// undefined reset value (OHCI 1.2 draft Table 9-7). It clears only this
+// context's stale event bit, so a running sibling keeps its pending completion.
+TEST(IsochServiceTxPreparation, StartClearsContextControlAndOnlyItsOwnEvent) {
+    IsochService service;
+    HardwareInterface hardware;
+    IOMemoryDescriptor* payloadDescriptor = nullptr;
+    IOMemoryDescriptor* metadataDescriptor = nullptr;
+    IOMemoryDescriptor* controlDescriptor = nullptr;
+    ASSERT_EQ(service.AllocateTxIsochResources(
+                  0, AudioTimingGeometry::kTxSharedSlotPackets, 512,
+                  AudioTimingGeometry::kTxPacketsPerGroup, &payloadDescriptor,
+                  &metadataDescriptor, &controlDescriptor),
+              kIOReturnSuccess);
+
+    IOAddressSegment metadataRange{};
+    ASSERT_EQ(metadataDescriptor->GetAddressRange(&metadataRange), kIOReturnSuccess);
+    auto* metadata = reinterpret_cast<IsochTxPacketMeta*>(metadataRange.address);
+    for (uint64_t packetIndex = 0;
+         packetIndex < AudioTimingGeometry::kTxSharedSlotPackets;
+         ++packetIndex) {
+        auto& meta = metadata[packetIndex % AudioTimingGeometry::kTxSharedSlotPackets];
+        meta.immediateHeader[0] = 0;
+        meta.immediateHeader[1] = 0;
+        meta.packetIndex = packetIndex;
+        meta.payloadLength = 8;
+        meta.operation = ASFW::Isoch::IsochTxOperation::Packet;
+        meta.commitGeneration.store(
+            ExpectedTxCommitGeneration(
+                packetIndex, AudioTimingGeometry::kTxSharedSlotPackets),
+            std::memory_order_release);
+    }
+    IOAddressSegment controlRange{};
+    ASSERT_EQ(controlDescriptor->GetAddressRange(&controlRange), kIOReturnSuccess);
+    auto* queue = reinterpret_cast<IsochTxQueueControl*>(controlRange.address);
+    queue->ResetProducerForStart();
+    queue->committedEnd.store(AudioTimingGeometry::kTxPreparationLeadPackets,
+                              std::memory_order_release);
+
+    ASSERT_EQ(service.StartTransmit(3, hardware, 0x3f, ASFW::FW::FwSpeed::S400),
+              kIOReturnSuccess);
+
+    const Register32 controlClear = static_cast<Register32>(
+        DMAContextHelpers::IsoXmitContextControlClear(0));
+    EXPECT_EQ(hardware.GetTestRegister(controlClear), 0xFFFFFFFFu);
+    EXPECT_EQ(hardware.GetTestRegister(Register32::kIsoXmitIntEventClear), 1u);
 }
 
 // Secondary-stream container: a multi-stream DICE device (Venice F32 = 2×16)
@@ -164,7 +318,8 @@ TEST(IsochServiceTxPreparation, SecondaryStreamRejectsIndexZeroAndOutOfRange) {
     EXPECT_EQ(service.PrepareReceiveStream(0, /*channel=*/1, hardware,
                                            /*offset=*/0, /*streamChannels=*/16),
               kIOReturnBadArgument);
-    EXPECT_EQ(service.PrepareTransmitStream(0, /*channel=*/0, hardware, /*sid=*/0x3f),
+    EXPECT_EQ(service.PrepareTransmitStream(0, /*channel=*/0, hardware, /*sid=*/0x3f,
+                                            ASFW::FW::FwSpeed::S400),
               kIOReturnBadArgument);
     // Out of range.
     EXPECT_EQ(service.PrepareReceiveStream(IsochService::kMaxStreamsPerDirection, 2, hardware,
@@ -270,7 +425,7 @@ TEST(IsochServiceTxPreparation, SecondaryTransmitStreamCreatesIndependentContext
               kIOReturnSuccess);
 
     ASSERT_EQ(service.PrepareTransmitStream(/*streamIndex=*/1, /*channel=*/4, hardware,
-                                            /*sid=*/0x3f),
+                                            /*sid=*/0x3f, ASFW::FW::FwSpeed::S400),
               kIOReturnSuccess);
 
     EXPECT_EQ(service.TransmitContext(0), nullptr); // master not created

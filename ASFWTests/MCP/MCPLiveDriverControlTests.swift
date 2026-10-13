@@ -365,12 +365,14 @@ struct MCPLiveDriverControlTests {
 private final class FakeLiveDriverBackend: ASFWLiveDriverBackend {
     var mcpIsConnected = true
     var mcpLastError: String?
+    var driverVersion: DriverVersionInfo?
     var generation: UInt32 = 17
     var devices: [FWDeviceInfo] = []
     var topologySnapshot: TopologySnapshot?
     var configROM: ASFWDriverConnector.ConfigROMFetchResult?
     var avcUnits: [AVCUnitInfo] = []
     var avcSubunitCapabilities: AVCMusicCapabilities?
+    var avcSubunitDescriptor: Data?
     var nextHandle: UInt16 = 0x44
     var results: [UInt16: ASFWDriverConnector.AsyncTransactionResult] = [:]
     var reads = 0
@@ -388,6 +390,8 @@ private final class FakeLiveDriverBackend: ASFWLiveDriverBackend {
     var logQueryResponse: ASFWLogRingQueryResponse?
     var logStats: ASFWLogRingStats?
 
+    func mcpDriverVersion() -> DriverVersionInfo? { driverVersion }
+
     func mcpCurrentGeneration() -> UInt32? { generation }
     func mcpControllerStatus() -> ControllerStatus? { nil }
     func mcpFetchDiagnostics() throws -> ASFWDiagnosticsSnapshot { throw DiagnosticsError.notConnected }
@@ -403,6 +407,10 @@ private final class FakeLiveDriverBackend: ASFWLiveDriverBackend {
     func mcpAVCSubunitCapabilities(guid: UInt64, type: UInt8, id: UInt8) -> AVCMusicCapabilities? {
         avcSubunitCapabilities
     }
+    func mcpAVCSubunitDescriptor(guid: UInt64, type: UInt8, id: UInt8) -> Data? {
+        avcSubunitDescriptor
+    }
+    func mcpAVCDiscoveryDocument(guid: UInt64) -> Data? { nil }
 
     func mcpAsyncRead(destinationID: UInt16, addressHigh: UInt16, addressLow: UInt32, length: UInt32) -> UInt16? {
         reads += 1

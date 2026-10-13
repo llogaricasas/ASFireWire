@@ -2,25 +2,31 @@
 #include "DirectRxPacketDecoder.hpp"
 #include "../../../Wire/CIP/CIPHeader.hpp"
 #include "../../../../Isoch/Receive/IsochRxTiming.hpp"
+#include "../../../Ports/IWirePayloadCodec.hpp"
 
 #include <algorithm>
 #include <cstring>
+#include <span>
 
 namespace ASFW::AudioEngine::Direct::Rx {
 
 static constexpr size_t kIsochHeaderSize = 8; // Timestamp (4) + 1394 Isoch Header (4)
 
-RxAudioPacketProcessorResult RxAudioPacketProcessor::ProcessPacket(const uint8_t* payload,
-                                                                   size_t length,
-                                                                   uint64_t absoluteFrame,
-                                                                   uint32_t channels,
-                                                                   uint32_t am824Slots,
-                                                                   ASFW::Encoding::AudioWireFormat format,
-                                                                   uint32_t channelOffset,
-                                                                   bool publishTimeline) noexcept {
+RxAudioPacketProcessorResult RxAudioPacketProcessor::ProcessPacket(
+    const uint8_t* payload,
+    size_t length,
+    uint64_t absoluteFrame,
+    uint32_t channels,
+    const ::ASFW::Audio::IRxPayloadCodec& codec,
+    uint32_t channelOffset,
+    bool publishTimeline,
+    const RxCaptureChannelMap& captureMap,
+    bool primeDelayLine,
+    const ::ASFW::Encoding::AudioPacketFraming framing) noexcept {
     RxAudioPacketProcessorResult result{};
 
-    if (length < kIsochHeaderSize + 8) {
+    const bool headerless = framing == ::ASFW::Encoding::AudioPacketFraming::kHeaderless;
+    if (length < kIsochHeaderSize + (headerless ? 0U : 8U)) {
         result.status = DirectRxWriteStatus::kShortPacket;
         return result;
     }
@@ -29,30 +35,53 @@ RxAudioPacketProcessorResult RxAudioPacketProcessor::ProcessPacket(const uint8_t
         ASFW::Isoch::Rx::DecodeReceiveTimestamp(
             payload, length, result.receiveCycleTimestamp);
 
-    const uint8_t* cipStart = payload + kIsochHeaderSize;
-    const auto* quadlets = reinterpret_cast<const uint32_t*>(cipStart);
-    
-    // Decode CIP Header (quadlets[0] and quadlets[1])
-    const auto cip = ASFW::Isoch::CIPHeader::Decode(quadlets[0], quadlets[1]);
-    if (!cip) {
-        result.status = DirectRxWriteStatus::kInvalidCipHeader;
+    const uint8_t* data = payload + kIsochHeaderSize;
+    size_t payloadBytes = length - kIsochHeaderSize;
+    uint8_t cipDBS = 0;
+    if (!headerless) {
+        uint32_t quadlets[2]{};
+        std::memcpy(quadlets, data, sizeof(quadlets));
+        const auto cip = codec.DecodeHeader(quadlets[0], quadlets[1]);
+        if (!cip) {
+            result.status = DirectRxWriteStatus::kInvalidCipHeader;
+            return result;
+        }
+        result.hasValidCip = true;
+        result.syt = cip->syt;
+        result.fdf = cip->fdf;
+        result.dbc = cip->dataBlockCounter;
+        result.dbs = cip->dataBlockSize;
+        cipDBS = cip->dataBlockSize;
+        data += 8;
+        payloadBytes -= 8;
+    }
+
+    // A CIP header without payload carries no audio events regardless of its
+    // DBS value. The M-Audio 1814 idles with header-only packets that say
+    // DBS=2 (captured `02020000 9002ffff`) while its stream is DBS=11. Linux
+    // AMDTP handles zero payload before checking DBS (amdtp-stream.c:769-780).
+    if (payloadBytes == 0) {
+        result.status = DirectRxWriteStatus::kAvailable;
         return result;
     }
 
-    result.hasValidCip = true;
-    result.syt = cip->syt;
-    result.fdf = cip->fdf;
-    result.dbs = cip->dataBlockSize;
-    result.dbc = cip->dataBlockCounter;
+    const uint32_t strideQuadlets = codec.StrideQuadlets(cipDBS);
+    result.strideQuadlets = strideQuadlets;
 
-    const size_t payloadBytes = length - kIsochHeaderSize - 8;
-    const size_t dbsBytes = static_cast<size_t>(cip->dataBlockSize) * 4u;
-    if (dbsBytes == 0) {
+    const size_t strideBytes = static_cast<size_t>(strideQuadlets) * 4u;
+    if (strideBytes == 0) {
         result.status = DirectRxWriteStatus::kZeroDataBlockSize;
         return result;
     }
 
-    const size_t eventCount = payloadBytes / dbsBytes;
+    // Headerless streams have no DBS field to bound each sample frame, so their
+    // payload must consist of complete codec-defined frames.
+    if (headerless && payloadBytes % strideBytes != 0) {
+        result.status = DirectRxWriteStatus::kGeometryMismatch;
+        return result;
+    }
+
+    const size_t eventCount = payloadBytes / strideBytes;
     result.framesDecoded = static_cast<uint32_t>(eventCount);
 
     if (eventCount == 0) {
@@ -66,16 +95,28 @@ RxAudioPacketProcessorResult RxAudioPacketProcessor::ProcessPacket(const uint8_t
         return result;
     }
 
-    // Geometry validation
-    if (channels == 0 ||
-        cip->dataBlockSize < channels ||
-        am824Slots != cip->dataBlockSize) {
+    if (!codec.ValidateGeometry(channels, channelOffset, strideQuadlets, cipDBS)) {
         result.status = DirectRxWriteStatus::kGeometryMismatch;
         return result;
     }
 
-    // If armed: decode quadlets directly to ADK input memory
-    const uint32_t* dataBlocks = &quadlets[2];
+    const bool mapUsable = captureMap.FitsWithin(channels, strideQuadlets);
+    const RxCaptureChannelMap& effectiveMap =
+        mapUsable ? captureMap : RxCaptureChannelMap{};
+    if (!mapUsable) {
+        result.mapRejected = true;
+    }
+    const uint32_t delayFrames = effectiveMap.HasDelay() ? effectiveMap.delayFrames : 0;
+
+    if (primeDelayLine && delayFrames != 0) {
+        for (uint32_t i = 0; i < delayFrames; ++i) {
+            float* frameOut = writer_.Frame(absoluteFrame + i);
+            if (frameOut) {
+                SilenceDelayedChannels(channels, effectiveMap, frameOut + channelOffset);
+            }
+        }
+    }
+
     for (size_t i = 0; i < eventCount; ++i) {
         float* frameOut = writer_.Frame(absoluteFrame + i);
         if (!frameOut) {
@@ -83,16 +124,20 @@ RxAudioPacketProcessorResult RxAudioPacketProcessor::ProcessPacket(const uint8_t
             return result;
         }
 
-        const uint32_t* frameIn = dataBlocks + (i * cip->dataBlockSize);
-        // Write this stream's slice at its channel offset into the interleaved
-        // frame; the writer stride covers the buffer's full channel width.
-        DecodeDirectRxFrame(frameIn, channels, cip->dataBlockSize, format,
-                            frameOut + channelOffset);
+        float* delayedOut = nullptr;
+        if (delayFrames != 0) {
+            delayedOut = writer_.Frame(absoluteFrame + i + delayFrames);
+            if (delayedOut) {
+                delayedOut += channelOffset;
+            }
+        }
+
+        codec.DecodeBlock(
+            std::span<const uint8_t>(data + i * strideBytes, strideBytes),
+            channels, channelOffset, effectiveMap,
+            frameOut + channelOffset, delayedOut);
     }
 
-    // Only the master stream advances the producer cursor/frame counters; a
-    // secondary slice writes PCM into the same frames without re-publishing the
-    // timeline (the two streams are frame-locked by the device clock).
     if (publishTimeline) {
         const uint64_t producedEnd = absoluteFrame + eventCount;
         writer_.PublishProducedEnd(producedEnd, static_cast<uint32_t>(eventCount));

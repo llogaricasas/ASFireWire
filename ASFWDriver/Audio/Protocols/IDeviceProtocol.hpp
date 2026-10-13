@@ -4,6 +4,7 @@
 // IDeviceProtocol.hpp - Interface for device-specific protocol handlers
 
 #pragma once
+#include "../Runtime/ResolvedAudioConfiguration.hpp"
 
 #include "AudioTypes.hpp"
 #include "../../Discovery/DeviceRouteToken.hpp"
@@ -11,11 +12,12 @@
 #include <DriverKit/IOReturn.h>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
-namespace ASFW::Protocols::AVC {
-    class FCPTransport;
+namespace ASFW::AVC {
+class IAvcUnit;
 }
 
 namespace ASFW::IRM {
@@ -23,15 +25,15 @@ namespace ASFW::IRM {
 }
 
 namespace ASFW::Audio {
-class IDuplexDeviceControl;
+class FamilyDriver;
 }
 
 namespace ASFW::Audio {
 
 /// Interface for device-specific protocol handlers
 ///
-/// Device protocols are instantiated by DeviceProtocolFactory when a
-/// known device is detected during discovery. Each protocol handler
+/// Device protocols are instantiated by CreateFamilyDeviceProtocol when a
+/// audio endpoint is resolved during discovery. Each protocol handler
 /// encapsulates vendor-specific control logic (DSP, routing, etc.).
 class IDeviceProtocol {
 public:
@@ -61,6 +63,22 @@ public:
         return false;
     }
 
+    // Immutable protocol-discovered formation snapshot, distinct from the
+    // current stream observation and from hardware qualification evidence.
+    virtual std::shared_ptr<const std::vector<Runtime::RateFormation>> RateFormations() const {
+        return {};
+    }
+    virtual void ReadRateObservation(std::function<void(IOReturn, RateHardwareObservation)> callback) {
+        callback(kIOReturnUnsupported, {});
+    }
+
+    /// Read the device's stream geometry into the cache GetRuntimeAudioStreamCaps
+    /// serves, then call back. Asynchronous, so it is safe on the Default queue
+    /// (nub publication). A protocol with nothing to read succeeds at once.
+    virtual void EnsureRuntimeStreamGeometry(std::function<void(IOReturn)> callback) {
+        callback(kIOReturnSuccess);
+    }
+
     /// Query per-channel device labels discovered from the protocol's stream
     /// format (e.g. DICE TX/RX name sections). `inNames` is host input/capture,
     /// `outNames` is host output/playback, both in channel order; an empty entry
@@ -76,55 +94,32 @@ public:
 
     using VoidCallback = std::function<void(IOReturn)>;
 
-    /// Optional bring-up hook to prepare device-side duplex state at 48kHz.
-    /// Drivers can call this before any IRM reservation or host IR/IT startup.
-    /// Implementations should be idempotent.
-    virtual void PrepareDuplex48k(const AudioDuplexChannels& channels, VoidCallback callback) {
-        (void)channels;
-        callback(kIOReturnUnsupported);
-    }
-
-    /// Optional hook to program the device-side RX leg after playback IRM allocation.
-    virtual void ProgramRxForDuplex48k(VoidCallback callback) {
-        callback(kIOReturnUnsupported);
-    }
-
-    /// Optional hook to program the device-side TX leg and enable duplex streaming.
-    virtual void ProgramTxAndEnableDuplex48k(VoidCallback callback) {
-        callback(kIOReturnUnsupported);
-    }
-
-    /// Optional completion hook after host IR/IT contexts are running.
-    /// DICE devices can use this to verify stream lock/state.
-    virtual void ConfirmDuplex48kStart(VoidCallback callback) {
-        callback(kIOReturnUnsupported);
-    }
 
     /// Optional teardown hook to stop device-side duplex state.
     virtual IOReturn StopDuplex() {
         return kIOReturnUnsupported;
     }
 
-    /// Optional internal hook for backends that need the protocol's IRM client.
-    virtual ::ASFW::IRM::IRMClient* GetIRMClient() const {
-        return nullptr;
-    }
 
-    /// Optional protocol-neutral duplex control interface used by the audio lifecycle.
-    virtual IDuplexDeviceControl* AsDuplexDeviceControl() noexcept {
-        return nullptr;
-    }
+    /// The protocol's streaming driver, for the audio session. Null: the device
+    /// does not stream.
+    virtual FamilyDriver* AsFamilyDriver() noexcept { return nullptr; }
 
-    virtual const IDuplexDeviceControl* AsDuplexDeviceControl() const noexcept {
-        return nullptr;
-    }
 
     /// Update volatile runtime context that can change across bus resets.
+    /// `avcUnit` is the device's AV/C unit (owned: the audio nub calls in on its
+    /// own queue), or null for a device without AV/C. Every frame goes through
+    /// IAvcUnit::Submit, which checks the route and the command allowlist.
     virtual void UpdateRuntimeContext(const Discovery::DeviceRouteToken& route,
-                                      Protocols::AVC::FCPTransport* transport) {
+                                      std::shared_ptr<ASFW::AVC::IAvcUnit> avcUnit) {
         (void)route;
-        (void)transport;
+        (void)avcUnit;
     }
+
+    // Explicit discovery/reset hook, including idle devices. The caller retains
+    // the protocol until completion. Register protocols restore notification IO
+    // here; ordinary protocols have no reset registration work.
+    virtual void RebindNotifications(VoidCallback callback) { callback(kIOReturnSuccess); }
 
     /// Check if protocol can expose/control a boolean control.
     // These virtuals intentionally match the host-facing `(class, element[, value])` contract.

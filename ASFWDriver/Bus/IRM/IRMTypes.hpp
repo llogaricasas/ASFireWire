@@ -13,7 +13,7 @@ using Generation = ::ASFW::Discovery::Generation;
 // ============================================================================
 
 /**
- * IRM Register Addresses (IEEE 1394-1995 §8.3.2.3.4)
+ * IRM Register Addresses (IEEE Std 1394-2008 Clause 8.3.2.3.8)
  *
  * All IRM registers are in CSR space (0xFFFFF0000000 base).
  * CRITICAL: All IRM register accesses MUST use S100 speed per specification.
@@ -33,17 +33,31 @@ namespace IRMRegisters {
 }
 
 // ============================================================================
-// Bandwidth Calculation (IEEE 1394-1995 §8.3.2.3.5)
+// Bandwidth Calculation (IEEE Std 1394-2008 Clause 8.4.3.1 & Clause 8.3.2.3.8)
 // ============================================================================
 
 /**
- * Maximum bandwidth units available at S400.
- * Per IEEE 1394, total bus bandwidth = 4915 allocation units at S400.
+ * Maximum bandwidth allocation units available per 125 µs cycle (IEEE Std 1394-2008 Clause 8.3.2.3.8).
  *
- * Calculation: 400 Mbps / 196 KB/s per unit ≈ 4915 units
+ * The IRM BANDWIDTH_AVAILABLE register (CSR offset 0x220) specifies the remaining
+ * isochronous bandwidth allocation units on the bus.
  *
- * Reference: Apple IOFireWireController.cpp:6302 - Initial bandwidth 0x1333
- *            Linux core.h:46 - BANDWIDTH_AVAILABLE_INITIAL 4915
+ * Specification & Timing Derivation:
+ * - 1 bandwidth allocation unit = time to transmit 1 quadlet (32 bits) at S1600
+ *   with base transmission clock 49.152 MHz (IEEE Std 1394-2008 Clause 5.2.4.1):
+ *     t_unit = 1 / 49.152 MHz = 20.34505 ns.
+ * - Total allocation units in a nominal 8 kHz (125 µs) isochronous cycle:
+ *     125 µs × 49.152 MHz = 6,144 allocation units.
+ * - IEEE Std 1394-2008 Clause 8.3.2.3.8 strictly caps isochronous transmissions to at most 100 µs
+ *   (80% of the 125 µs cycle) to guarantee bus availability for asynchronous traffic:
+ *     100 µs × 49.152 MHz = 4,915.2 ≈ 4,915 allocation units (0x1333).
+ * - The remaining 25 µs (1,228.8 ≈ 1,229 units, or 20% of the cycle) is the mandatory
+ *   async cycle remainder, dedicated to cycle start packets, arbitration gaps,
+ *   and asynchronous transaction requests and responses.
+ *
+ * Reference:
+ *   Apple IOFireWireController.cpp:6302 - Initial bandwidth 0x1333 (4915)
+ *   Linux core.h:46 - BANDWIDTH_AVAILABLE_INITIAL 4915
  */
 constexpr uint32_t kMaxBandwidthUnitsS400 = 4915;
 
@@ -58,52 +72,74 @@ constexpr uint32_t kMaxBandwidthUnitsS400 = 4915;
 constexpr uint32_t kChannelsAvailableInitial = 0xFFFFFFFF;  ///< All channels free
 
 /**
- * Inputs for CalculateBandwidthUnits().
+ * Isochronous packet cost, in IEEE 1394 bandwidth allocation units.
  *
- * Formula (from IEEE 1394-1995 Annex C):
- *   units = (bits_per_second * overhead_factor) / speed_mbps * max_units
+ * Specification: IEEE Std 1394-2008 Clause 8.4.3.1.
  *
- * bitsPerSecond: Required bandwidth in bits per second.
- * speedMbps: Bus speed in Mbps (100, 200, 400, 800).
- * overheadPercent: Overhead factor for CIP headers, retries, etc. Defaults to 10%.
+ * Formula:
+ *   units = (ceil(payloadBytes / 4) + 3) * 16 / (1 << speedCode)
  *
- * Example:
- *   Audio: 48kHz * 24-bit * 2ch = 2.304 Mbps
- *   At S400 with 10% overhead:
- *   units = (2.304 * 1.10) / 400 * 4915 ≈ 31 units
+ * Component Breakdown:
+ * - payloadBytes: Isochronous data payload including IEC 61883 CIP header,
+ *   excluding the 1394 isochronous packet header.
+ * - quadlets = (payloadBytes + 3) / 4: Payload bytes rounded up to quadlets.
+ * - +3 quadlets: Mandatory 1394 isochronous packet framing overhead:
+ *     1 quadlet: Isochronous packet header (data_length:16, tag:2, channel:6, tcode:4, sy:4)
+ *     1 quadlet: Header CRC
+ *     1 quadlet: Data CRC
+ * - * 16: Scales transmission time at S100 to S1600 allocation units
+ *   (since S100 is 16× slower than S1600).
+ * - >> speedCode: Divides duration by 2^speedCode (1 for S100, 2 for S200, 4 for S400, 8 for S800).
  *
- * Reference: Apple IOFireWireController.cpp bandwidth allocation
- *            IEC 61883 overhead calculations
+ * Apple and Linux Parity:
+ * - Apple IOFWIsochChannel.cpp:664:
+ *     bandwidth = (fPacketSize / 4 + 3) * 16 / (1 << inSpeed);
+ * - Linux sound/firewire/iso-resources.c:48-61:
+ *     packet_bandwidth(max_payload_bytes, speed);
+ *
+ * Apple charges strictly this packet term against BANDWIDTH_AVAILABLE. Zero gap
+ * overhead is subtracted from the IRM ledger because the 25 µs (1,229 units)
+ * cycle remainder already accommodates isochronous arbitration gaps.
+ *
+ * @param payloadBytes Packet payload including CIP headers, excluding the
+ *                     1394 isochronous header.
+ * @param speedCode    0=S100, 1=S200, 2=S400, 3=S800.
  */
-struct BandwidthUnitsRequest {
-    uint32_t bitsPerSecond{0};
-    uint32_t speedMbps{0};
-    uint32_t overheadPercent{10};
-};
+[[nodiscard]] constexpr uint32_t PacketBandwidthUnits(uint32_t payloadBytes,
+                                                      uint8_t speedCode) noexcept {
+    const uint32_t quadlets = (payloadBytes + 3U) / 4U;
+    const uint32_t unitsAtS1600 = (quadlets + 3U) * 16U;
+    return speedCode >= 4U ? unitsAtS1600 : unitsAtS1600 >> speedCode;
+}
 
 /**
- * Calculate the number of bandwidth units to allocate for a stream request.
+ * Bus arbitration gap overhead for IEC 61883-1 Connection Management Protocol (CMP).
+ *
+ * Specification: IEC 61883-1:2001 Clause 5.3.2 Table 5 (Plug Control Registers: oPCR/iPCR).
+ *
+ * Architecture Distinction (IEEE 1394 IRM vs. IEC 61883 CMP):
+ * - IEEE 1394 IRM (CSR 0xFFFFF0000220 BANDWIDTH_AVAILABLE):
+ *   A bus-wide shared allocation counter. Apple IOFWIsochChannel.cpp:664 does NOT
+ *   charge gap overhead against BANDWIDTH_AVAILABLE because arbitration gaps are
+ *   subsumed in the 25 µs (1,229 units) async cycle remainder (IEEE Std 1394-2008 Clause 8.3.2.3.8).
+ *
+ * - IEC 61883-1 CMP (CSR 0xFFFFF0000900 oPCR[n] bits [13:10] overhead_id):
+ *   The overhead_id field in output plug control registers communicates the expected
+ *   arbitration and packet gap delay across hops (in quanta of 32 allocation units)
+ *   to receiving nodes for buffer dimensioning and media clock synchronization.
+ *
+ * Formula:
+ *   For gapCount < 63: overhead ≈ (gapCount * 9.7) + 89 units.
+ *   For unoptimized bus (gapCount = 63): worst-case 512 units (overhead_id = 0, or 16 * 32 units).
  */
-inline uint32_t CalculateBandwidthUnits(const BandwidthUnitsRequest& request)
-{
-    // Convert bits/sec to Mbits/sec (round up)
-    uint32_t mbitsPerSec = (request.bitsPerSecond + 999999) / 1000000;
-
-    // Add overhead
-    mbitsPerSec = static_cast<uint32_t>(
-        (static_cast<uint64_t>(mbitsPerSec) * (100ULL + request.overheadPercent)) / 100ULL);
-
-    // Scale to S400 bandwidth units
-    uint32_t units = static_cast<uint32_t>(
-        (static_cast<uint64_t>(mbitsPerSec) * kMaxBandwidthUnitsS400) / request.speedMbps);
-
-    return units;
+[[nodiscard]] constexpr uint32_t BandwidthOverheadForGapCount(uint8_t gapCount) noexcept {
+    return gapCount < 63U ? (static_cast<uint32_t>(gapCount) * 97U) / 10U + 89U : 512U;
 }
 
 /**
  * Calculate bit position for channel in CHANNELS_AVAILABLE register.
  *
- * Bit mapping (IEEE 1394-1995):
+ * Bit mapping (IEEE Std 1394-2008 Clause 8.3.2.3.8):
  *   CHANNELS_AVAILABLE_31_0:  bit 31 = channel 0, bit 0 = channel 31
  *   CHANNELS_AVAILABLE_63_32: bit 31 = channel 32, bit 0 = channel 63
  *
@@ -152,10 +188,16 @@ enum class AllocationStatus : uint8_t {
     /// Allocation succeeded (CAS lock succeeded)
     Success,
 
-    /// Insufficient resources
-    /// - Channel: Bit already clear (channel allocated by another node)
-    /// - Bandwidth: Insufficient units available
+    /// A lock lost its race and ran out of retries. The ledger moved between
+    /// our read and our compare-swap, so ownership of the resource is unknown
+    /// rather than known-denied.
     NoResources,
+
+    /// The requested channel's bit was already clear: another node owns it.
+    ChannelBusy,
+
+    /// BANDWIDTH_AVAILABLE held fewer units than the request needed.
+    BandwidthShort,
 
     /// Generation mismatch
     /// - Caller's generation != IRMClient's internal generation, OR
@@ -177,7 +219,11 @@ enum class AllocationStatus : uint8_t {
         case AllocationStatus::Success:
             return "success";
         case AllocationStatus::NoResources:
-            return "no_resources";
+            return "lock_contention";
+        case AllocationStatus::ChannelBusy:
+            return "channel_busy";
+        case AllocationStatus::BandwidthShort:
+            return "bandwidth_short";
         case AllocationStatus::GenerationMismatch:
             return "generation_mismatch";
         case AllocationStatus::Timeout:

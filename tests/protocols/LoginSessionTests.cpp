@@ -104,6 +104,21 @@ public:
         session.Configure(info);
     }
 
+    // Mirror production's ORB deregistration protocol.
+    //
+    // FetchAgent tracks outstanding ORBs by RAW pointer and writes
+    // orb->SetAppended(false) into each one when cleared, so a cleared ORB must
+    // still be alive. Production satisfies that in
+    // CommandExecutor::CleanupCommandResources: it calls
+    // session_.ClearCommandTracking() FIRST, then drops commandORB_ -- and
+    // SessionRecord declares `executor` last so it tears down before `session`.
+    //
+    // Tests that build bare stack ORBs have no executor doing that for them, so
+    // they must do it themselves before the ORBs leave scope. Without it the
+    // session's destructor writes into dead ORBs, which ASan reports as
+    // stack-use-after-scope.
+    void ClearCommandTracking() { session.ClearCommandTracking(); }
+
     // Bus completions fire inline via CompleteNextWrite; timeouts/retries run on
     // the virtual-clock scheduler. There is no queue to drain.
     void DrainReady() {}
@@ -306,6 +321,32 @@ TEST(LoginSessionTests, ReconnectAckStartsStatusTimeoutAndFallsBackToLogin) {
 // login, then the fresh login's up-edge. Observers (the SCSI HBA) key target
 // lifetime to these edges — without the down-edge the stale target survives the
 // device reboot (HW finding 2, 2026-07-29: data-out 5/26 after power-cycle).
+// A reconnect write that fails (target gone, or rejected at the link) must not
+// strand the session in Reconnecting: it falls back to session lost + login.
+TEST(LoginSessionTests, FailedReconnectWriteEmitsSessionLostThenFallbackLogin) {
+    SessionRig rig;
+    rig.LoginSuccessfully();
+
+    std::vector<int> statuses;
+    rig.session.SetLoginCallback(
+        [&statuses](const ASFW::Protocols::SBP2::LoginCompleteParams& params) {
+            statuses.push_back(params.status);
+        });
+
+    rig.bus.SetGeneration(ASFW::FW::Generation{2});
+    rig.session.HandleBusReset(2);
+    ASSERT_TRUE(rig.session.Reconnect());
+    const size_t reconnectWriteIndex = rig.bus.WriteCount() - 1;
+    ASSERT_TRUE(rig.bus.CompleteWrite(rig.bus.WriteAt(reconnectWriteIndex).handle,
+                                      ASFW::Async::AsyncStatus::kTimeout));
+
+    rig.AdvanceMs(1'000);
+
+    ASSERT_EQ(1u, statuses.size());
+    EXPECT_LT(statuses[0], 0);
+    EXPECT_EQ(LoginState::LoggingIn, rig.session.State());
+}
+
 TEST(LoginSessionTests, ReconnectRejectionEmitsSessionLostThenFreshLoginUpEdge) {
     SessionRig rig;
     rig.LoginSuccessfully();
@@ -500,7 +541,8 @@ TEST(LoginSessionTests, ImmediateORBRetryStaysBoundToOriginalORBAndQueuesNextImm
 
     SBP2CommandORB first(rig.addressManager, &rig.session, 16);
     first.SetFlags(SBP2CommandORB::kNormalORB);
-    first.SetTimeout(50);
+    // Outlives the 1 s retry delay: the timer runs from the first write.
+    first.SetTimeout(5'000);
 
     SBP2CommandORB second(rig.addressManager, &rig.session, 16);
     second.SetFlags(SBP2CommandORB::kNormalORB);
@@ -524,9 +566,11 @@ TEST(LoginSessionTests, ImmediateORBRetryStaysBoundToOriginalORBAndQueuesNextImm
     const uint32_t retryAddressLo = static_cast<uint32_t>(
         DecodeOrbAddressFromPayload(rig.bus.WriteAt(3).data));
     EXPECT_EQ(firstAddressLo, retryAddressLo);
+    // Deregister before the ORBs leave scope, as CommandExecutor does.
+    rig.ClearCommandTracking();
 }
 
-TEST(LoginSessionTests, SubmittedImmediateORBStartsTimeoutAfterFetchAgentWriteSucceeds) {
+TEST(LoginSessionTests, SubmittedImmediateORBStartsTimeoutWhenFetchAgentWriteIsIssued) {
     SessionRig rig;
     rig.LoginSuccessfully();
 
@@ -544,7 +588,7 @@ TEST(LoginSessionTests, SubmittedImmediateORBStartsTimeoutAfterFetchAgentWriteSu
     const size_t pendingTimersBeforeSubmit = rig.scheduler.PendingCount();
 
     ASSERT_TRUE(rig.session.SubmitORB(&orb));
-    EXPECT_EQ(pendingTimersBeforeSubmit, rig.scheduler.PendingCount());
+    EXPECT_EQ(pendingTimersBeforeSubmit + 1U, rig.scheduler.PendingCount());
 
     ASSERT_TRUE(rig.bus.CompleteNextWrite(ASFW::Async::AsyncStatus::kSuccess));
     EXPECT_EQ(pendingTimersBeforeSubmit + 1U, rig.scheduler.PendingCount());
@@ -555,6 +599,8 @@ TEST(LoginSessionTests, SubmittedImmediateORBStartsTimeoutAfterFetchAgentWriteSu
     rig.AdvanceMs(1);
     EXPECT_EQ(1, callbackCount);
     EXPECT_EQ(-1, callbackStatus);
+    // Deregister before the ORBs leave scope, as CommandExecutor does.
+    rig.ClearCommandTracking();
 }
 
 TEST(LoginSessionTests, SolicitedStatusCompletesORBMatchingByORBAddress) {
@@ -592,6 +638,8 @@ TEST(LoginSessionTests, SolicitedStatusCompletesORBMatchingByORBAddress) {
 
     EXPECT_EQ(0, firstStatus);
     EXPECT_EQ(99, secondStatus);
+    // Deregister before the ORBs leave scope, as CommandExecutor does.
+    rig.ClearCommandTracking();
 }
 
 TEST(LoginSessionTests, ImmediateORBWriteRetryExhaustionFailsActiveCommandAndResetsFetchAgent) {
@@ -624,6 +672,8 @@ TEST(LoginSessionTests, ImmediateORBWriteRetryExhaustionFailsActiveCommandAndRes
               rig.bus.WriteAt(rig.bus.WriteCount() - 1).address.addressLo);
 
     EXPECT_TRUE(rig.bus.CompleteNextWrite(ASFW::Async::AsyncStatus::kSuccess));
+    // Deregister before the ORBs leave scope, as CommandExecutor does.
+    rig.ClearCommandTracking();
 }
 
 TEST(LoginSessionTests,
@@ -669,6 +719,8 @@ TEST(LoginSessionTests,
     EXPECT_EQ(commandBlock.addressLo + CommandBlockAgentOffsets::kAgentReset,
               rig.bus.WriteAt(rig.bus.WriteCount() - 1).address.addressLo);
     EXPECT_TRUE(rig.bus.CompleteNextWrite(ASFW::Async::AsyncStatus::kSuccess));
+    // Deregister before the ORBs leave scope, as CommandExecutor does.
+    rig.ClearCommandTracking();
 }
 
 } // namespace

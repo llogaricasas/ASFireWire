@@ -8,7 +8,7 @@
 #include <DriverKit/OSSharedPtr.h>
 
 #include "../../Logging/Logging.hpp"
-#include <net.mrmidi.ASFW.ASFWDriver/ASFWAudioNub.h>
+#include <net.asfw.driver/ASFWAudioNub.h>
 
 namespace ASFW::Audio {
 
@@ -138,6 +138,7 @@ bool AudioNubPublisher::EnsureNub(uint64_t guid,
 
     IOLockLock(lock_);
     nubsByGuid_[guid] = audioNub;
+    publishedGeometry_.insert_or_assign(guid, Model::NubGeometryRefreshState{config});
     IOLockUnlock(lock_);
 
     // Release our creation reference - IOKit retains it.
@@ -148,6 +149,50 @@ bool AudioNubPublisher::EnsureNub(uint64_t guid,
              sourceTag ? sourceTag : "unknown",
              guid);
     return true;
+}
+
+bool AudioNubPublisher::RefreshNubProperties(uint64_t guid,
+                                             const Model::ASFWAudioDevice& config,
+                                             const char* sourceTag) noexcept {
+    if (!lock_) return false;
+    IOLockLock(lock_);
+    const auto it = publishedGeometry_.find(guid);
+    if (it == publishedGeometry_.end()) {
+        IOLockUnlock(lock_);
+        return false;
+    }
+    const bool blocked = !it->second.Accept(config);
+    IOLockUnlock(lock_);
+    if (blocked) {
+        ASFW_LOG_ERROR(Audio,
+                       "AudioNubPublisher[%{public}s]: geometry changed GUID=%llx; "
+                       "restart refused until endpoint recreation",
+                       sourceTag ? sourceTag : "unknown", guid);
+    }
+    // SetProperties cannot update the audio driver's cached graph. Keep the
+    // original snapshot, including clock-owned properties, on an unchanged refresh.
+    return !blocked;
+}
+
+void AudioNubPublisher::BlockGeometryChange(uint64_t guid, const char* sourceTag) noexcept {
+    if (!lock_) return;
+    IOLockLock(lock_);
+    const auto it = publishedGeometry_.find(guid);
+    if (it != publishedGeometry_.end()) it->second.Block();
+    IOLockUnlock(lock_);
+    ASFW_LOG_ERROR(Audio,
+                   "AudioNubPublisher[%{public}s]: geometry changed GUID=%llx; "
+                   "restart refused until endpoint recreation",
+                   sourceTag ? sourceTag : "unknown", guid);
+}
+
+bool AudioNubPublisher::IsGeometryChangeBlocked(uint64_t guid) const noexcept {
+    if (!lock_) return true;
+    IOLockLock(lock_);
+    const auto it = publishedGeometry_.find(guid);
+    const bool blocked = it != publishedGeometry_.end() && it->second.IsBlocked();
+    IOLockUnlock(lock_);
+    return blocked;
 }
 
 ASFWAudioNub* AudioNubPublisher::GetNub(uint64_t guid) const noexcept {
@@ -172,11 +217,13 @@ std::optional<uint64_t> AudioNubPublisher::GetSingleGuid() const noexcept {
     return result;
 }
 
-void AudioNubPublisher::TerminateNub(uint64_t guid, const char* reasonTag) noexcept {
+void AudioNubPublisher::TerminateNub(uint64_t guid, const char* reasonTag,
+                                    std::optional<IOReturn> remoteStopResult) noexcept {
     if (!lock_ || guid == 0) return;
 
     ASFWAudioNub* nub = nullptr;
     IOLockLock(lock_);
+    publishedGeometry_.erase(guid);
     auto it = nubsByGuid_.find(guid);
     if (it != nubsByGuid_.end()) {
         nub = it->second;
@@ -189,6 +236,7 @@ void AudioNubPublisher::TerminateNub(uint64_t guid, const char* reasonTag) noexc
                  "AudioNubPublisher[%{public}s]: Terminating ASFWAudioNub for GUID=%llx",
                  reasonTag ? reasonTag : "unknown",
                  guid);
+        if (remoteStopResult) nub->RecordRemoteDeviceStopResult(*remoteStopResult);
         nub->Terminate(0);
     }
 }

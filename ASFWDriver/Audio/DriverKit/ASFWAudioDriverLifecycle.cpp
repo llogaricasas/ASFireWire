@@ -6,7 +6,6 @@
 #include "ASFWAudioDriverPrivate.hpp"
 #include "ASFWAudioDevice.h"
 #include "../../Logging/Logging.hpp"
-#include "../Config/TimingCursorPolicy.hpp"
 #include "Config/AudioProfileRegistry.hpp"
 #include "../../Common/DriverKitOwnership.hpp"
 #include <DriverKit/DriverKit.h>
@@ -33,29 +32,30 @@ kern_return_t IMPL(ASFWAudioDriver, Start)
         return error;
     }
 
-    AudioGraphStartState graphState{};
     auto failStart = [&](kern_return_t status, const char* stage) -> kern_return_t {
         const kern_return_t result = (status == kIOReturnSuccess) ? kIOReturnError : status;
         ASFW_LOG(Audio,
-                 "ASFWAudioDriver: Start() failed at %{public}s kr=0x%x - unwinding partial ADK graph",
+                 "ASFWAudioDriver: Start() failed at %{public}s kr=0x%x (%{public}s) - unwinding partial ADK graph",
                  stage ? stage : "unknown",
-                 result);
+                 result, ASFW::Logging::IOReturnName(result));
         if (ivars->device.audioNub) {
             (void)ivars->device.audioNub->RegisterZtsAnchorAction(nullptr);
             (void)ivars->device.audioNub->RegisterTxPreparationAction(nullptr);
             (void)ivars->device.audioNub->RegisterDeviceClockChangedAction(nullptr);
+            (void)ivars->device.audioNub->RegisterIoRestartRequiredAction(nullptr);
         }
         ivars->deviceClockChangedAction.reset();
+        ivars->ioRestartRequiredAction.reset();
         ivars->ztsAnchorAction.reset();
         ivars->ztsQueue.reset();
         ivars->txPreparationAction.reset();
         ivars->txPreparationQueue.reset();
-        TearDownAudioGraph(*this, *ivars, &graphState);
+        TearDownAudioGraph(*this, *ivars);
         (void)Stop(provider, SUPERDISPATCH);
         return result;
     };
 
-    error = BuildAudioGraph(*this, provider, *ivars, graphState);
+    error = BuildAudioGraph(*this, provider, *ivars);
     if (error != kIOReturnSuccess) {
         return failStart(error, "BuildAudioGraph");
     }
@@ -145,6 +145,22 @@ kern_return_t IMPL(ASFWAudioDriver, Start)
         return failStart(error, "RegisterDeviceClockChangedAction");
     }
 
+    OSAction* rawIoRestartRequiredAction = nullptr;
+    error = CreateActionIoRestartRequired(0, &rawIoRestartRequiredAction);
+    if (error != kIOReturnSuccess || !rawIoRestartRequiredAction) {
+        return failStart(
+            error == kIOReturnSuccess ? kIOReturnNoMemory : error,
+            "CreateActionIoRestartRequired");
+    }
+    ivars->ioRestartRequiredAction =
+        ASFW::Common::AdoptRetained(rawIoRestartRequiredAction);
+    error = ivars->device.audioNub->RegisterIoRestartRequiredAction(
+        ivars->ioRestartRequiredAction.get());
+    if (error != kIOReturnSuccess) {
+        ivars->ioRestartRequiredAction.reset();
+        return failStart(error, "RegisterIoRestartRequiredAction");
+    }
+
     return kIOReturnSuccess;
 }
 
@@ -161,8 +177,20 @@ void IMPL(ASFWAudioDriver, DeviceClockChanged)
         ivars->audioDevice->RequestExternalRateResync(nominalRateHz);
     if (kr != kIOReturnSuccess) {
         ASFW_LOG(Audio,
-                 "ASFWAudioDriver: external rate resync request failed: 0x%x",
-                 kr);
+                 "ASFWAudioDriver: external rate resync request failed: 0x%x (%{public}s)",
+                 kr, ASFW::Logging::IOReturnName(kr));
+    }
+}
+
+void IMPL(ASFWAudioDriver, IoRestartRequired)
+{
+    (void)action;
+    if (!ivars || !ivars->audioDevice) {
+        return;
+    }
+    const kern_return_t kr = ivars->audioDevice->RequestIoRestart(reason);
+    if (kr != kIOReturnSuccess) {
+        ASFW_LOG(Audio, "ASFWAudioDriver: IO restart request failed: 0x%x (%{public}s)", kr, ASFW::Logging::IOReturnName(kr));
     }
 }
 
@@ -171,26 +199,7 @@ kern_return_t IMPL(ASFWAudioDriver, Stop)
     ASFW_LOG(Audio, "ASFWAudioDriver: Stop()");
 
     if (ivars) {
-        ivars->runtime.isRunning.store(false, std::memory_order_release);
-        if (ivars->device.audioNub) {
-            kern_return_t stopKr = ivars->device.audioNub->StopAudioStreaming();
-            if (stopKr != kIOReturnSuccess) {
-                ASFW_LOG(Audio, "ASFWAudioDriver: StopAudioStreaming failed in Stop(): 0x%x", stopKr);
-            }
-            (void)ivars->device.audioNub->RegisterTxPreparationAction(nullptr);
-            (void)ivars->device.audioNub->RegisterZtsAnchorAction(nullptr);
-            (void)ivars->device.audioNub->RegisterDeviceClockChangedAction(nullptr);
-        }
-        ivars->txPreparationAction.reset();
-        ivars->txPreparationQueue.reset();
-        ivars->deviceClockChangedAction.reset();
-        ivars->ztsAnchorAction.reset();
-        ivars->ztsQueue.reset();
-        ivars->device.audioNub = nullptr;
-    }
-
-    if (ivars && ivars->audioDevice) {
-        RemoveObject(ivars->audioDevice.get());
+        ASFW::Audio::DriverKit::StopAudioDriverGraph(*this, *ivars);
     }
 
     return Stop(provider, SUPERDISPATCH);
@@ -244,7 +253,7 @@ kern_return_t ASFWAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
     // ASFWAudioDevice::StartIO, called by the framework via super::StartDevice.
     const kern_return_t superStartKr = super::StartDevice(in_object_id, in_flags);
     if (superStartKr != kIOReturnSuccess) {
-        ASFW_LOG(Audio, "ASFWAudioDriver: super::StartDevice failed: 0x%x", superStartKr);
+        ASFW_LOG(Audio, "ASFWAudioDriver: super::StartDevice failed: 0x%x (%{public}s)", superStartKr, ASFW::Logging::IOReturnName(superStartKr));
         return superStartKr;
     }
     ASFW_LOG(DirectAudio, "ADK DBG IO super StartDevice ok id=%u", in_object_id);
@@ -262,60 +271,8 @@ kern_return_t ASFWAudioDriver::StopDevice(IOUserAudioObjectID in_object_id,
     // ASFWAudioDevice::StopIO, called by the framework via super::StopDevice.
     const kern_return_t superStopKr = super::StopDevice(in_object_id, in_flags);
     if (superStopKr != kIOReturnSuccess) {
-        ASFW_LOG(Audio, "ASFWAudioDriver: super::StopDevice failed: 0x%x", superStopKr);
+        ASFW_LOG(Audio, "ASFWAudioDriver: super::StopDevice failed: 0x%x (%{public}s)", superStopKr, ASFW::Logging::IOReturnName(superStopKr));
     }
 
     return superStopKr;
 }
-
-namespace ASFW::Audio::DriverKit {
-
-void PerformLoudTeardown(ASFWAudioDriver_IVars& ivars, const char* reason) noexcept {
-    // 1. Immediately clear isRunning and txActive to stop pump and block further IO
-    ivars.runtime.isRunning.store(false, std::memory_order_release);
-    ivars.runtime.txActive.store(false, std::memory_order_release);
-
-    ASFW_LOG(Audio, "ADK FATAL: TEARDOWN DUPLEX STREAM DUE TO: %{public}s", reason);
-
-    // 3. Stop hardware isochronous streaming
-    if (ivars.device.audioNub) {
-        const kern_return_t stopKr = ivars.device.audioNub->StopAudioStreaming();
-        if (stopKr != kIOReturnSuccess) {
-            ASFW_LOG(Audio, "ASFWAudioDriver: StopAudioStreaming failed in loud teardown: 0x%x", stopKr);
-        }
-        
-        ivars.txPayloadMap = nullptr;
-        ivars.txMetadataMap = nullptr;
-        ivars.txControlMap = nullptr;
-        ivars.txPayloadBuffer = nullptr;
-        ivars.txMetadataBuffer = nullptr;
-        ivars.txControlBuffer = nullptr;
-        ivars.runtime.txSlotProvider.payloadBase = nullptr;
-        ivars.runtime.txSlotProvider.metadataRing = nullptr;
-        ivars.runtime.txSlotProvider.queueControl = nullptr;
-        ivars.runtime.txSlotProvider.audioControl = nullptr;
-        ivars.runtime.txSlotProvider.numSlots = 0;
-        ivars.runtime.txExecutionTimeline.queueControl = nullptr;
-
-        // Secondary playback stream teardown (mirrors the master above).
-        ivars.runtime.txSecondaryActive = false;
-        ivars.txPayloadMapSecondary = nullptr;
-        ivars.txMetadataMapSecondary = nullptr;
-        ivars.txControlMapSecondary = nullptr;
-        ivars.txPayloadBufferSecondary = nullptr;
-        ivars.txMetadataBufferSecondary = nullptr;
-        ivars.txControlBufferSecondary = nullptr;
-        ivars.runtime.txSlotProviderSecondary.payloadBase = nullptr;
-        ivars.runtime.txSlotProviderSecondary.metadataRing = nullptr;
-        ivars.runtime.txSlotProviderSecondary.queueControl = nullptr;
-        ivars.runtime.txSlotProviderSecondary.audioControl = nullptr;
-        ivars.runtime.txSlotProviderSecondary.numSlots = 0;
-
-        ivars.device.audioNub->FreeTxIsochResources();
-    }
-
-    // 4. Emit final diagnostic snapshot
-    DirectDiagnostics::ForceLogDirectAudioDebugSnapshot(ivars.runtime, reason);
-}
-
-} // namespace ASFW::Audio::DriverKit

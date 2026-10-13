@@ -12,11 +12,57 @@
 #include "ASFWDriver.h"
 #include "ASFWDriverUserClient.h"
 #include "AsyncPortAccess.hpp"
+#include "../../Protocols/BeBoB/VirtualUart/BeBoBVirtualUartCommand.hpp"
 
 #include <DriverKit/IOLib.h>
 #include <DriverKit/OSData.h>
+#include <span>
+#include <memory>
 
 namespace ASFW::UserClient {
+
+namespace {
+
+// User-client transaction ownership is independent of the app connection.
+void LogTransactionRetain(ASFWDriverUserClient* client) {
+    IOLockLock(client->ivars->actionLock);
+    const auto holds = ++client->ivars->transactionHolds;
+    IOLockUnlock(client->ivars->actionLock);
+    ASFW_LOG(UserClient, "[Lifecycle] transaction retain client=%p holds=%u", client, holds);
+}
+void LogTransactionRelease(ASFWDriverUserClient* client) {
+    IOLockLock(client->ivars->actionLock);
+    const auto holds = --client->ivars->transactionHolds;
+    IOLockUnlock(client->ivars->actionLock);
+    ASFW_LOG(UserClient, "[Lifecycle] transaction release client=%p holds=%u", client, holds);
+}
+
+// A callback can be destroyed without being invoked (queued command or
+// terminal transaction teardown). Its ownership must travel with the callable,
+// rather than depending on control reaching the callback body's final line.
+class TransactionClientLifetime final {
+public:
+    explicit TransactionClientLifetime(ASFWDriverUserClient* client) : client_(client) {
+        client_->retain();
+        LogTransactionRetain(client_);
+    }
+    ~TransactionClientLifetime() {
+        LogTransactionRelease(client_);
+        client_->release();
+    }
+    TransactionClientLifetime(const TransactionClientLifetime&) = delete;
+    TransactionClientLifetime& operator=(const TransactionClientLifetime&) = delete;
+private:
+    ASFWDriverUserClient* client_;
+};
+
+[[nodiscard]] bool IsPermittedVirtualUartWrite(uint16_t addressHi, uint32_t addressLo,
+                                                std::span<const uint8_t> payload) {
+    namespace VUart = ASFW::Protocols::BeBoB::VirtualUart;
+    return VUart::IsPermittedUserClientWrite(addressHi, addressLo, payload);
+}
+
+} // namespace
 
 TransactionHandler::TransactionHandler(ASFWDriver* driver, TransactionStorage* storage)
     : driver_(driver), storage_(storage) {}
@@ -78,17 +124,15 @@ kern_return_t TransactionHandler::AsyncRead(IOUserClientMethodArguments* args,
     params.length = length;
 
     // Initiate async read with completion callback
-    userClient->retain();
+    auto lifetime = std::make_shared<TransactionClientLifetime>(userClient);
     AsyncHandle handle = asyncPort->Read(
-        params, [userClient](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
+        params, [userClient, lifetime](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
                              std::span<const uint8_t> responsePayload) {
             AsyncCompletionCallback(handle, status, responseCode, userClient,
                                     responsePayload.data(),
                                     static_cast<uint32_t>(responsePayload.size()));
-            userClient->release();
         });
     if (!handle) {
-        userClient->release();
         ASFW_LOG(UserClient, "AsyncRead: Failed to initiate transaction");
         return kIOReturnError;
     }
@@ -156,6 +200,12 @@ kern_return_t TransactionHandler::AsyncWrite(IOUserClientMethodArguments* args,
         return kIOReturnBadArgument;
     }
 
+    if (!IsPermittedVirtualUartWrite(addressHi, addressLo,
+                                     {static_cast<const uint8_t*>(payload), length})) {
+        ASFW_LOG_ERROR(UserClient, "AsyncWrite: refused non-shell BeBoB Virtual UART opcode");
+        return kIOReturnNotPermitted;
+    }
+
     // Build WriteParams
     WriteParams params{};
     params.destinationID = destinationID;
@@ -165,17 +215,15 @@ kern_return_t TransactionHandler::AsyncWrite(IOUserClientMethodArguments* args,
     params.length = length;
 
     // Initiate async write with completion callback
-    userClient->retain();
+    auto lifetime = std::make_shared<TransactionClientLifetime>(userClient);
     AsyncHandle handle = asyncPort->Write(
-        params, [userClient](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
+        params, [userClient, lifetime](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
                              std::span<const uint8_t> responsePayload) {
             AsyncCompletionCallback(handle, status, responseCode, userClient,
                                     responsePayload.data(),
                                     static_cast<uint32_t>(responsePayload.size()));
-            userClient->release();
         });
     if (!handle) {
-        userClient->release();
         ASFW_LOG(UserClient, "AsyncWrite: Failed to initiate transaction");
         return kIOReturnError;
     }
@@ -218,17 +266,15 @@ kern_return_t TransactionHandler::AsyncBlockRead(IOUserClientMethodArguments* ar
     params.length = length;
     params.forceBlock = true;
 
-    userClient->retain();
+    auto lifetime = std::make_shared<TransactionClientLifetime>(userClient);
     AsyncHandle handle = asyncPort->Read(
-        params, [userClient](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
+        params, [userClient, lifetime](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
                              std::span<const uint8_t> responsePayload) {
             AsyncCompletionCallback(handle, status, responseCode, userClient,
                                     responsePayload.data(),
                                     static_cast<uint32_t>(responsePayload.size()));
-            userClient->release();
         });
     if (!handle) {
-        userClient->release();
         ASFW_LOG(UserClient, "AsyncBlockRead: Failed to initiate transaction");
         return kIOReturnError;
     }
@@ -294,6 +340,12 @@ kern_return_t TransactionHandler::AsyncBlockWrite(IOUserClientMethodArguments* a
         return kIOReturnBadArgument;
     }
 
+    if (!IsPermittedVirtualUartWrite(addressHi, addressLo,
+                                     {static_cast<const uint8_t*>(payload), length})) {
+        ASFW_LOG_ERROR(UserClient, "AsyncBlockWrite: refused non-shell BeBoB Virtual UART opcode");
+        return kIOReturnNotPermitted;
+    }
+
     WriteParams params{};
     params.destinationID = destinationID;
     params.addressHigh = addressHi;
@@ -302,17 +354,15 @@ kern_return_t TransactionHandler::AsyncBlockWrite(IOUserClientMethodArguments* a
     params.length = length;
     params.forceBlock = true;
 
-    userClient->retain();
+    auto lifetime = std::make_shared<TransactionClientLifetime>(userClient);
     AsyncHandle handle = asyncPort->Write(
-        params, [userClient](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
+        params, [userClient, lifetime](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
                              std::span<const uint8_t> responsePayload) {
             AsyncCompletionCallback(handle, status, responseCode, userClient,
                                     responsePayload.data(),
                                     static_cast<uint32_t>(responsePayload.size()));
-            userClient->release();
         });
     if (!handle) {
-        userClient->release();
         ASFW_LOG(UserClient, "AsyncBlockWrite: Failed to initiate transaction");
         return kIOReturnError;
     }
@@ -484,10 +534,10 @@ kern_return_t TransactionHandler::AsyncCompareSwap(IOUserClientMethodArguments* 
 
     // Initiate async compare-swap with completion callback
     // NOTE: Lock completion includes old value in response payload
-    userClient->retain();
+    auto lifetime = std::make_shared<TransactionClientLifetime>(userClient);
     AsyncHandle handle = asyncPort->Lock(
         params, extendedTCode,
-        [userClient](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
+        [userClient, lifetime](AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
                      std::span<const uint8_t> responsePayload) {
             // For compare-swap, responsePayload contains the old value read from memory
             // locked = true if compare succeeded (old == compare), false otherwise
@@ -500,11 +550,9 @@ kern_return_t TransactionHandler::AsyncCompareSwap(IOUserClientMethodArguments* 
 
             ASFW_LOG(UserClient, "AsyncCompareSwap completion: handle=0x%04x locked=%{public}s",
                      handle.value, locked ? "YES" : "NO");
-            userClient->release();
         });
 
     if (!handle) {
-        userClient->release();
         ASFW_LOG(UserClient, "AsyncCompareSwap: Failed to initiate transaction");
         return kIOReturnError;
     }

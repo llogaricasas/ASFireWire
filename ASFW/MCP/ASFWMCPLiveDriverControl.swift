@@ -5,6 +5,8 @@ protocol ASFWLiveDriverBackend: AnyObject {
     var mcpIsConnected: Bool { get }
     var mcpLastError: String? { get }
 
+    func mcpDriverVersion() -> DriverVersionInfo?
+
     func mcpCurrentGeneration() -> UInt32?
     func mcpControllerStatus() -> ControllerStatus?
     func mcpFetchDiagnostics() throws -> ASFWDiagnosticsSnapshot
@@ -14,6 +16,8 @@ protocol ASFWLiveDriverBackend: AnyObject {
     func mcpConfigROM(nodeId: UInt8, generation: UInt16) -> ASFWDriverConnector.ConfigROMFetchResult?
     func mcpAVCUnits() -> [AVCUnitInfo]?
     func mcpAVCSubunitCapabilities(guid: UInt64, type: UInt8, id: UInt8) -> AVCMusicCapabilities?
+    func mcpAVCSubunitDescriptor(guid: UInt64, type: UInt8, id: UInt8) -> Data?
+    func mcpAVCDiscoveryDocument(guid: UInt64) -> Data?
 
     func mcpAsyncRead(destinationID: UInt16, addressHigh: UInt16, addressLow: UInt32, length: UInt32) -> UInt16?
     func mcpAsyncWrite(destinationID: UInt16, addressHigh: UInt16, addressLow: UInt32, payload: Data) -> UInt16?
@@ -32,6 +36,10 @@ protocol ASFWLiveDriverBackend: AnyObject {
 extension ASFWDriverConnector: ASFWLiveDriverBackend {
     var mcpIsConnected: Bool { isConnected }
     var mcpLastError: String? { lastError }
+
+    func mcpDriverVersion() -> DriverVersionInfo? {
+        getDriverVersion()
+    }
 
     func mcpCurrentGeneration() -> UInt32? {
         getControllerStatus()?.generation
@@ -92,6 +100,14 @@ extension ASFWDriverConnector: ASFWLiveDriverBackend {
 
     func mcpAVCSubunitCapabilities(guid: UInt64, type: UInt8, id: UInt8) -> AVCMusicCapabilities? {
         getSubunitCapabilities(guid: guid, type: type, id: id)
+    }
+
+    func mcpAVCSubunitDescriptor(guid: UInt64, type: UInt8, id: UInt8) -> Data? {
+        getSubunitDescriptor(guid: guid, type: type, id: id)
+    }
+
+    func mcpAVCDiscoveryDocument(guid: UInt64) -> Data? {
+        getAVCDiscoveryDocument(guid: guid)
     }
 
     func mcpAsyncRead(destinationID: UInt16, addressHigh: UInt16, addressLow: UInt32, length: UInt32) -> UInt16? {
@@ -156,6 +172,11 @@ final class LiveASFWDriverControl: ASFWDriverControlling {
     /// is not captured here — see `ASFWMCPFcpRecord`.
     private var fcpRecords: [ASFWMCPFcpRecord] = []
     private static let fcpRecordCapacity = 64
+
+    func fetchDriverVersion() async -> DriverVersionInfo? {
+        guard backend.mcpIsConnected else { return nil }
+        return backend.mcpDriverVersion()
+    }
 
     private static func bigEndianQuadlets(from data: Data) -> [UInt32] {
         guard data.count >= 4 else { return [] }
@@ -447,6 +468,18 @@ final class LiveASFWDriverControl: ASFWDriverControlling {
                 )
             }
         )
+    }
+
+    func avcSubunitDescriptor(
+        guid: UInt64,
+        type: UInt8,
+        id: UInt8
+    ) async -> Data? {
+        backend.mcpAVCSubunitDescriptor(guid: guid, type: type, id: id)
+    }
+
+    func avcDiscoveryDocument(guid: UInt64) async -> Data? {
+        backend.mcpAVCDiscoveryDocument(guid: guid)
     }
 
     func listRecentTransactions(limit: Int) async -> [ASFWMCPTransactionEvent] {
@@ -808,6 +841,11 @@ final class LiveASFWDriverControl: ASFWDriverControlling {
         guard backend.mcpIsConnected else { return [] }
         guard let snapshot = backend.mcpAudioTelemetry() else { return [] }
         return snapshot.endpoints.map { $0.mcpStreamHealth }
+    }
+
+    func fetchAudioTelemetry() async -> ASFWMCPValue? {
+        guard backend.mcpIsConnected else { return nil }
+        return backend.mcpAudioTelemetry()?.mcpValue()
     }
 
     private func executeTransaction(

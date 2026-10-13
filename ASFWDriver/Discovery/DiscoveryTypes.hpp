@@ -2,11 +2,16 @@
 
 #include "../Common/FWCommon.hpp"
 #include "DiscoveryValues.hpp"  // FwSpeed enum and constants
+#include "RuntimeIdentity.hpp"  // DeviceInstanceId / UnitInstanceId
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
+
+namespace ASFW::DeviceProfiles::Audio {
+struct ResolvedDevicePolicy;
+}
 
 namespace ASFW::Discovery {
 
@@ -45,8 +50,24 @@ struct FwAddress {
 // FwSpeed enum is now defined in DiscoveryValues.hpp
 
 struct LinkPolicy {
+    // Async speed. Starts at the topology speed and is demoted by SpeedPolicy
+    // when a request times out, which is the right behaviour for asynchronous
+    // requests — some devices genuinely mishandle them above S200 — and is
+    // Apple's `fSpeedVector`, read by async transmit at
+    // IOFireWireController.cpp:7058 and demoted at :2755-2759.
+    //
     // TODO: S100 hardcoded for maximum hardware compatibility.
-    FwSpeed localToNode{FwSpeed::S100};      // Negotiated/observed speed
+    FwSpeed localToNode{FwSpeed::S100};
+
+    // Isochronous speed starts with the Self-ID path speed. A successful
+    // lower-speed DICE read may tighten the device's operational ceiling
+    // before stream reservation and TX-speed programming. Linux DICE uses
+    // fw_device::max_speed for both TX_SPEED and stream resources.
+    //
+    // Conservative initialization; discovery supplies the resolved path speed
+    // before stream planning. S100 is valid, never an "unset" sentinel.
+    FwSpeed isochToNode{FwSpeed::S100};
+
     uint16_t maxPayloadBytes{512};           // Clamp for Async TX (depends on MaxRec, speed, policy)
     bool halvePackets{false};                // Stability escape hatch
 };
@@ -184,9 +205,103 @@ enum class LifeState : uint8_t {
     Lost           // Node gone this generation
 };
 
+// ============================================================================
+// Config-ROM identity evidence
+// ============================================================================
+//
+// Raw, immutable evidence read from the Config ROM. Nothing here is promoted to
+// a canonical identity: callers pick the evidence appropriate to their protocol
+// family. That distinction is load-bearing rather than stylistic —
+//
+//   - A zero is not an absence. MOTU publishes root model_id 0, which is why
+//     DeviceProtocolFactory::Create has to match that family on the unit
+//     directory instead. `std::optional` says "absent"; `uint32_t{0}` cannot.
+//   - A device has units, plural. The TC Applied Technologies devices publish an
+//     audio unit and a MIDI unit; a single specId/version pair can only describe
+//     one of them.
+//   - The GUID is evidence, not a key. It can be zero, and its vendor-defined
+//     bits do not have to agree with the root directory: the Focusrite Saffire
+//     Pro 40 TCD3070 carries model field 0x13 in its GUID while its root/unit
+//     directory says 0x0000de (Linux dice.c documents the same quirk).
+//
+// Ported from the `midi` branch, which restructured DeviceRecord around these
+// types. Here they are added ALONGSIDE the flat fields below rather than
+// replacing them, so no existing call site breaks; see the note on DeviceRecord.
+
+struct UnitIdentityEvidence {
+    uint32_t unitDirectoryOffset{0};
+    std::optional<uint32_t> vendorId;
+    std::optional<uint32_t> modelId;
+    std::optional<uint32_t> specifierId;
+    std::optional<uint32_t> version;
+    std::optional<uint32_t> logicalUnitNumber;
+    std::optional<std::string> vendorName;
+    std::optional<std::string> modelName;
+};
+
+struct DeviceIdentityEvidence {
+    Guid64 observedGuid{0};
+    uint32_t nodeVendorOui{0};
+    std::vector<uint32_t> rawBusInfoQuadlets;  // big-endian wire order
+
+    std::optional<uint32_t> rootVendorId;
+    std::optional<uint32_t> rootModelId;
+    std::string rootVendorName;
+    std::string rootModelName;
+
+    std::vector<UnitIdentityEvidence> units;
+};
+
+/// Why a device was refused, as one neutral verdict consumers can read instead
+/// of each re-deriving identity for itself.
+enum class QuarantineReason : uint8_t {
+    None = 0,
+    ZeroObservedGuid,
+    DuplicateObservedGuid,
+    HazardousNoProbe,
+    AmbiguousIdentity,
+    InsufficientSafeEvidence,
+    UnsupportedFamily,
+};
+
+/// Which AV/C command shapes a device may be sent, decided from Config-ROM
+/// identity alone and stamped onto the record the same way QuarantineReason is.
+enum class AvcCommandFilterId : uint8_t {
+    /// No restriction. Every ordinary device.
+    Unrestricted = 0,
+    /// M-Audio special firmware (FireWire 1814, ProjectMix I/O), which hangs on
+    /// AV/C it does not implement.
+    MAudioSpecialBeBoB,
+    /// Quarantined or hazardous device: block all AV/C commands.
+    BlockAll,
+};
+
 // Device record anchored to GUID (stable across bus resets)
+//
+// MIGRATION: `identity` is the destination; the flat fields beneath it are a
+// compatibility shim kept so the ~315 existing call sites continue to compile.
+// Both are populated and must agree. New code reads `identity` (or the
+// accessors at the bottom); subsystems move over one at a time — Audio first,
+// where there is hardware to test against, SBP-2 and AV/C last — and the flat
+// fields are deleted when the last caller moves.
 struct DeviceRecord {
-    // ---- Stable identity (persistent across resets) ----
+    // ---- Runtime handle ----
+    // Unique within one driver lifetime and never derived from the GUID, which
+    // is an observation: shipping devices report zero and duplicate EUI-64
+    // values. Anything that needs to *address* a device or unit uses this;
+    // `guid` below only describes one.
+    DeviceInstanceId instanceId{};
+
+    // ---- Config-ROM evidence (destination) ----
+    DeviceIdentityEvidence identity{};
+    QuarantineReason quarantineReason{QuarantineReason::None};
+    AvcCommandFilterId avcCommandFilter{AvcCommandFilterId::Unrestricted};
+    /// Immutable audio decision bound to the route that produced it. The
+    /// registry clears it on reset/loss; audio consumers validate the binding
+    /// before using it. Discovery does not interpret its contents.
+    std::shared_ptr<const DeviceProfiles::Audio::ResolvedDevicePolicy> audioPolicy;
+
+    // ---- Stable identity (persistent across resets) ---- [shim, see above]
     Guid64 guid{0};
     // Device incarnation changes only when this GUID is removed and later
     // discovered again. Route epoch changes on reset/rebind independently.
@@ -213,6 +328,29 @@ struct DeviceRecord {
     // ---- Optional metadata ----
     std::optional<uint32_t> unitSpecId;
     std::optional<uint32_t> unitSwVersion;
+
+    // ---- Accessors over `identity` ----
+    // The migration path: call sites move to these before the flat fields go,
+    // so the final deletion is a compile-checked no-op rather than a rewrite.
+    [[nodiscard]] Guid64 ObservedGuid() const noexcept { return identity.observedGuid; }
+    [[nodiscard]] uint32_t RootVendorIdOrZero() const noexcept {
+        return identity.rootVendorId.value_or(0);
+    }
+    [[nodiscard]] uint32_t RootModelIdOrZero() const noexcept {
+        return identity.rootModelId.value_or(0);
+    }
+    /// First unit directory matching `specifierId`, or nullptr. A device has
+    /// units plural — the flat unitSpecId/unitSwVersion pair can only describe
+    /// one, which is why this exists.
+    [[nodiscard]] const UnitIdentityEvidence*
+    FindUnitBySpecifier(uint32_t specifierId) const noexcept {
+        for (const auto& unit : identity.units) {
+            if (unit.specifierId.has_value() && *unit.specifierId == specifierId) {
+                return &unit;
+            }
+        }
+        return nullptr;
+    }
 };
 
 // ============================================================================

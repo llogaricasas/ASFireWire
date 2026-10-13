@@ -113,7 +113,9 @@ IRMClient::IRMClient(Async::IFireWireBus& bus, LocalIRMAccess localIRMAccess)
 {
 }
 
-IRMClient::~IRMClient() = default;
+IRMClient::~IRMClient() {
+    ASFW_LOG(Controller, "[Teardown] IRMClient destructor object=%p", this);
+}
 
 AllocationStatus IRMClient::MapAsyncStatus(const Async::AsyncStatus status) noexcept {
     switch (status) {
@@ -309,30 +311,9 @@ void IRMClient::CompareSwapIRMQuadlet(
     FW::NodeId node{irmNodeId_};
     FW::Generation gen{generation_};
 
-    std::array<uint8_t, 8> operand;
-    uint32_t expectedBE = OSSwapHostToBigInt32(expected);
-    uint32_t desiredBE = OSSwapHostToBigInt32(desired);
-    std::memcpy(&operand[0], &expectedBE, 4);
-    std::memcpy(&operand[4], &desiredBE, 4);
-
-    bus_.Lock(gen, node, addr, FW::LockOp::kCompareSwap,
-        std::span{operand}, 4, speed,
-        [callbackState](Async::AsyncStatus status, std::span<const uint8_t> payload) {
-            const AllocationStatus mapped = IRMClient::MapAsyncStatus(status);
-            if (mapped != AllocationStatus::Success) {
-                Common::InvokeSharedCallback(callbackState, mapped, 0u);
-                return;
-            }
-
-            if (payload.size() != 4) {
-                Common::InvokeSharedCallback(callbackState, AllocationStatus::Failed, 0u);
-                return;
-            }
-
-            uint32_t raw = 0;
-            std::memcpy(&raw, payload.data(), sizeof(raw));
-            const uint32_t oldValue = OSSwapBigToHostInt32(raw);
-            Common::InvokeSharedCallback(callbackState, AllocationStatus::Success, oldValue);
+    bus_.CompareSwapQuad(gen, node, addr, expected, desired, speed,
+        [callbackState](Async::AsyncStatus status, uint32_t oldValue) {
+            Common::InvokeSharedCallback(callbackState, IRMClient::MapAsyncStatus(status), oldValue);
         });
 }
 
@@ -668,7 +649,7 @@ void IRMClient::OnChannelRead(const std::shared_ptr<ChannelLockState>& ctx,
         if ((currentValue & ctx->bitMask) == 0) {
             ASFW_LOG(IRM, "Channel %u not available (current=0x%08x mask=0x%08x)",
                      ctx->channel, currentValue, ctx->bitMask);
-            ctx->userCallback(AllocationStatus::NoResources);
+            ctx->userCallback(AllocationStatus::ChannelBusy);
             return;
         }
         newValue = currentValue & ~ctx->bitMask;
@@ -769,7 +750,7 @@ void IRMClient::OnBandwidthRead(const std::shared_ptr<BandwidthLockState>& ctx,
         if (currentBandwidth < ctx->units) {
             ASFW_LOG(IRM, "Insufficient bandwidth (available=%u needed=%u)",
                      currentBandwidth, ctx->units);
-            ctx->userCallback(AllocationStatus::NoResources);
+            ctx->userCallback(AllocationStatus::BandwidthShort);
             return;
         }
         newBandwidth = currentBandwidth - ctx->units;

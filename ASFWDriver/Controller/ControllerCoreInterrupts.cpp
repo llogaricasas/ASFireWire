@@ -33,7 +33,6 @@
 #include "../Protocols/AVC/AVCDiscovery.hpp"
 #include "../Protocols/SBP2/Session/SessionRegistry.hpp"
 #include "../Protocols/AVC/CMP/CMPClient.hpp"
-#include "../Audio/Protocols/DeviceProtocolFactory.hpp"
 #include "../Scheduling/Scheduler.hpp"
 #include "../Version/DriverVersion.hpp"
 #include "ControllerStateMachine.hpp"
@@ -75,6 +74,13 @@ void ControllerCore::HandleInterrupt(const InterruptSnapshot& snapshot) {
         // `(device incarnation, route epoch, generation, node)` mapping.
         if (deps_.deviceRegistry) {
             deps_.deviceRegistry->InvalidateLiveMappingsForBusReset();
+        }
+        // Observed link speeds are keyed by node ID, and the reset reassigns
+        // them. Carrying an entry across would apply one device's proven ceiling
+        // to whatever lands on that number next. Discovery re-probes before any
+        // protocol transacts, so clearing here costs nothing.
+        if (deps_.speedPolicy) {
+            deps_.speedPolicy->Reset();
         }
         if (deps_.cmpClient) {
             deps_.cmpClient->InvalidateAllLeasesForBusReset();
@@ -129,14 +135,35 @@ void ControllerCore::HandleInterrupt(const InterruptSnapshot& snapshot) {
         hw.ClearIntEvents(faultAcks);
     }
 
-    // Only clear non-reset, non-sticky completion events generically here.
-    uint32_t toAck = events & ~(IntEventBits::kBusReset | IntEventBits::kSelfIDComplete |
-                                IntEventBits::kSelfIDComplete2 | faultAcks);
+    // Acknowledge everything read except busReset, which must stay set until
+    // the reset FSM has quiesced AT (OHCI 1.1 §7.2.3.2) and which OnIrq has
+    // masked. selfIDComplete/selfIDComplete2 are acknowledged here because
+    // they are already latched: left set and enabled, they kept the interrupt
+    // asserted, and an MSI controller then sends no message for anything that
+    // follows. Linux clears the same set in its handler (ohci.c:2219-2224).
+    uint32_t toAck = events & ~(IntEventBits::kBusReset | faultAcks);
     if (toAck != 0U) {
         hw.ClearIntEvents(toAck);
     }
-    hw.ClearIsoXmitEvents(snapshot.isoXmitEvent);
-    hw.ClearIsoRecvEvents(snapshot.isoRecvEvent);
+    // The per-context isoch events are read and cleared after this, by
+    // InterruptDispatcher (HardwareInterface::TakeIsochContextEvents).
+
+    if ((events & IntEventBits::kCycleTooLong) != 0U) {
+        HandleCycleTooLong();
+    }
+}
+
+// A cycle ran past 115-120 us while this node was root and cycle master, and
+// the controller cleared LinkControl.cycleMaster (OHCI 1.2 draft Table 6-1,
+// Table 5-17). Until something sets it again the bus has no cycle starts, so
+// no isochronous stream runs. The cycle policy owns the decision (FW-9/FW-10);
+// it re-applies it. Runs after the acknowledge above: cycleMaster stays zero
+// while cycleTooLong is set.
+void ControllerCore::HandleCycleTooLong() {
+    const bool restored =
+        cyclePolicy_ && cyclePolicy_->OnCycleTooLong(currentGeneration_, *this);
+    ASFW_LOG(Controller, "[CyclePolicy] cycleTooLong gen=%u cycleMaster %{public}s",
+             currentGeneration_, restored ? "re-enabled" : "not ours; left off");
 }
 
 void ControllerCore::LogInterruptContext(const InterruptSnapshot& snapshot,
@@ -178,13 +205,6 @@ void ControllerCore::HandleFaultInterrupts(uint32_t events) {
             "Common causes: Self-ID buffer access, Config ROM mapping, or context register access");
     }
 
-    if ((events & IntEventBits::kCycleTooLong) != 0U) {
-        ASFW_LOG(Controller, "⚠️ WARNING: Cycle too long - isochronous cycle overran 125μs budget");
-        ASFW_LOG(Controller,
-                 "This indicates DMA descriptors or system latency causing timing violation");
-        // FW-9/FW-10: local cycleMaster is no longer reasserted from the fault path.
-        // RoleCoordinator owns local-vs-remote cycle-master enablement.
-    }
 
     if ((events & IntEventBits::kCycleInconsistent) != 0U) {
         const bool busResetActive =

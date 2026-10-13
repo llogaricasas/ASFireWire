@@ -227,6 +227,29 @@ def _cmd_export_parity_cpp(
     print(f"Exported parity C++ fixture: {written}")
 
 
+def _cmd_export_maudio_special_cpp(log_path: str, out: str) -> None:
+    from pydice.protocol.maudio_special_fixture import load_and_export_maudio_special_fixture
+
+    try:
+        written = load_and_export_maudio_special_fixture(log_path, out)
+    except (OSError, ValueError) as exc:
+        print(f"Error exporting M-Audio special fixture: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Exported M-Audio special C++ fixture: {written}")
+
+
+def _cmd_export_dice_images_cpp(out: str) -> None:
+    from pydice.protocol.dice_report import export_dice_images_cpp
+
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        written = export_dice_images_cpp(repo_root, out)
+    except (OSError, ValueError) as exc:
+        print(f"Error exporting DICE device images: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Exported DICE device images: {written}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pydice",
@@ -311,6 +334,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to write the generated C++ fixture include",
     )
 
+    default_maudio_special_cpp = str(
+        Path(__file__).resolve().parents[2] / "tests" / "support" /
+        "MAudioSpecialHappyPathFixture.inc"
+    )
+    export_maudio_special = subparsers.add_parser(
+        "export-maudio-special-cpp",
+        help="Export the successful M-Audio 1814 FireBug run as a C++ fixture",
+    )
+    export_maudio_special.add_argument("log", metavar="LOG")
+    export_maudio_special.add_argument("--out", default=default_maudio_special_cpp,
+                                       help="Path to write the generated C++ fixture include")
+
+    default_dice_images_cpp = str(
+        Path(__file__).resolve().parents[2] / "tests" / "support" / "DiceDeviceImages.inc"
+    )
+    export_dice_images = subparsers.add_parser(
+        "export-dice-images-cpp",
+        help="Export the recorded DICE device reports as simulated-device register images",
+    )
+    export_dice_images.add_argument("--out", default=default_dice_images_cpp,
+                                    help="Path to write the generated C++ include")
+
     list_unknown = subparsers.add_parser(
         "list-unknown",
         help="List addresses not yet in the register map",
@@ -355,6 +400,14 @@ def main() -> None:
 
     if args.command == "export-parity-cpp":
         _cmd_export_parity_cpp(args.log, args.ignore_config_rom, args.out)
+        return
+
+    if args.command == "export-maudio-special-cpp":
+        _cmd_export_maudio_special_cpp(args.log, args.out)
+        return
+
+    if args.command == "export-dice-images-cpp":
+        _cmd_export_dice_images_cpp(args.out)
         return
 
     if args.list_unknown:

@@ -1,5 +1,13 @@
 # ZTS, Buffers, and Interrupt/DCL Cadence — Saffire.kext reference vs ASFW
 
+> **Current ownership (Epic 4, 2026-09-26):** the CoreAudio clock is now a projection of one
+> `HardwareSampleTimeline` per device (RX observations, or the M-Audio TX clock), published
+> through one function. [`HARDWARE_TIMELINE_OWNERSHIP.md`](HARDWARE_TIMELINE_OWNERSHIP.md) is
+> authoritative for who owns sample time. Where this document describes the RX anchor or a
+> private M-Audio timeline, read it as history.
+
+> **Vocabulary:** latency-shaped numbers in this document (delays, offsets, leads, depths) are classified in [`LATENCY_VOCABULARY.md`](LATENCY_VOCABULARY.md). A configured frame count is not a measured duration, and a depth is never a latency.
+
 **Status:** analysis / reference. No code changes.
 **Goal:** document how Focusrite's `Saffire.kext` (DICE/TCAT, IOAudioFamily) anchors the
 CoreAudio clock and sizes its buffers, how its isoch DCL program is constructed (interrupt
@@ -190,7 +198,7 @@ two *frame* rings whose wrap points can disagree.
   updates the authoritative ZTS (`RxClock`).
 
 ### 4c. ZTS → HAL — `ASFWAudioDriverZts.cpp::PublishSharedZeroTimestampToHAL`
-- Steps in `P = TimingCursorPolicy::HalZeroTimestampPeriodFrames()` increments, and for every
+- Steps in `P` = the HAL zero-timestamp period (`AudioTimingGeometry::kHalZeroTimestampPeriodFrames`; the resolved `zeroTimestampPeriodFrames` since FW-177) increments, and for every
   `P`-boundary crossed since the last event frame calls
   `audioDevice->UpdateCurrentZeroTimestamp(nextFrame, targetHostTicks)` (`targetHostTicks`
   linearly interpolated from `eventFrame/eventHostTicks/nanosPerSampleQ8`).

@@ -172,13 +172,22 @@ void HardwareInterface::WriteScoped(Register32 reg, uint32_t value) const noexce
         state.registers[KeyFor(reg)] = value;
         state.operations.push_back(TestOperation::Write);
 
-        if (reg == Register32::kIntMaskSet) {
+        if (reg == Register32::kIntEventClear) {
+            state.registers[KeyFor(Register32::kIntEvent)] &= ~value;
+        } else if (reg == Register32::kIntMaskSet) {
             state.registers[KeyFor(Register32::kIntMaskSet)] |= value;
         } else if (reg == Register32::kIntMaskClear) {
             state.registers[KeyFor(Register32::kIntMaskSet)] &=
                 ~value;
         } else if (reg == Register32::kLinkControlSet) {
-            state.registers[KeyFor(Register32::kLinkControl)] |= value;
+            // "This bit shall be zero when the IntEvent.cycleTooLong bit is
+            // set" (OHCI 1.2 draft Table 5-17): setting cycleMaster has no
+            // effect until cycleTooLong is acknowledged.
+            uint32_t bits = value;
+            if ((state.registers[KeyFor(Register32::kIntEvent)] & IntEventBits::kCycleTooLong) != 0U) {
+                bits &= ~LinkControlBits::kCycleMaster;
+            }
+            state.registers[KeyFor(Register32::kLinkControl)] |= bits;
         } else if (reg == Register32::kLinkControlClear) {
             state.registers[KeyFor(Register32::kLinkControl)] &=
                 ~value;
@@ -209,7 +218,6 @@ void HardwareInterface::SetInterruptMask(uint32_t mask, bool enable) {
 
 InterruptSnapshot HardwareInterface::CaptureInterruptSnapshot(uint64_t timestamp) const noexcept {
     return InterruptSnapshot{ReadScoped(Register32::kIntEvent), ReadScoped(Register32::kIntMaskSet),
-                             ReadScoped(Register32::kIsoXmitEvent), ReadScoped(Register32::kIsoRecvEvent),
                              timestamp};
 }
 
@@ -227,20 +235,20 @@ void HardwareInterface::ClearIntEvents(uint32_t mask) {
     });
 }
 
-void HardwareInterface::ClearIsoXmitEvents(uint32_t mask) {
-    WithState(this, [mask](HardwareTestState& state) {
-        state.registers[KeyFor(Register32::kIsoXmitIntEventClear)] = mask;
-        state.registers[KeyFor(Register32::kIsoXmitEvent)] &= ~mask;
-        state.operations.push_back(TestOperation::ClearIsoXmitEvents);
+IsochContextEvents HardwareInterface::TakeIsochContextEvents(uint32_t intEvent) noexcept {
+    IsochContextEvents events{};
+    WithState(this, [intEvent, &events](HardwareTestState& state) {
+        if ((intEvent & IntEventBits::kIsochRx) != 0) {
+            events.receive = state.registers[KeyFor(Register32::kIsoRecvIntEventClear)];
+            state.registers[KeyFor(Register32::kIsoRecvIntEventClear)] &= ~events.receive;
+        }
+        if ((intEvent & IntEventBits::kIsochTx) != 0) {
+            events.transmit = state.registers[KeyFor(Register32::kIsoXmitIntEventClear)];
+            state.registers[KeyFor(Register32::kIsoXmitIntEventClear)] &= ~events.transmit;
+        }
+        state.operations.push_back(TestOperation::TakeIsochContextEvents);
     });
-}
-
-void HardwareInterface::ClearIsoRecvEvents(uint32_t mask) {
-    WithState(this, [mask](HardwareTestState& state) {
-        state.registers[KeyFor(Register32::kIsoRecvIntEventClear)] = mask;
-        state.registers[KeyFor(Register32::kIsoRecvEvent)] &= ~mask;
-        state.operations.push_back(TestOperation::ClearIsoRecvEvents);
-    });
+    return events;
 }
 
 bool HardwareInterface::SendPhyConfig(std::optional<uint8_t> gapCount,

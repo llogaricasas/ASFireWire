@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <optional>
+#include <tuple>
+
 #include "Audio/Protocols/Backends/DuplexStreamProfile.hpp"
+#include "DeviceProfiles/Audio/ResolvedDevicePolicy.hpp"
 
 namespace {
 
@@ -15,15 +19,113 @@ using ASFW::DeviceProfiles::Audio::kFocusriteVendorId;
 using ASFW::DeviceProfiles::Audio::kSPro24DspModelId;
 using ASFW::DeviceProfiles::Audio::kTerraTecVendorId;
 using ASFW::DeviceProfiles::Audio::kPhase88RackFwModelId;
+using ASFW::DeviceProfiles::Audio::kMackieVendorId;
+using ASFW::DeviceProfiles::Audio::kMidasVendorId;
+using ASFW::DeviceProfiles::Audio::kMidasVeniceModelId;
+using ASFW::DeviceProfiles::Audio::kMAudioVendorId;
+using ASFW::DeviceProfiles::Audio::kMAudioFireWire1814ModelId;
+using ASFW::DeviceProfiles::Audio::kMAudioProjectMixModelId;
+using ASFW::DeviceProfiles::Audio::kOnyx400FModelId;
 using ASFW::DeviceProfiles::Audio::kWeissInt202ModelId;
 using ASFW::DeviceProfiles::Audio::kWeissInt203ModelId;
 using ASFW::DeviceProfiles::Audio::kWeissVendorId;
+using ASFW::DeviceProfiles::Audio::kRmeVendorId;
+using ASFW::DeviceProfiles::Audio::kRmeRootModelId;
+using ASFW::DeviceProfiles::Audio::kRmeUnitSpecifierId;
+using ASFW::DeviceProfiles::Audio::kRmeFireface400UnitVersion;
+using ASFW::DeviceProfiles::Audio::kRmeFireface800UnitVersion;
 using ASFW::Discovery::DeviceRecord;
 using ASFW::Encoding::AudioWireFormat;
+
+// Discovery resolves the catalog once and attaches that decision to the live
+// route. These fixtures construct the same record/policy pairing for profile
+// tests without involving a bus or DriverKit service.
+constexpr uint32_t kDiceInterfaceVersion = 0x000001;
+constexpr uint32_t kTa1394AvcSpecifier = 0x00A02D;
+constexpr uint32_t kTa1394AvcVersion = 0x010001;
+constexpr uint32_t kFireworksVersion = 0x010000;
+
+[[nodiscard]] DeviceRecord MakeRecord(uint32_t vendorId,
+                                      std::optional<uint32_t> modelId,
+                                      uint32_t unitSpecifier,
+                                      uint32_t unitVersion) {
+    DeviceRecord record{};
+    record.instanceId = ASFW::Discovery::DeviceInstanceId{1};
+    record.deviceIncarnation = 1;
+    record.routeEpoch = 1;
+    record.gen = ASFW::Discovery::Generation{1};
+    record.nodeId = 2;
+    record.state = ASFW::Discovery::LifeState::Identified;
+    record.guid = (static_cast<uint64_t>(vendorId) << 40U) | 0x04'0000'0000ULL;
+    record.vendorId = vendorId;
+    record.modelId = modelId.value_or(0U);
+    record.unitSpecId = unitSpecifier;
+    record.unitSwVersion = unitVersion;
+    record.identity.observedGuid = record.guid;
+    record.identity.nodeVendorOui = vendorId;
+    record.identity.rootVendorId = vendorId;
+    record.identity.rootModelId = modelId;
+    record.link.localToNode = ASFW::FW::FwSpeed::S400;
+    record.link.isochToNode = ASFW::FW::FwSpeed::S400;
+    ASFW::Discovery::UnitIdentityEvidence unit{};
+    unit.unitDirectoryOffset = 5;
+    unit.specifierId = unitSpecifier;
+    unit.version = unitVersion;
+    record.identity.units.push_back(unit);
+    const auto plan = ASFW::DeviceProfiles::Audio::AudioDeviceCatalog::Resolve(record);
+    EXPECT_TRUE(plan.has_value());
+    if (plan.has_value()) {
+        record.audioPolicy = std::make_shared<const ASFW::DeviceProfiles::Audio::ResolvedDevicePolicy>(
+            ASFW::DeviceProfiles::Audio::ResolvedDevicePolicy{
+                *plan,
+                ASFW::Discovery::DeviceRouteToken{
+                    .guid = record.guid,
+                    .deviceIncarnation = record.deviceIncarnation,
+                    .routeEpoch = record.routeEpoch,
+                    .generation = record.gen,
+                    .nodeId = record.nodeId}});
+    }
+    return record;
+}
+
+[[nodiscard]] DeviceRecord DiceRecord(uint32_t vendorId, uint32_t modelId) {
+    return MakeRecord(vendorId, modelId, vendorId, kDiceInterfaceVersion);
+}
+
+[[nodiscard]] DeviceRecord AvcRecord(uint32_t vendorId, uint32_t modelId) {
+    return MakeRecord(vendorId, modelId, kTa1394AvcSpecifier, kTa1394AvcVersion);
+}
+
+TEST(DuplexStreamProfileTests, MAudioSpecialResolvesAsymmetricSlotsAndTransmitFirst) {
+    const AudioStreamRuntimeCaps caps{
+        .hostInputPcmChannels = 10,
+        .hostOutputPcmChannels = 6,
+        .deviceToHostAm824Slots = 11,
+        .hostToDeviceAm824Slots = 7,
+        .sampleRateHz = 48000,
+    };
+
+    for (const uint32_t modelId : {kMAudioFireWire1814ModelId, kMAudioProjectMixModelId}) {
+        const DeviceRecord record = AvcRecord(kMAudioVendorId, modelId);
+        const DuplexStreamProfile profile = DuplexStreamProfileResolver::Resolve(record, caps);
+        ASSERT_TRUE(profile.policyResolved) << modelId;
+        EXPECT_EQ(profile.captureStreams[0].am824Slots, 11U) << modelId;
+        EXPECT_EQ(profile.playbackStreams[0].am824Slots, 7U) << modelId;
+        EXPECT_EQ(profile.captureChannelMap.SlotFor(1), 4U) << modelId;
+        EXPECT_EQ(profile.captureChannelMap.SlotFor(2), 1U) << modelId;
+        EXPECT_EQ(profile.captureChannelMap.delayFrames,
+                  modelId == kMAudioFireWire1814ModelId ? 16U : 0U) << modelId;
+        EXPECT_FALSE(profile.startOrder.requiresPreStreamClockLock) << modelId;
+        EXPECT_EQ(profile.startOrder.startOrder[0], DuplexHostDirection::kTransmit) << modelId;
+        EXPECT_EQ(profile.startOrder.startOrder[1], DuplexHostDirection::kReceive) << modelId;
+        EXPECT_EQ(profile.startOrder.postDeviceEnableDelayMs, 0U) << modelId;
+    }
+}
 
 TEST(DuplexStreamProfileTests, OrdinaryDiceKeepsLegacyChannelsGeometryAndRecipe) {
     DeviceRecord record{};
     record.link.localToNode = ASFW::FW::FwSpeed::S400;
+    record.link.isochToNode = ASFW::FW::FwSpeed::S400;
     AudioStreamRuntimeCaps caps{
         .hostInputPcmChannels = 16,
         .hostOutputPcmChannels = 16,
@@ -45,9 +147,11 @@ TEST(DuplexStreamProfileTests, OrdinaryDiceKeepsLegacyChannelsGeometryAndRecipe)
     EXPECT_EQ(profile.captureStreams[0].pcmChannels, 0U);
     EXPECT_EQ(profile.captureStreams[0].am824Slots, 17U);
     EXPECT_EQ(profile.captureWireFormat, AudioWireFormat::kAM824);
-    EXPECT_EQ(profile.playbackWireFormat, AudioWireFormat::kAM824);
-    EXPECT_EQ(profile.playbackStreams[0].bandwidthUnits, 1076U);
-    EXPECT_EQ(profile.captureStreams[0].bandwidthUnits, 1076U);
+    // Packet term only: 17 slots x 8 blocks x 4 bytes + 8 CIP bytes = 552 payload,
+    // 138 quadlets + 3 header quadlets = 564 units at S400. The per-allocation bus
+    // overhead is charged by the reservation from the live gap count, not here.
+    EXPECT_EQ(profile.playbackStreams[0].packetBandwidthUnits, 564U);
+    EXPECT_EQ(profile.captureStreams[0].packetBandwidthUnits, 564U);
     EXPECT_EQ(profile.playbackStreams[0].allowedIsoChannels, uint64_t{1} << 0U);
     EXPECT_EQ(profile.captureStreams[0].allowedIsoChannels, uint64_t{1} << 1U);
     EXPECT_EQ(profile.startOrder.postDeviceEnableDelayMs, 2U);
@@ -59,11 +163,31 @@ TEST(DuplexStreamProfileTests, OrdinaryDiceKeepsLegacyChannelsGeometryAndRecipe)
     EXPECT_EQ(profile.startOrder.startOrder[1], DuplexHostDirection::kTransmit);
 }
 
-TEST(DuplexStreamProfileTests, SPro24DspResolvesRawPcmOnBothDirectionsWhenGeometryMatches) {
-    DeviceRecord record{
-        .vendorId = kFocusriteVendorId,
-        .modelId = kSPro24DspModelId,
+// Every DICE row, with or without named stream traits, lets the IRM pick from
+// channels 0-31 (Linux dice-stream.c:506); the planned 0/1 are only a seed.
+TEST(DuplexStreamProfileTests, DiceLetsTheIrmPickFromChannelsZeroToThirtyOne) {
+    const AudioStreamRuntimeCaps caps{
+        .hostInputPcmChannels = 8,
+        .hostOutputPcmChannels = 8,
+        .deviceToHostAm824Slots = 9,
+        .hostToDeviceAm824Slots = 9,
+        .sampleRateHz = 48000,
+        .deviceToHostStreamCount = 1,
+        .hostToDeviceStreamCount = 1,
     };
+    for (const auto& [vendor, model] : {std::pair{kFocusriteVendorId, kSPro24DspModelId},
+                                        std::pair{kMidasVendorId, kMidasVeniceModelId},
+                                        std::pair{kWeissVendorId, kWeissInt202ModelId}}) {
+        const DuplexStreamProfile profile =
+            DuplexStreamProfileResolver::Resolve(DiceRecord(vendor, model), caps);
+        ASSERT_TRUE(profile.policyResolved) << model;
+        EXPECT_EQ(profile.playbackStreams[0].allowedIsoChannels, 0x00000000FFFFFFFFULL) << model;
+        EXPECT_EQ(profile.captureStreams[0].allowedIsoChannels, 0x00000000FFFFFFFFULL) << model;
+    }
+}
+
+TEST(DuplexStreamProfileTests, SPro24DspResolvesRawPcmOnBothDirectionsWhenGeometryMatches) {
+    DeviceRecord record = DiceRecord(kFocusriteVendorId, kSPro24DspModelId);
     AudioStreamRuntimeCaps caps{
         .hostInputPcmChannels = 8,
         .hostOutputPcmChannels = 8,
@@ -79,11 +203,9 @@ TEST(DuplexStreamProfileTests, SPro24DspResolvesRawPcmOnBothDirectionsWhenGeomet
 }
 
 TEST(DuplexStreamProfileTests, ApogeeDuetAllowsDynamicChannelsAndPreservesCmpInterleave) {
-    DeviceRecord record{
-        .vendorId = kApogeeVendorId,
-        .modelId = kApogeeDuetModelId,
-    };
+    DeviceRecord record = AvcRecord(kApogeeVendorId, kApogeeDuetModelId);
     record.link.localToNode = ASFW::FW::FwSpeed::S400;
+    record.link.isochToNode = ASFW::FW::FwSpeed::S400;
     AudioStreamRuntimeCaps caps{
         .hostInputPcmChannels = 2,
         .hostOutputPcmChannels = 2,
@@ -96,8 +218,8 @@ TEST(DuplexStreamProfileTests, ApogeeDuetAllowsDynamicChannelsAndPreservesCmpInt
 
     EXPECT_EQ(profile.captureStreams[0].allowedIsoChannels, ~uint64_t{0});
     EXPECT_EQ(profile.playbackStreams[0].allowedIsoChannels, ~uint64_t{0});
-    EXPECT_EQ(profile.captureStreams[0].bandwidthUnits, 596U);
-    EXPECT_EQ(profile.playbackStreams[0].bandwidthUnits, 596U);
+    EXPECT_EQ(profile.captureStreams[0].packetBandwidthUnits, 84U);
+    EXPECT_EQ(profile.playbackStreams[0].packetBandwidthUnits, 84U);
     EXPECT_TRUE(profile.startOrder.startReceiveBeforeDeviceRx);
     EXPECT_TRUE(profile.startOrder.startTransmitBeforeDeviceTx);
     EXPECT_EQ(profile.startOrder.postDeviceEnableDelayMs, 0U);
@@ -106,11 +228,9 @@ TEST(DuplexStreamProfileTests, ApogeeDuetAllowsDynamicChannelsAndPreservesCmpInt
 }
 
 TEST(DuplexStreamProfileTests, Phase88PreservesLinuxBeBoBCmpBeforeHostStartOrdering) {
-    DeviceRecord record{
-        .vendorId = kTerraTecVendorId,
-        .modelId = kPhase88RackFwModelId,
-    };
+    DeviceRecord record = AvcRecord(kTerraTecVendorId, kPhase88RackFwModelId);
     record.link.localToNode = ASFW::FW::FwSpeed::S400;
+    record.link.isochToNode = ASFW::FW::FwSpeed::S400;
     AudioStreamRuntimeCaps caps{
         .hostInputPcmChannels = 10,
         .hostOutputPcmChannels = 10,
@@ -137,6 +257,37 @@ TEST(DuplexStreamProfileTests, Phase88PreservesLinuxBeBoBCmpBeforeHostStartOrder
     EXPECT_EQ(profile.startOrder.postDeviceEnableDelayMs, 0U);
 }
 
+TEST(DuplexStreamProfileTests, Onyx400FUsesBeBoBOrderingWithoutPreStreamClockLock) {
+    DeviceRecord record = MakeRecord(kMackieVendorId, kOnyx400FModelId,
+                                     kTa1394AvcSpecifier, kFireworksVersion);
+    record.link.localToNode = ASFW::FW::FwSpeed::S400;
+    record.link.isochToNode = ASFW::FW::FwSpeed::S400;
+    AudioStreamRuntimeCaps caps{
+        .hostInputPcmChannels = 10,
+        .hostOutputPcmChannels = 10,
+        .deviceToHostAm824Slots = 11,
+        .hostToDeviceAm824Slots = 11,
+        .sampleRateHz = 44100,
+        .deviceToHostStreamCount = 1,
+        .hostToDeviceStreamCount = 1,
+    };
+
+    const DuplexStreamProfile profile = DuplexStreamProfileResolver::Resolve(record, caps);
+
+    // Field-verified 2026-09-13: the Fireworks unit never reports a pre-connection
+    // clock lock, so the DICE-style gate must be off, and CMP owns the channel.
+    EXPECT_EQ(profile.captureStreams[0].allowedIsoChannels, ~uint64_t{0});
+    EXPECT_EQ(profile.playbackStreams[0].allowedIsoChannels, ~uint64_t{0});
+    EXPECT_EQ(profile.captureStreams[0].am824Slots, 11U);
+    EXPECT_EQ(profile.playbackStreams[0].am824Slots, 11U);
+    EXPECT_FALSE(profile.startOrder.startReceiveBeforeDeviceRx);
+    EXPECT_FALSE(profile.startOrder.startTransmitBeforeDeviceTx);
+    EXPECT_FALSE(profile.startOrder.requiresPreStreamClockLock);
+    EXPECT_EQ(profile.startOrder.startOrder[0], DuplexHostDirection::kReceive);
+    EXPECT_EQ(profile.startOrder.startOrder[1], DuplexHostDirection::kTransmit);
+    EXPECT_TRUE(profile.captureTrustConfiguredStride);
+}
+
 TEST(DuplexStreamProfileTests, WeissIntStartsHostTransmitFirstWithoutPreEnableSourceLock) {
     AudioStreamRuntimeCaps caps{
         // CoreAudio presentation is output-only, but the DICE wire topology is
@@ -151,10 +302,7 @@ TEST(DuplexStreamProfileTests, WeissIntStartsHostTransmitFirstWithoutPreEnableSo
     };
 
     for (const uint32_t modelId : {kWeissInt202ModelId, kWeissInt203ModelId}) {
-        DeviceRecord record{
-            .vendorId = kWeissVendorId,
-            .modelId = modelId,
-        };
+        DeviceRecord record = DiceRecord(kWeissVendorId, modelId);
         const DuplexStreamProfile profile = DuplexStreamProfileResolver::Resolve(record, caps);
 
         EXPECT_FALSE(profile.startOrder.requiresPreStreamClockLock) << modelId;
@@ -165,7 +313,12 @@ TEST(DuplexStreamProfileTests, WeissIntStartsHostTransmitFirstWithoutPreEnableSo
     }
 }
 
-TEST(DuplexStreamProfileTests, AlesisModelsClampAdvertisedCaptureStreamsToOne) {
+// Was AlesisModelsClampAdvertisedCaptureStreamsToOne, asserting that both Alesis
+// rows had capture forced to one stream. That clamp is disabled: it was
+// libffado's PLAYBACK workaround (m_nb_rx, dice_avdevice.cpp:1686-1700)
+// transcribed onto capture, and the vendor's own driver clamps neither
+// The device's advertised stream counts and per-stream geometry are preserved.
+TEST(DuplexStreamProfileTests, AlesisModelsKeepTheAdvertisedCaptureStreamCount) {
     AudioStreamRuntimeCaps caps{
         .hostInputPcmChannels = 32,
         .hostOutputPcmChannels = 32,
@@ -180,19 +333,83 @@ TEST(DuplexStreamProfileTests, AlesisModelsClampAdvertisedCaptureStreamsToOne) {
     caps.deviceToHostStreams[1] = {.isoChannel = 6, .pcmChannels = 16, .am824Slots = 17};
 
     for (const uint32_t modelId : {0x000000U, 0x000001U}) {
-        DeviceRecord record{
-            .vendorId = kAlesisVendorId,
-            .modelId = modelId,
-        };
+        DeviceRecord record = DiceRecord(kAlesisVendorId, modelId);
         const DuplexStreamProfile profile = DuplexStreamProfileResolver::Resolve(record, caps);
 
-        EXPECT_EQ(profile.channels.captureStreamCount, 1U) << modelId;
+        // Both streams advertised by the device are armed.
+        EXPECT_EQ(profile.channels.captureStreamCount, 2U) << modelId;
         EXPECT_EQ(profile.channels.playbackStreamCount, 2U) << modelId;
         EXPECT_EQ(profile.captureStreams[0].isoChannel, 5U) << modelId;
-        EXPECT_EQ(profile.captureStreams[0].pcmChannels, 0U) << modelId;
-        EXPECT_EQ(profile.captureStreams[0].am824Slots, 34U) << modelId;
-        EXPECT_EQ(profile.channels.PlaybackChannel(1), 0U) << modelId;
+
+        // Per-stream slots are used instead of the device's aggregate.
+        EXPECT_EQ(profile.captureStreams[0].am824Slots, 17U) << modelId;
+        EXPECT_EQ(profile.captureStreams[1].am824Slots, 17U) << modelId;
+        EXPECT_EQ(profile.captureStreams[0].pcmChannels, 16U) << modelId;
+        EXPECT_EQ(profile.captureStreams[1].pcmChannels, 16U) << modelId;
+
+        // The second capture stream gets an iso channel of its own rather than
+        // being discarded.
+        EXPECT_NE(profile.channels.CaptureChannel(1),
+                  profile.channels.CaptureChannel(0)) << modelId;
     }
 }
 
 } // namespace
+
+TEST(DuplexStreamProfileTests, MotuCaptureCarriesTheModelPortMap) {
+    AudioStreamRuntimeCaps caps{
+        .hostInputPcmChannels = 14,
+        .hostOutputPcmChannels = 14,
+        .sampleRateHz = 48000,
+        .deviceToHostStreamCount = 1,
+        .hostToDeviceStreamCount = 1,
+    };
+    // MOTU publishes root model_id 0 -- not "no model_id", which is a
+    // different thing the catalog can tell apart.
+    DeviceRecord record = MakeRecord(
+        ASFW::DeviceProfiles::Audio::kMotuVendorId, 0U,
+        ASFW::DeviceProfiles::Audio::kMotuVendorId,
+        ASFW::DeviceProfiles::Audio::kMotuUltraliteSwVersion);
+
+    const DuplexStreamProfile profile = DuplexStreamProfileResolver::Resolve(record, caps);
+
+    EXPECT_EQ(profile.captureWireFormat, AudioWireFormat::kMotuPacked);
+    EXPECT_EQ(profile.captureMotuPcmChunks, 14U);
+    ASSERT_EQ(profile.captureMotuPorts.size(), 14U);
+    EXPECT_EQ(profile.captureMotuPorts.data(), ASFW::Encoding::Motu::kUltraLiteCapture);
+}
+
+TEST(DuplexStreamProfileTests, NonMotuDevicesCarryNoPortMap) {
+    DeviceRecord record{};
+    AudioStreamRuntimeCaps caps{.hostInputPcmChannels = 2, .hostOutputPcmChannels = 2};
+    const DuplexStreamProfile profile = DuplexStreamProfileResolver::Resolve(record, caps);
+    EXPECT_TRUE(profile.captureMotuPorts.empty());
+}
+
+TEST(DuplexStreamProfileTests, FirefaceUsesHeaderlessBandwidthAndModelChannelMasks) {
+    for (const auto [version, channels, mask] : {
+             std::tuple{kRmeFireface400UnitVersion, 18U, uint64_t{0xff}},
+             std::tuple{kRmeFireface800UnitVersion, 28U, ~uint64_t{0}}}) {
+        auto record = MakeRecord(kRmeVendorId, kRmeRootModelId, kRmeUnitSpecifierId, version);
+        AudioStreamRuntimeCaps caps{.hostInputPcmChannels = channels,
+                                    .hostOutputPcmChannels = channels,
+                                    .deviceToHostAm824Slots = channels,
+                                    .hostToDeviceAm824Slots = channels,
+                                    .sampleRateHz = 48000,
+                                    .deviceToHostStreamCount = 1,
+                                    .hostToDeviceStreamCount = 1};
+        const auto profile = DuplexStreamProfileResolver::Resolve(record, caps);
+        const uint32_t expectedBytes = channels * 8U * 4U;
+        EXPECT_TRUE(profile.policyResolved);
+        EXPECT_EQ(profile.captureWireFormat, AudioWireFormat::kRawPcm24Upper24In32LE);
+        EXPECT_EQ(profile.playbackWireFormat, AudioWireFormat::kRawPcm24Upper24In32LE);
+        EXPECT_EQ(profile.capturePacketFraming, ASFW::Encoding::AudioPacketFraming::kHeaderless);
+        EXPECT_EQ(profile.playbackPacketFraming, ASFW::Encoding::AudioPacketFraming::kHeaderless);
+        EXPECT_EQ(profile.captureStreams[0].allowedIsoChannels, mask);
+        EXPECT_EQ(profile.playbackStreams[0].allowedIsoChannels, mask);
+        EXPECT_EQ(profile.captureStreams[0].packetBandwidthUnits,
+                  ASFW::IRM::PacketBandwidthUnits(expectedBytes, 2));
+        EXPECT_EQ(profile.playbackStreams[0].packetBandwidthUnits,
+                  ASFW::IRM::PacketBandwidthUnits(expectedBytes, 2));
+    }
+}

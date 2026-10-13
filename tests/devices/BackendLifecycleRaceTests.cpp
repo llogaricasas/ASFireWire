@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 ASFireWire Project
+//
+// BackendLifecycleRaceTests.cpp
+// Controlled interleaving tests for audio backend concurrent teardown and
+// publication-vs-teardown race conditions.
+
+#include <gtest/gtest.h>
+#include <net.asfw.driver/ASFWAudioNub.h>
+
+#include "Audio/Protocols/DICE/Core/DiceNotificationRouter.hpp"
+
+#include "Async/Interfaces/IFireWireBus.hpp"
+#include "Audio/Core/AudioNubPublisher.hpp"
+#include "Audio/Core/AudioRuntimeRegistry.hpp"
+#include "Audio/Host/AudioDeviceHost.hpp"
+#include "Audio/Host/DiceFamilyAdapter.hpp"
+#include "Audio/Session/AudioSessions.hpp"
+#include "Bus/IRM/IRMClient.hpp"
+#include "Discovery/DeviceRegistry.hpp"
+#include "Hardware/HardwareInterface.hpp"
+#include "DeviceProfiles/Audio/AudioDeviceIds.hpp"
+#include "Testing/HostDriverKitStubs.hpp"
+
+#include <chrono>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+using ASFW::Async::AsyncHandle;
+using ASFW::Async::AsyncStatus;
+using ASFW::Async::FWAddress;
+using ASFW::Async::IFireWireBus;
+using ASFW::Audio::AudioNubPublisher;
+using ASFW::Audio::AudioRuntimeRegistry;
+using ASFW::Audio::Host::AudioDeviceHost;
+using ASFW::Audio::Host::DiceFamilyAdapter;
+using ASFW::Audio::Host::HostEvent;
+using ASFW::Audio::Host::HostOutcome;
+using ASFW::Audio::IIsochDuplexHostTransport;
+using ASFW::Discovery::CfgKey;
+using ASFW::Discovery::ConfigROM;
+using ASFW::Discovery::DeviceRegistry;
+using ASFW::Discovery::RomEntry;
+using ASFW::Driver::HardwareInterface;
+using ASFW::FW::FwSpeed;
+using ASFW::FW::Generation;
+using ASFW::FW::LockOp;
+using ASFW::FW::NodeId;
+using ASFW::IRM::IRMClient;
+
+class NullFireWireBus final : public IFireWireBus {
+public:
+    AsyncHandle ReadBlock(Generation, NodeId, FWAddress, uint32_t, FwSpeed,
+                          ASFW::Async::InterfaceCompletionCallback callback) override {
+        callback(AsyncStatus::kSuccess, {});
+        return AsyncHandle{.value = 1};
+    }
+
+    AsyncHandle WriteBlock(Generation, NodeId, FWAddress, std::span<const uint8_t>, FwSpeed,
+                           ASFW::Async::InterfaceCompletionCallback callback) override {
+        callback(AsyncStatus::kSuccess, {});
+        return AsyncHandle{.value = 2};
+    }
+
+    AsyncHandle Lock(Generation, NodeId, FWAddress, LockOp, std::span<const uint8_t>,
+                     uint32_t responseLength, FwSpeed,
+                     ASFW::Async::InterfaceCompletionCallback callback) override {
+        std::array<uint8_t, 8> zeroes{};
+        callback(AsyncStatus::kSuccess, std::span<const uint8_t>(zeroes.data(), responseLength));
+        return AsyncHandle{.value = 3};
+    }
+
+    bool Cancel(AsyncHandle) override { return false; }
+    [[nodiscard]] FwSpeed GetSpeed(NodeId) const override { return FwSpeed::S400; }
+    [[nodiscard]] uint32_t HopCount(NodeId, NodeId) const override { return 0; }
+    [[nodiscard]] Generation GetGeneration() const override { return Generation{1}; }
+    [[nodiscard]] NodeId GetLocalNodeID() const override { return NodeId{0}; }
+};
+
+class FakeHostTransport final : public IIsochDuplexHostTransport {
+public:
+    kern_return_t BeginSplitDuplex(uint64_t) noexcept override { return kIOReturnSuccess; }
+    kern_return_t ReservePlaybackResources(uint64_t, IRMClient&, uint64_t, uint32_t,
+                                           ASFW::Audio::Backends::IRMReservationResult& outResult) noexcept override {
+        outResult.channel = 1;
+        outResult.status = kIOReturnSuccess;
+        return kIOReturnSuccess;
+    }
+    kern_return_t ReserveCaptureResources(uint64_t, IRMClient&, uint64_t, uint32_t,
+                                          ASFW::Audio::Backends::IRMReservationResult& outResult) noexcept override {
+        outResult.channel = 2;
+        outResult.status = kIOReturnSuccess;
+        return kIOReturnSuccess;
+    }
+    kern_return_t PrepareReceive(uint8_t, HardwareInterface&, ASFW::Audio::Runtime::IDirectAudioBindingSource*,
+                                 const ASFW::Audio::DirectRxFormatDescriptor& = {}) noexcept override { return kIOReturnSuccess; }
+    kern_return_t PrepareTransmit(uint8_t, HardwareInterface&, uint8_t, ASFW::FW::FwSpeed) noexcept override { return kIOReturnSuccess; }
+    kern_return_t PrepareReceiveStream(uint32_t, uint8_t, HardwareInterface&, ASFW::Audio::Runtime::IDirectAudioBindingSource*,
+                                       uint32_t, const ASFW::Audio::DirectRxFormatDescriptor& = {}) noexcept override { return kIOReturnSuccess; }
+    kern_return_t PrepareTransmitStream(uint32_t, uint8_t, HardwareInterface&, uint8_t, ASFW::FW::FwSpeed) noexcept override { return kIOReturnSuccess; }
+    kern_return_t StartPreparedReceive() noexcept override { return kIOReturnSuccess; }
+    kern_return_t StartPreparedTransmit() noexcept override { return kIOReturnSuccess; }
+    kern_return_t StopPreparedReceive() noexcept override { return kIOReturnSuccess; }
+    kern_return_t StopPreparedTransmit() noexcept override { return kIOReturnSuccess; }
+    kern_return_t StopAll() noexcept override { return kIOReturnSuccess; }
+};
+
+struct TestFixture {
+    NullFireWireBus bus{};
+    IRMClient irmClient{bus};
+    HardwareInterface hardware{};
+    DeviceRegistry registry{};
+    AudioRuntimeRegistry runtime{};
+    FakeHostTransport hostTransport{};
+    std::atomic<bool> cancel{false};
+    ASFW::Audio::Session::AudioSessions sessions{
+        registry, runtime, hostTransport, hardware, &cancel,
+        [](uint64_t) -> ASFW::Audio::Runtime::IDirectAudioBindingSource* {
+            return nullptr;
+        }};
+    AudioNubPublisher publisher{nullptr};
+    ASFW::Audio::DICE::DiceNotificationRouter diceNotifications{registry};
+    // DICE runs on the audio device host (AUDIO_DEVICE_HOST.md §6 E5). The
+    // adapter is declared first so it outlives the host's teardown.
+    DiceFamilyAdapter diceAdapter{diceNotifications};
+    AudioDeviceHost dice{publisher, registry, runtime, sessions, hostTransport};
+
+    TestFixture() { dice.Install(ASFW::Audio::AudioBackendKind::Dice, diceAdapter); }
+
+    void SeedDiceDevice(uint64_t guid) {
+        ConfigROM rom{};
+        rom.gen = Generation{1};
+        rom.firstSeen = Generation{1};
+        rom.lastValidated = Generation{1};
+        rom.nodeId = 2;
+        rom.bib.guid = guid;
+        rom.bib.maxRec = 8;
+        rom.rootDirMinimal = {
+            RomEntry{.key = CfgKey::VendorId, .value = ASFW::DeviceProfiles::Audio::kFocusriteVendorId},
+            RomEntry{.key = CfgKey::ModelId, .value = ASFW::DeviceProfiles::Audio::kSPro24DspModelId},
+        };
+        ASFW::Discovery::UnitDirectory unit{};
+        unit.offsetQuadlets = 5;
+        unit.unitSpecId = ASFW::DeviceProfiles::Audio::kFocusriteVendorId;
+        unit.unitSwVersion = 0x000001;
+        rom.unitDirectories.push_back(unit);
+        ASFW::Discovery::LinkPolicy link{};
+        (void)registry.UpsertFromROM(rom, link);
+    }
+};
+
+// Case 1 (DICE): Concurrent teardown of the host serving DICE
+TEST(BackendLifecycleRaceTests, DiceHostConcurrentTeardownWaitsForDrain) {
+    TestFixture f;
+    auto* queue = f.dice.WorkQueueForTesting();
+    ASSERT_NE(queue, nullptr);
+
+    std::unique_lock<std::mutex> queueLock(queue->ExecutionMutexForTesting());
+
+    std::promise<void> drainStartedA;
+    std::promise<void> waitingB;
+
+    f.dice.SetOnTeardownDrainStartedHookForTesting([&] {
+        drainStartedA.set_value();
+    });
+    f.dice.SetOnSecondaryTeardownWaitingHookForTesting([&] {
+        waitingB.set_value();
+    });
+
+    auto futA = std::async(std::launch::async, [&] {
+        f.dice.BeginTeardown();
+    });
+
+    drainStartedA.get_future().wait();
+
+    auto futB = std::async(std::launch::async, [&] {
+        f.dice.BeginTeardown();
+    });
+
+    waitingB.get_future().wait();
+
+    EXPECT_EQ(futA.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+    EXPECT_EQ(futB.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+    EXPECT_FALSE(f.dice.IsTeardownCompleteForTesting());
+
+    queueLock.unlock();
+
+    EXPECT_EQ(futA.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(futB.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_TRUE(f.dice.IsTeardownCompleteForTesting());
+
+    f.dice.SetOnTeardownDrainStartedHookForTesting({});
+    f.dice.SetOnSecondaryTeardownWaitingHookForTesting({});
+}
+
+// Case 4 (DICE): Publication versus teardown on the host serving DICE
+TEST(BackendLifecycleRaceTests, DiceHostPublicationPausedAfterAdmissionAbortsOnTeardown) {
+    TestFixture f;
+    const uint64_t guid = 0x00130E0402004713ULL;
+    f.SeedDiceDevice(guid);
+
+    std::promise<void> admitted;
+    std::promise<void> allowResume;
+    std::promise<void> teardownGateClosed;
+
+    f.dice.SetBeforePublishHookForTesting([&] {
+        admitted.set_value();
+        allowResume.get_future().wait();
+    });
+
+    f.dice.SetOnTeardownGateClosedHookForTesting([&] {
+        teardownGateClosed.set_value();
+    });
+
+    auto pubFut = std::async(std::launch::async, [&] {
+        f.dice.RefreshPublication(guid);
+    });
+
+    admitted.get_future().wait();
+
+    auto teardownFut = std::async(std::launch::async, [&] {
+        f.dice.BeginTeardown();
+    });
+
+    teardownGateClosed.get_future().wait();
+    EXPECT_EQ(teardownFut.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+
+    allowResume.set_value();
+
+    pubFut.wait();
+    teardownFut.wait();
+
+    EXPECT_EQ(f.publisher.GetNub(guid), nullptr);
+    EXPECT_GE(f.dice.OutcomeCount(HostEvent::Publish, HostOutcome::RefusedTeardown), 1u);
+
+    f.dice.SetBeforePublishHookForTesting({});
+    f.dice.SetOnTeardownGateClosedHookForTesting({});
+}
+
+} // namespace
+
+TEST(BackendLifecycleRaceTests, NubTerminationPreservesRemoteTransportResult) {
+    class PublishedNub final : public ASFWAudioNub {
+    public:
+        kern_return_t CopyProperties(OSDictionary** out) override {
+            *out = OSDictionary::withCapacity(8);
+            return *out ? kIOReturnSuccess : kIOReturnNoMemory;
+        }
+    };
+    class Provider final : public IOService {
+    public:
+        PublishedNub* nub = new PublishedNub();
+        ~Provider() override { nub->release(); }
+        kern_return_t Create(IOService*, const char*, IOService** out) override {
+            nub->retain(); // Creation reference; provider owns the service lifetime.
+            *out = nub;
+            return kIOReturnSuccess;
+        }
+    } provider;
+    AudioNubPublisher publisher{&provider};
+    constexpr uint64_t guid = 0x00130e0402004713ULL;
+    ASFW::Audio::Model::ASFWAudioDevice config;
+    config.guid = guid;
+    ASSERT_TRUE(publisher.EnsureNub(guid, config, "late-stop-test"));
+    ASSERT_EQ(publisher.GetNub(guid), provider.nub);
+    publisher.TerminateNub(guid, "remote-device-lost", kIOReturnTimeout);
+    EXPECT_EQ(publisher.GetNub(guid), nullptr);
+    EXPECT_EQ(provider.nub->StopAudioStreamingOrRemoteResult(), kIOReturnTimeout);
+}

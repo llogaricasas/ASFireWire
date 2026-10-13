@@ -1,127 +1,50 @@
-//
-// DescriptorAccessor.hpp
-// ASFWDriver - AV/C Protocol Layer
-//
-// High-level API for AV/C Descriptor operations with automatic sequencing,
-// chunking, and fallback mechanisms for non-compliant devices.
-//
-// Specification: TA Document 2002013 - AV/C Descriptor Mechanism 1.2
-// Reference: Apple IOFireWireFamily (IOFireWireAVCLib), FWA DescriptorAccessor
-//
-
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "DescriptorTypes.hpp"
-#include "AVCDescriptorCommands.hpp"
-#include "../FCPTransport.hpp"
-#include <vector>
+#include "../Commands/DescriptorCommands.hpp"
+#include "../Core/IAvcUnit.hpp"
+#include "../../../Common/MoveOnlyCallback.hpp"
 #include <functional>
 #include <memory>
+#include <optional>
+#include <vector>
 
 namespace ASFW::Protocols::AVC {
-
-//==============================================================================
-// DescriptorAccessor - High-level Descriptor API
-//==============================================================================
-
-/// Provides high-level access to AV/C descriptors with automatic:
-/// - OPEN → READ → CLOSE sequencing
-/// - Chunked reading for large descriptors
-/// - Fallback mechanisms for non-compliant devices
-/// - read_result_status interpretation with length-based fallback (Apple pattern)
-class DescriptorAccessor {
+class DescriptorReadOperation;
+/// Serial-queue owner of a generation/route-bound descriptor operation.
+class DescriptorAccessor final {
 public:
-    /// Result type for read operations
+    static constexpr size_t kMaxDescriptorBytes = 4096;
+    /// READ DESCRIPTOR data_length per request (bytes). Unchanged from the
+    /// hardware-proven reader; Apple MusicSubunitController reads in chunks too.
+    static constexpr uint16_t kChunkBytes = 128;
+    // Every reply must make progress. Even one-byte replies terminate within
+    // the byte budget, rather than an unrelated 50-attempt cutoff.
+    static constexpr size_t kMaxChunks = kMaxDescriptorBytes;
     struct ReadDescriptorResult {
-        bool success;
+        bool success{false};
         std::vector<uint8_t> data;
-        AVCResult avcResult;
+        std::optional<ASFW::AVC::AvcError> primaryError;
+        std::optional<ASFW::AVC::AvcError> cleanupError;
+        bool cancelled{false};
     };
-    
-    /// Completion handler type
-    using ReadCompletion = std::function<void(const ReadDescriptorResult&)>;
-    using SimpleCompletion = std::function<void(bool success)>;
+    /// Runs exactly once; move-only so it can never be duplicated.
+    using ReadCompletion = Common::MoveOnlyCallback<void(const ReadDescriptorResult&)>;
+    explicit DescriptorAccessor(ASFW::AVC::IAvcUnit& unit,
+                                ASFW::AVC::SubunitAddress address = ASFW::AVC::SubunitAddress::Unit());
+    ~DescriptorAccessor();
+    DescriptorAccessor(const DescriptorAccessor&) = delete("an accessor owns its in-flight OPEN/READ/CLOSE operation");
+    DescriptorAccessor& operator=(const DescriptorAccessor&) = delete("an accessor owns its in-flight OPEN/READ/CLOSE operation");
 
-    //==========================================================================
-    // Construction
-    //==========================================================================
-    
-    DescriptorAccessor(FCPTransport& transport, uint8_t subunitAddr);
-    ~DescriptorAccessor() = default;
-
-    //==========================================================================
-    // Core Descriptor Operations
-    //==========================================================================
-    
-    /// Open descriptor for reading
-    /// Spec: Section 7.1 - OPEN DESCRIPTOR command
-    void openForRead(const DescriptorSpecifier& specifier, 
-                     SimpleCompletion completion);
-    
-    /// Read entire descriptor with automatic chunking
-    /// Implements Apple's dual-strategy approach:
-    /// - Primary: read_result_status checking (spec-compliant)
-    /// - Fallback: length-based termination (real-world robustness)
-    void readComplete(const DescriptorSpecifier& specifier,
-                     ReadCompletion completion);
-    
-    /// Close descriptor
-    /// Spec: Section 7.1 - OPEN DESCRIPTOR command (subfunction 0x00)
-    void close(const DescriptorSpecifier& specifier,
-              SimpleCompletion completion);
-
-    //==========================================================================
-    // Convenience Methods (OPEN → READ → CLOSE)
-    //==========================================================================
-    
-    /// Read (Sub)unit Identifier Descriptor
-    /// Spec: Section 6.2.1 - Type 0x00
-    /// Automatically performs OPEN → READ → CLOSE sequence
-    void readUnitIdentifier(ReadCompletion completion);
-    
-    /// Read Status Descriptor (type 0x80) with proper OPEN→READ→CLOSE sequence
-    /// Note: 0x80-0xFF are subunit-type specific (subunit-dependent descriptors)
-    /// For Music Subunit, 0x80 is the Status Descriptor containing dynamic info blocks
-    /// 
-    /// Key difference from readUnitIdentifier: Status descriptors REQUIRE the full
-    /// OPEN → READ → CLOSE sequence to work on real hardware (confirmed via packet capture).
-    void readStatusDescriptor(uint8_t descriptorType, 
-                             ReadCompletion completion);
-    
-    /// Read descriptor with full OPEN → READ → CLOSE sequence
-    /// Required for subunit-dependent descriptors (types 0x80-0xBF)
-    /// The Apple driver uses this sequence for all descriptor reads except Unit Identifier
-    void readWithOpenCloseSequence(const DescriptorSpecifier& specifier,
-                                   ReadCompletion completion);
-
+    /// OPEN for read, READ until the declared length, CLOSE. There is no naked
+    /// READ: every read holds the descriptor open (TA 2002013).
+    void Read(const ASFW::AVC::Cmd::DescriptorSpecifier& specifier, ReadCompletion completion);
+    void Cancel();
+    /// Route loss/shutdown terminates an operation without another submission.
+    void Abort();
 private:
-    //==========================================================================
-    // Internal State
-    //==========================================================================
-    
-    FCPTransport& transport_;
-    uint8_t subunitAddr_;
-    
-    //==========================================================================
-    // Internal Chunked Read Implementation
-    //==========================================================================
-    
-    struct ReadChunkState {
-        DescriptorSpecifier specifier;
-        std::vector<uint8_t> accumulatedData;
-        uint16_t totalDescriptorLength;
-        uint16_t bytesReadSoFar;
-        int attemptCount;
-        ReadCompletion completion;
-    };
-    
-    /// Read next chunk using READ DESCRIPTOR command
-    void readNextChunk(std::shared_ptr<ReadChunkState> state);
-    
-    /// Handle read chunk response - implements Apple's dual-strategy
-    void handleReadChunk(std::shared_ptr<ReadChunkState> state,
-                        AVCResult result,
-                        const AVCReadDescriptorCommand::ReadResult& readResult);
+    Common::LiveRef<ASFW::AVC::IAvcUnit> unit_;
+    ASFW::AVC::SubunitAddress address_;
+    std::shared_ptr<DescriptorReadOperation> operation_;
 };
-
 } // namespace ASFW::Protocols::AVC

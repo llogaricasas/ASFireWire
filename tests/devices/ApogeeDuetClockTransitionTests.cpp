@@ -15,20 +15,20 @@
 namespace {
 
 using ASFW::Audio::AudioClockConfig;
-using ASFW::Audio::ClockApplyResult;
+using ASFW::Audio::DuplexClockApplyResult;
 using ASFW::Audio::Oxford::Apogee::ApogeeDuetProtocol;
 using ASFW::Testing::AvcTestRig;
 
 TEST(ApogeeDuetClockTransitionTests, ConcurrentApplyClockConfigReturnsBusy) {
     AvcTestRig rig;
 
-    ApogeeDuetProtocol protocol(rig.Bus(), rig.Bus(), rig.Route(), &rig.Routes(), nullptr, nullptr, nullptr, 100U,
+    ApogeeDuetProtocol protocol(rig.Bus(), rig.Bus(), rig.Route(), &rig.Routes(), nullptr, nullptr, 100U,
                                 &rig.Timers());
 
     // Initial ApplyClockConfig without transport returns kIOReturnNotReady
     bool callbackFired = false;
     protocol.ApplyClockConfig(AudioClockConfig{.sampleRateHz = 48000U},
-                              [&callbackFired](IOReturn status, const ClockApplyResult&) {
+                              [&callbackFired](IOReturn status, const DuplexClockApplyResult&) {
                                   callbackFired = true;
                                   EXPECT_EQ(status, kIOReturnNotReady);
                               });
@@ -38,7 +38,7 @@ TEST(ApogeeDuetClockTransitionTests, ConcurrentApplyClockConfigReturnsBusy) {
 TEST(ApogeeDuetClockTransitionTests, ShutdownCancelsClockTransition) {
     AvcTestRig rig;
 
-    ApogeeDuetProtocol protocol(rig.Bus(), rig.Bus(), rig.Route(), &rig.Routes(), nullptr, nullptr, nullptr, 100U,
+    ApogeeDuetProtocol protocol(rig.Bus(), rig.Bus(), rig.Route(), &rig.Routes(), nullptr, nullptr, 100U,
                                 &rig.Timers());
 
     EXPECT_EQ(protocol.Shutdown(), kIOReturnSuccess);

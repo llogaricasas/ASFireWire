@@ -141,8 +141,14 @@ void HandleInterrupt(const InterruptSnapshot& snapshot) {
     if (events & kRSPkt) asyncSubsystem->OnRxInterrupt(ARResponse);
     
     // Cycle timing
-    if (events & kCycleTooLong) { /* ISO overrun */ }
     if (events & kCycle64Seconds) { /* 64s rollover */ }
+
+    // ... acknowledge the handled events, then:
+    // cycleTooLong: the controller cleared LinkControl.cycleMaster (OHCI 1.2
+    // draft Table 6-1). The cycle policy re-applies its decision after the
+    // acknowledge, because cycleMaster stays zero while the event is set
+    // (Table 5-17).
+    if (events & kCycleTooLong) HandleCycleTooLong();
 }
 ```
 
@@ -181,10 +187,10 @@ struct ControllerConfig {
 struct InterruptSnapshot {
     uint32_t intEvent;       // Raw OHCI IntEvent register
     uint32_t intMask;        // Current IntMask (for filtering)
-    uint32_t isoXmitEvent;   // ISO transmit context events
-    uint32_t isoRecvEvent;   // ISO receive context events
-    uint64_t timestamp;      // mach_absolute_time()
+    uint64_t timestamp;      // host time, nanoseconds
 };
+// The per-context isoch masks are read and cleared once, after the global
+// acknowledgement: HardwareInterface::TakeIsochContextEvents.
 ```
 
 #### TopologySnapshot

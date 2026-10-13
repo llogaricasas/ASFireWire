@@ -146,7 +146,9 @@ TEST(ApogeeMeterRegisters, RouteReboundBeforeTheReadIsResolvedFreshNotFromASnaps
     rom.gen = snapshot.generation;
     rom.nodeId = static_cast<uint8_t>(snapshot.nodeId);
     rig.Routes().InvalidateLiveMappingsForBusReset();
-    rig.Routes().UpsertFromROM(rom, ASFW::Discovery::LinkPolicy{});
+    // Returns the resulting record; this test wants only the side effect of
+    // registering the device.
+    (void)rig.Routes().UpsertFromROM(rom, ASFW::Discovery::LinkPolicy{});
 
     ASSERT_NE(rig.Route().routeEpoch, snapshot.routeEpoch);
     EXPECT_FALSE(rig.Routes().IsCurrent(snapshot));
@@ -207,6 +209,47 @@ TEST(ApogeeVendorFcp, StatusQueryOmitsTheValueOperand) {
     EXPECT_EQ(rig.Target().Commands()[0].data[0], 0x01) << "ctype STATUS";
     // 3 + 9 = 12, already quadlet-aligned, so no value byte was appended.
     EXPECT_EQ(rig.Target().Commands()[0].length, 12U);
+}
+
+TEST(ApogeeVendorFcp, StatusDecodesFromTheRealEchoedOuiAndVendorPayload) {
+    AvcTestRig rig;
+    rig.Target().Script(AvcReply::RawBytes({
+        0x0C, 0xFF, 0x00, // IMPLEMENTED/STABLE, unit, VENDOR-DEPENDENT
+        0x00, 0x03, 0xDB, // echoed Apogee OUI
+        0x50, 0x43, 0x4D, // PCM magic
+        static_cast<uint8_t>(Code::OutVolume), 0xFF, 0xFF, 0x2A,
+    }));
+
+    IOReturn status = kIOReturnNotReady;
+    ApogeeVendorCommand decoded{};
+    VendorFcp::Send(rig.Transport(), ApogeeVendorCommand::Make(Code::OutVolume),
+                    /*isStatus=*/true,
+                    [&](IOReturn result, const ApogeeVendorCommand& reply) {
+                        status = result;
+                        decoded = reply;
+                    });
+    rig.Drain();
+
+    EXPECT_EQ(status, kIOReturnSuccess);
+    EXPECT_EQ(decoded.u8Value, 0x2A);
+}
+
+TEST(ApogeeVendorFcp, StatusRejectsAReplyWithAChangedOui) {
+    AvcTestRig rig;
+    rig.Target().Script(AvcReply::RawBytes({
+        0x0C, 0xFF, 0x00,
+        0x00, 0x0A, 0x27, // valid vendor payload under a foreign OUI
+        0x50, 0x43, 0x4D,
+        static_cast<uint8_t>(Code::OutVolume), 0xFF, 0xFF, 0x2A,
+    }));
+
+    IOReturn status = kIOReturnSuccess;
+    VendorFcp::Send(rig.Transport(), ApogeeVendorCommand::Make(Code::OutVolume),
+                    /*isStatus=*/true,
+                    [&](IOReturn result, const ApogeeVendorCommand&) { status = result; });
+    rig.Drain();
+
+    EXPECT_EQ(status, kIOReturnBadArgument);
 }
 
 TEST(ApogeeVendorFcp, MissingTransportIsNotReadyRatherThanACrash) {

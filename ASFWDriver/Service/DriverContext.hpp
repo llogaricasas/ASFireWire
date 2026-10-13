@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <atomic>
+#include "../Common/TeardownCompletion.hpp"
 
 #ifdef ASFW_HOST_TEST
 #include "../Testing/HostDriverKitStubs.hpp"
@@ -32,6 +34,10 @@ class SBP2TargetBridge;
 }
 
 struct ServiceContext {
+    // Interrupt callback progress is sampled only by the watchdog diagnostics.
+    std::atomic<uint64_t> irqEntries{0}, irqExits{0};
+    uint32_t irqProbeTicks{0}, irqPendingSamples{0}, irqProbeReports{0};
+    uint64_t irqProbeLastEntries{0};
     ASFW::Driver::ControllerCore::Dependencies deps;
     ASFW::Driver::ControllerConfig config{}; // immutable identity/static config
     // Initial (wiring-time) role policy. The runtime-mutable copy is owned by
@@ -57,6 +63,10 @@ struct ServiceContext {
     std::shared_ptr<ASFW::Audio::AudioCoordinator> audioCoordinator;
     std::shared_ptr<ASFW::Protocols::SBP2::SBP2NubPublisher> sbp2NubPublisher;
     std::shared_ptr<ASFW::Protocols::SBP2::SBP2TargetBridge> sbp2Bridge;
+
+    // Kept across Reset: cancellation callbacks outlive the runtime graph.
+    std::shared_ptr<ASFW::Common::TeardownCompletion> teardownCompletion{
+        std::make_shared<ASFW::Common::TeardownCompletion>()};
 
     void DisarmProviderNotifications();
 

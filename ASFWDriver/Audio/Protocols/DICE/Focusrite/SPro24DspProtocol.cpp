@@ -29,8 +29,10 @@ SPro24DspProtocol::SPro24DspProtocol(Protocols::Ports::FireWireBusOps& busOps,
                                      Protocols::Ports::FireWireBusInfo& busInfo,
                                      Discovery::DeviceRegistry& routeRegistry,
                                      const Discovery::DeviceRouteToken& route,
-                                     IRM::IRMClient* irmClient)
-    : tcat_(busOps, busInfo, routeRegistry, route, irmClient)
+                                     IRM::IRMClient* irmClient,
+                                     DiceWaitClock& waitClock,
+                                     DiceNotificationRouter* notifications)
+    : tcat_(busOps, busInfo, routeRegistry, route, irmClient, waitClock, notifications)
 {
     ASFW_LOG(DICE, "SPro24DspProtocol created for GUID=0x%016llx node=0x%04x", route.guid,
              route.nodeId);
@@ -111,29 +113,14 @@ IOReturn SPro24DspProtocol::Shutdown() {
     return tcat_.Shutdown();
 }
 
-void SPro24DspProtocol::PrepareDuplex48k(const AudioDuplexChannels& channels, VoidCallback callback) {
-    tcat_.PrepareDuplex48k(channels, std::move(callback));
-}
-
-void SPro24DspProtocol::ProgramRxForDuplex48k(VoidCallback callback) {
-    tcat_.ProgramRxForDuplex48k(std::move(callback));
-}
-
-void SPro24DspProtocol::ProgramTxAndEnableDuplex48k(VoidCallback callback) {
-    tcat_.ProgramTxAndEnableDuplex48k(std::move(callback));
-}
-
-void SPro24DspProtocol::ConfirmDuplex48kStart(VoidCallback callback) {
-    tcat_.ConfirmDuplex48kStart(std::move(callback));
-}
 
 IOReturn SPro24DspProtocol::StopDuplex() {
     return tcat_.StopDuplex();
 }
 
 void SPro24DspProtocol::UpdateRuntimeContext(const Discovery::DeviceRouteToken& route,
-                                             Protocols::AVC::FCPTransport* transport) {
-    tcat_.UpdateRuntimeContext(route, transport);
+                                             std::shared_ptr<ASFW::AVC::IAvcUnit> avcUnit) {
+    tcat_.UpdateRuntimeContext(route, std::move(avcUnit));
 }
 
 void SPro24DspProtocol::ReadAppQuad(uint32_t offset,
@@ -367,14 +354,5 @@ void SPro24DspProtocol::SetOutputGroupState(const OutputGroupState& state, VoidC
         });
     });
 }
-
-// ============================================================================
-// TODO: Test only - Stream Control
-// ============================================================================
-
-void SPro24DspProtocol::StartStreamTest(VoidCallback callback) {
-    const AudioDuplexChannels channels{};
-    PrepareDuplex48k(channels, std::move(callback));
-}
-
 } // namespace ASFW::Audio::DICE::Focusrite
+

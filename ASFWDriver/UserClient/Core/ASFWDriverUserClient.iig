@@ -29,7 +29,7 @@ public:
         kMethodClearHistory            = 4,
         kMethodGetSelfIDCapture        = 5,
         kMethodGetTopologySnapshot     = 6,
-        kMethodPing                    = 7,
+    // Selector 7 retired (GUI health check).
         kMethodAsyncRead               = 8,
         kMethodAsyncWrite              = 9,
         kMethodRegisterStatusListener  = 10,
@@ -74,6 +74,13 @@ public:
         // Developer-only complete audio lifecycle control, GUID scalar input.
         kMethodStartAudioStreaming     = 62,
         kMethodStopAudioStreaming      = 63,
+        kMethodMotuCapture = 64,
+        // Read-only audio observer: select GUID, query state; memory type 2 is its output ring.
+        kMethodGetFCPExchangeLog = 65,
+        kMethodSelectAudioObserver = 66,
+        kMethodGetAudioObserverState = 67,
+        // One page of a unit's versioned discovery document (AVCDiscoveryDocument.hpp).
+        kMethodGetAVCDiscoveryDocument = 68,
         // TODO(ASFW-IRM): Remove temporary IRM test method after dedicated validation tooling exists.
         kMethodTestIRMAllocation       = 26,
         kMethodTestIRMRelease          = 27,
@@ -169,4 +176,10 @@ struct ASFWDriverUserClient_IVars {
     void* runtimeState;
     IOLock* actionLock;
     bool stopping;
+    uint32_t startCount;
+    uint32_t stopCount;
+    uint32_t transactionHolds;
+    uint64_t audioObserverGuid;
+    uint64_t audioObserverMappingGeneration;
+    bool audioObserverMemoryRequested;
 };

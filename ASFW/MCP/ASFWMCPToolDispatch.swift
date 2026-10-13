@@ -38,6 +38,8 @@ extension ASFWMCPCore {
         switch name {
         case "asfw_get_capabilities":
             return await capabilitiesResult(toolName: name)
+        case "asfw_get_driver_version":
+            return await driverVersionResult(toolName: name)
         case "asfw_get_policy":
             return await policyResult(toolName: name)
         case "asfw_list_nodes":
@@ -99,16 +101,9 @@ extension ASFWMCPCore {
         case "asfw_fcp_get_recent_responses":
             return await recentFcpResponsesResult(toolName: name, decoder: decoder)
         case "asfw_avc_get_subunit_descriptor":
-            // Unlike the other read-only tools, this one is not a routing gap: AV/C
-            // descriptor access is a wire-observable OPEN/READ/CLOSE DESCRIPTOR
-            // sequence that has to be written against the AV/C descriptor mechanism
-            // and cross-checked with references/IOFireWireAVC before it may issue FCP
-            // to a real device. Left explicitly unimplemented rather than synthesized.
-            return notImplementedToolResult(
-                name,
-                reason: "AV/C READ DESCRIPTOR is not implemented. It requires the OPEN/READ/CLOSE "
-                    + "descriptor sequence validated against a reference stack, not a routing change."
-            )
+            return await avcSubunitDescriptorResult(toolName: name, decoder: decoder)
+        case "asfw_avc_get_discovery_document":
+            return await avcDiscoveryDocumentResult(toolName: name, decoder: decoder)
         case "asfw_fcp_send_command":
             return await dispatchFcpReadCommand(name, decoder: decoder)
         case "asfw_apogee_duet_apply_format_dev":
@@ -131,6 +126,8 @@ extension ASFWMCPCore {
             return await dispatchSbp2Orb(name, decoder: decoder)
         case "asfw_get_audio_stream_health":
             return await dispatchAudioStreamHealth(name)
+        case "asfw_get_audio_telemetry":
+            return await dispatchAudioTelemetry(name)
         case "asfw_dice_decode_status":
             return await dispatchDiceDecodeStatus(name, decoder: decoder)
         case "asfw_dice_write_register":
@@ -143,6 +140,18 @@ extension ASFWMCPCore {
             return await bebobUnitPlugInfoResult(toolName: name, decoder: decoder)
         case "asfw_bebob_get_clock_topology":
             return await bebobClockTopologyResult(toolName: name, decoder: decoder)
+        case "asfw_bebob_get_streaming_stats":
+            return await bebobShellDiagnosticResult(toolName: name, decoder: decoder, command: "sys stat")
+        case "asfw_bebob_get_silicon_status":
+            return await bebobShellDiagnosticResult(toolName: name, decoder: decoder, command: "sys avstat all")
+        case "asfw_bebob_get_sync_state":
+            return await bebobShellDiagnosticResult(toolName: name, decoder: decoder, command: "fw show")
+        case "asfw_bebob_get_mixer_routing":
+            return await bebobShellDiagnosticResult(toolName: name, decoder: decoder, command: "fw mix show")
+        case "asfw_bebob_get_meter_peaks":
+            return await bebobShellDiagnosticResult(toolName: name, decoder: decoder, command: "fw vol peak")
+        case "asfw_bebob_shell_execute":
+            return await bebobShellExecuteResult(toolName: name, decoder: decoder)
         case "asfw_phase88_get_clock":
             return await phase88GetClockResult(toolName: name, decoder: decoder)
         case "asfw_phase88_set_clock_internal":
@@ -527,6 +536,32 @@ extension ASFWMCPCore {
             ]),
             errors: []
         )
+    }
+
+    private func dispatchAudioTelemetry(_ name: String) async -> ASFWMCPToolCallResult {
+        guard let telemetry = await driver.fetchAudioTelemetry() else {
+            return .failure(toolName: name, code: .driverNotConnected,
+                            reason: "Audio telemetry is unavailable (driver not connected, or an older wire version).")
+        }
+        return ASFWMCPToolCallResult(toolName: name, ok: true, data: telemetry, errors: [])
+    }
+
+    /// The user client returns metadata embedded in the running dext, not the
+    /// app's own version or the source tree currently checked out on disk.
+    private func driverVersionResult(toolName: String) async -> ASFWMCPToolCallResult {
+        guard let version = await driver.fetchDriverVersion() else {
+            return .failure(toolName: toolName, code: .driverNotConnected,
+                            reason: "Running driver version is unavailable.")
+        }
+        return ASFWMCPToolCallResult(toolName: toolName, ok: true, data: .object([
+            "semanticVersion": .string(version.semanticVersion),
+            "gitCommitShort": .string(version.gitCommitShort),
+            "gitCommitFull": .string(version.gitCommitFull),
+            "gitBranch": .string(version.gitBranch),
+            "gitDirty": .bool(version.gitDirty),
+            "buildTimestamp": .string(version.buildTimestamp),
+            "buildHost": .string(version.buildHost),
+        ]), errors: [])
     }
 
     private func dispatchIrmSnapshot(_ name: String, decoder: ASFWMCPToolArgumentDecoder) async -> ASFWMCPToolCallResult {
@@ -1382,6 +1417,84 @@ private extension ASFWMCPCore {
         }
     }
 
+    private func bebobShellExecuteResult(
+        toolName: String,
+        decoder: ASFWMCPToolArgumentDecoder
+    ) async -> ASFWMCPToolCallResult {
+        do {
+            let node = try decoder.uint32("nodeId")
+            let generation = try decoder.uint32("generation")
+            let command = try decoder.string("command")
+            let refusal = await beBoBShellWriteRefusal(toolName: toolName, node: node, generation: generation)
+            if let refusal { return refusal }
+            guard let output = await ASFWMCPBeBoBShellClient.execute(driver: driver, nodeId: node,
+                                                                      generation: generation, command: command) else {
+                return .failure(toolName: toolName, code: .capabilityUnavailable,
+                                reason: "Command is unsupported or the BeBoB Virtual UART transaction failed.")
+            }
+            return .success(toolName: toolName, data: .object([
+                "kind": .string("bebobShellExecute"), "command": .string(command),
+                "stdout": .string(output)
+            ]))
+        } catch {
+            return malformedToolResult(toolName, reason: error.localizedDescription)
+        }
+    }
+
+    private func bebobShellDiagnosticResult(
+        toolName: String,
+        decoder: ASFWMCPToolArgumentDecoder,
+        command: String
+    ) async -> ASFWMCPToolCallResult {
+        do {
+            let node = try decoder.uint32("nodeId")
+            let generation = try decoder.uint32("generation")
+            let refusal = await beBoBShellWriteRefusal(toolName: toolName, node: node, generation: generation)
+            if let refusal { return refusal }
+            guard let output = await ASFWMCPBeBoBShellClient.execute(driver: driver, nodeId: node,
+                                                                      generation: generation, command: command) else {
+                return .failure(toolName: toolName, code: .capabilityUnavailable,
+                                reason: "BeBoB Virtual UART diagnostic failed.")
+            }
+            var fields: [String: ASFWMCPValue] = ["kind": .string("bebobShellDiagnostic"),
+                                                  "command": .string(command),
+                                                  "rawStdout": .string(output)]
+            if let value = BeBoBShellTelemetryParser.parseStreamingStats(output) {
+                fields["fireWireOutputChannel"] = value.fireWireOutput.map { .int($0.isoChannel) } ?? .null
+                fields["fireWireInputChannel"] = value.fireWireInput.map { .int($0.isoChannel) } ?? .null
+            }
+            if let value = BeBoBShellTelemetryParser.parseSyncState(output) {
+                fields["audioState"] = .string(value.audioState)
+                fields["syncSource"] = .string(value.syncSource)
+                fields["sampleRateHz"] = .int(Int(value.sampleRateHz))
+                fields["inputSource"] = .string(value.inputSource)
+                fields["outputSource"] = .string(value.outputSource)
+            }
+            if let value = BeBoBShellTelemetryParser.parseAvStat(output) {
+                fields["setLatches"] = .array(value.setLatches.map {
+                    .object(["block": .string($0.block), "label": .string($0.label), "value": .int(Int($0.value))])
+                })
+            }
+            return .success(toolName: toolName, data: .object(fields))
+        } catch {
+            return malformedToolResult(toolName, reason: error.localizedDescription)
+        }
+    }
+
+    private func beBoBShellWriteRefusal(toolName: String, node: UInt32,
+                                        generation: UInt32) async -> ASFWMCPToolCallResult? {
+        let address = ASFWMCPAddress(nodeId: node, generation: generation,
+                                     addressHigh: 0xffff, addressLow: 0xc802_1000)
+        let policy = evaluateWritePolicy(.forTransaction(
+            kind: .writeBlock, address: address, currentGeneration: await currentGeneration(),
+            protocolHint: "bebob", protocolSupported: await protocolSupported("bebob")))
+        guard policy.reachesDriverWritePath else {
+            return .failure(toolName: toolName, code: policy.errorCode ?? .policyDenied,
+                            reason: policy.reason)
+        }
+        return nil
+    }
+
     func phase88GetClockResult(
         toolName: String,
         decoder: ASFWMCPToolArgumentDecoder
@@ -1782,6 +1895,79 @@ private extension ASFWMCPCore {
                     "capabilities": capabilities.mcpValue,
                 ])
             )
+        } catch {
+            return malformedToolResult(toolName, reason: error.localizedDescription)
+        }
+    }
+
+    func avcSubunitDescriptorResult(
+        toolName: String,
+        decoder: ASFWMCPToolArgumentDecoder
+    ) async -> ASFWMCPToolCallResult {
+        do {
+            let guid = try decoder.uint64("targetGuid")
+            let type = try decoder.uint32("subunitType")
+            let id = try decoder.uint32("subunitId")
+            guard type <= UInt32(UInt8.max), id <= UInt32(UInt8.max) else {
+                return malformedToolResult(toolName, reason: "subunitType and subunitId must fit in one byte")
+            }
+
+            let unit = await driver.listAVCUnits().first { $0.guid == guid }
+            guard unit?.subunits.contains(where: { $0.type == UInt8(type) && $0.id == UInt8(id) }) == true else {
+                return .failure(
+                    toolName: toolName,
+                    code: .capabilityUnavailable,
+                    reason: "The requested AV/C subunit is not present in the current discovery snapshot."
+                )
+            }
+            guard let descriptorData = await driver.avcSubunitDescriptor(
+                guid: guid, type: UInt8(type), id: UInt8(id)
+            ) else {
+                return .failure(
+                    toolName: toolName,
+                    code: .capabilityUnavailable,
+                    reason: "The driver could not provide descriptor data for the requested AV/C subunit."
+                )
+            }
+
+            let hex = descriptorData.map { String(format: "%02x", $0) }.joined()
+            return .success(
+                toolName: toolName,
+                data: .object([
+                    "kind": .string("avcSubunitDescriptor"),
+                    "targetGuid": .string(String(format: "0x%016llX", guid)),
+                    "subunitType": .int(Int(type)),
+                    "subunitId": .int(Int(id)),
+                    "byteCount": .int(descriptorData.count),
+                    "hex": .string(hex),
+                ])
+            )
+        } catch {
+            return malformedToolResult(toolName, reason: error.localizedDescription)
+        }
+    }
+
+    func avcDiscoveryDocumentResult(
+        toolName: String,
+        decoder: ASFWMCPToolArgumentDecoder
+    ) async -> ASFWMCPToolCallResult {
+        do {
+            let guid = try decoder.uint64("targetGuid")
+            guard let data = await driver.avcDiscoveryDocument(guid: guid) else {
+                return .failure(toolName: toolName, code: .capabilityUnavailable,
+                                reason: "No discovery document for this unit (unknown GUID, a driver that predates it, or pages changed during every read).")
+            }
+            guard let json = try? JSONSerialization.jsonObject(with: data),
+                  let document = ASFWMCPValue(jsonObject: json) else {
+                return .failure(toolName: toolName, code: .capabilityUnavailable,
+                                reason: "The driver returned a discovery document that is not valid JSON.")
+            }
+            return .success(toolName: toolName, data: .object([
+                "kind": .string("avcDiscoveryDocument"),
+                "targetGuid": .string(String(format: "0x%016llX", guid)),
+                "byteCount": .int(data.count),
+                "document": document,
+            ]))
         } catch {
             return malformedToolResult(toolName, reason: error.localizedDescription)
         }

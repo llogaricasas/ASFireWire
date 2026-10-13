@@ -1,37 +1,150 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 ASFireWire Project
 //
-// DuplexControlTypes.hpp - Protocol-neutral duplex restart vocabulary
+// DuplexControlTypes.hpp - Values exchanged across FamilyDriver.
+//
+// Why a restart happens, the result each device stage reports, the callbacks
+// the families' asynchronous stage chains answer with, and the device-side
+// progress a DICE bring-up tracks. Session state (what should run,
+// what runs) belongs to Audio/Session/SessionScheduler; the lifecycle variant,
+// clock-request tokens and rollback ledger that used to live here went with
+// AudioDuplexCoordinator (documentation/AUDIO_SESSION_REDESIGN.md, stage S2).
 
 #pragma once
 
-#include "../DICE/Core/DICERestartSession.hpp"
+#include "../AudioTypes.hpp"
+#include "AudioClockConfig.hpp"
+#include "../../../Async/AsyncTypes.hpp"
+
+#include <DriverKit/IOReturn.h>
+
+#include <cstdint>
+#include <functional>
 
 namespace ASFW::Audio {
 
-// The state machine is shared by DICE and AV/C backends. Keep the seam's
-// vocabulary neutral even while the owning header retains its historical DICE
-// location; device-specific DICE protocol results remain explicitly DICE-named.
-using DuplexRestartReason = DICE::DiceRestartReason;
-using DuplexRestartPhase = DICE::DiceRestartPhase;
-using DuplexRestartState = DICE::DiceRestartState;
-using DuplexClockRequestOutcome = DICE::DiceClockRequestOutcome;
-using DuplexRestartErrorClass = DICE::DiceRestartErrorClass;
-using DuplexRestartFailureCause = DICE::DiceRestartFailureCause;
-using DuplexClockRequestCompletion = DICE::DiceClockRequestCompletion;
-using DuplexRestartIssueInfo = DICE::DiceRestartIssueInfo;
-using DuplexRestartSession = DICE::DiceRestartSession;
-using DuplexPrepareResult = DICE::DiceDuplexPrepareResult;
-using DuplexStageResult = DICE::DiceDuplexStageResult;
-using DuplexConfirmResult = DICE::DiceDuplexConfirmResult;
-using ClockApplyResult = DICE::DiceClockApplyResult;
-using DuplexHealthResult = DICE::DiceDuplexHealthResult;
+enum class DuplexRestartReason : uint8_t {
+    kInitialStart,
+    kSampleRateChange,
+    kClockSourceChange,
+    kBusResetRebind,
+    kRecoverAfterTimingLoss,
+    kRecoverAfterCycleInconsistent,
+    kRecoverAfterLockLoss,
+    kRecoverAfterTxFault,
+    kManualReconfigure,
+    // The device announced a stream-configuration change (DICE RX/TX_CFG_CHG).
+    // TCAT restarts streaming on it (NotificationWriteCallback).
+    kDeviceConfigChange,
+};
 
-using DICE::ClassifyRestartReason;
-using DICE::ClearRestartProgress;
-using DICE::HasAnyRestartState;
-using DICE::HasDeviceRestartState;
-using DICE::HasHostRestartState;
-using DICE::HasRestartIntent;
+// How far a device-side bring-up got. Reported in stage results and logs.
+enum class DuplexRestartPhase : uint8_t {
+    kIdle,
+    kPreparingDevice,
+    kPrepared,
+    kReservingPlaybackResources,
+    kProgrammingDeviceRx,
+    kDeviceRxProgrammed,
+    kReservingCaptureResources,
+    kStartingHostReceive,
+    kProgrammingDeviceTx,
+    kDeviceTxArmed,
+    kWaitingGlobalClock,
+    kStartingHostTransmit,
+    kConfirmingDeviceStart,
+    kRunning,
+    kStopping,
+    kFailed,
+};
+
+struct DuplexPrepareResult {
+    FW::Generation generation{0};
+    AudioDuplexChannels channels{};
+    AudioClockConfig appliedClock{};
+    AudioStreamRuntimeCaps runtimeCaps{};
+};
+
+struct DuplexStageResult {
+    FW::Generation generation{0};
+    AudioDuplexChannels channels{};
+    DuplexRestartPhase phase{DuplexRestartPhase::kIdle};
+    AudioStreamRuntimeCaps runtimeCaps{};
+};
+
+struct DuplexConfirmResult {
+    FW::Generation generation{0};
+    AudioDuplexChannels channels{};
+    AudioClockConfig appliedClock{};
+    AudioStreamRuntimeCaps runtimeCaps{};
+    uint32_t notification{0};
+    uint32_t status{0};
+    uint32_t extStatus{0};
+};
+
+struct DuplexClockApplyResult {
+    FW::Generation generation{0};
+    AudioClockConfig appliedClock{};
+    AudioStreamRuntimeCaps runtimeCaps{};
+};
+
+struct DuplexHealthResult {
+    FW::Generation generation{0};
+    AudioClockConfig appliedClock{};
+    AudioStreamRuntimeCaps runtimeCaps{};
+    bool sourceLocked{false};
+    bool clockReferenceHealthy{true};
+    uint32_t nominalRateHz{0};
+    uint32_t notification{0};
+    uint32_t status{0};
+    uint32_t extStatus{0};
+};
+
+// How a family's asynchronous stage chain answers. FamilyDriver steps start a
+// chain and wait for this answer (FamilyStageWait.hpp).
+using PrepareCallback = std::function<void(IOReturn, DuplexPrepareResult)>;
+using StageCallback = std::function<void(IOReturn, DuplexStageResult)>;
+using ConfirmCallback = std::function<void(IOReturn, DuplexConfirmResult)>;
+using ClockApplyCallback = std::function<void(IOReturn, DuplexClockApplyResult)>;
+using HealthCallback = std::function<void(IOReturn, DuplexHealthResult)>;
+
+// A DICE bring-up's device-side progress: what it claimed, armed and enabled,
+// so its stop and rollback know what to undo.
+struct DuplexRestartSession {
+    FW::Generation generation{0};
+    AudioDuplexChannels channels{};
+    DuplexRestartReason reason{DuplexRestartReason::kInitialStart};
+    AudioClockConfig desiredClock{};
+    AudioClockConfig appliedClock{};
+    AudioStreamRuntimeCaps runtimeCaps{};
+    DuplexRestartPhase phase{DuplexRestartPhase::kIdle};
+
+    // Past the owner step: the device is ours and may carry state this
+    // bring-up wrote, so its stop and rollback have something to undo.
+    bool ownerConfirmed{false};
+    bool devicePrepared{false};
+    bool deviceRxProgrammed{false};
+    bool deviceTxArmed{false};
+    bool deviceRunning{false};
+};
+
+[[nodiscard]] constexpr bool HasDeviceRestartState(const DuplexRestartSession& session) noexcept {
+    return session.ownerConfirmed ||
+           session.devicePrepared ||
+           session.deviceRxProgrammed ||
+           session.deviceTxArmed ||
+           session.deviceRunning;
+}
+
+// Clear the progress flags and move to `terminalPhase`.
+constexpr void ClearRestartProgress(DuplexRestartSession& session,
+                                    DuplexRestartPhase terminalPhase = DuplexRestartPhase::kIdle) noexcept {
+    session.phase = terminalPhase;
+    session.ownerConfirmed = false;
+    session.devicePrepared = false;
+    session.deviceRxProgrammed = false;
+    session.deviceTxArmed = false;
+    session.deviceRunning = false;
+}
 
 } // namespace ASFW::Audio

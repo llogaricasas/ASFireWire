@@ -8,12 +8,16 @@
 #include "../Protocols/IDeviceProtocol.hpp"
 #include "../../Discovery/DiscoveryTypes.hpp"
 #include "../../Discovery/DeviceRegistry.hpp"
+#include "../../DeviceProfiles/Audio/ResolvedDevicePolicy.hpp"
+#include "../../Common/TimingUtils.hpp"
 
 #include <algorithm>
 #include <vector>
 
 #if !defined(ASFW_HOST_TEST)
-#include "../Protocols/DeviceProtocolFactory.hpp"
+#include "../Protocols/FamilyProtocolConstruction.hpp"
+#include "../Protocols/DeviceProtocolChoice.hpp"
+#include "../../DeviceProfiles/Audio/AudioDeviceCatalog.hpp"
 #include "../../Protocols/Ports/FireWireBusPort.hpp"
 #endif
 
@@ -81,7 +85,13 @@ std::shared_ptr<AudioEndpointRuntime> AudioRuntimeRegistry::EnsureEndpointRuntim
 uint32_t AudioRuntimeRegistry::CopyAudioTelemetrySnapshots(
     Runtime::AudioTelemetrySnapshot& out) noexcept {
     out = {};
-    out.version = Runtime::kAudioTelemetryWireVersion;
+    // Stamp capture time and the tick->ns ratio so a reader can turn the
+    // completed-interval tick fields into time without its own timebase.
+    out.header.captureHostTicks = mach_absolute_time();
+    if (ASFW::Timing::initializeHostTimebase()) {
+        out.header.hostTimebaseNumer = ASFW::Timing::gHostTimebaseInfo.numer;
+        out.header.hostTimebaseDenom = ASFW::Timing::gHostTimebaseInfo.denom;
+    }
     if (!lock_) {
         return 0;
     }
@@ -103,11 +113,11 @@ uint32_t AudioRuntimeRegistry::CopyAudioTelemetrySnapshots(
 
     for (const auto& endpoint : endpoints) {
         if (endpoint->CopyAudioTelemetrySnapshot(
-                out.endpoints[out.endpointCount])) {
-            ++out.endpointCount;
+                out.endpoints[out.header.endpointCount])) {
+            ++out.header.endpointCount;
         }
     }
-    return out.endpointCount;
+    return out.header.endpointCount;
 }
 
 std::shared_ptr<IDeviceProtocol> AudioRuntimeRegistry::EnsureForDevice(
@@ -121,6 +131,12 @@ std::shared_ptr<IDeviceProtocol> AudioRuntimeRegistry::EnsureForDevice(
     if (!route.has_value()) {
         return nullptr;
     }
+    const auto* policy = DeviceProfiles::Audio::CurrentAudioPolicy(record);
+    if (policy == nullptr || policy->route != *route ||
+        !routeRegistry.IsCurrent(*route) ||
+        !DeviceProfiles::Audio::AllowsAudioRuntime(policy->plan.support)) {
+        return nullptr;
+    }
 
     // Creation is orchestrator-serialized: EnsureForDevice runs only on the single Default
     // queue (the controller discovery path), so there is no concurrent create for the same
@@ -128,6 +144,13 @@ std::shared_ptr<IDeviceProtocol> AudioRuntimeRegistry::EnsureForDevice(
     // Idempotent: an existing instance short-circuits (e.g. re-scan on resume).
     if (auto existing = FindShared(guid)) {
         existing->UpdateRuntimeContext(*route, nullptr);
+        // Discovery visits idle and streaming devices after every reset. Keep
+        // the protocol alive across async registration, independently of a nub.
+        existing->RebindNotifications([existing, guid](IOReturn status) {
+            if (status != kIOReturnSuccess)
+                ASFW_LOG(Audio, "AudioRuntimeRegistry: notification rebind failed guid=0x%016llx kr=0x%x (%{public}s)",
+                         guid, status, Logging::IOReturnName(status));
+        });
         return existing;
     }
 
@@ -142,16 +165,30 @@ std::shared_ptr<IDeviceProtocol> AudioRuntimeRegistry::EnsureForDevice(
         return nullptr;
     }
 
-    // Create() returns nullptr for everything but a recognized vendor/model, which
-    // is exactly the gate the former DeviceRegistry::MaybeCreateKnownProtocol path
-    // applied (recognized devices are precisely those with a non-None integration
-    // mode). No protocol is created, and nothing is logged, for unknown devices.
-    auto created = DeviceProtocolFactory::Create(
-        record.vendorId, record.modelId, *busOps, *busInfo, routeRegistry,
-        *route,
-        irmClient,
-        cmpClient_, timerScheduler_);
+    // Create() returns nullptr for everything the catalog does not name a
+    // profile builder for. That gate used to be a vendor/model if-chain that
+    // could disagree with the profile layer in silence -- issue #115, where the
+    // StudioLive 24.4.2 had a profile and a DiceProfileRegistry entry but no
+    // factory clause, published a nub, allocated isoch, and then failed every
+    // StartIO with nothing logged.
+    //
+    // It cannot disagree any more: one table decides both, a Supported row must
+    // name a builder (asserted in AudioDeviceCatalogTests), and Create()'s
+    // switch over builders has no default arm. The loud "supported but no
+    // clause" check below is therefore about a state that is now a compile
+    // error -- kept only as a runtime witness for a device whose catalog row
+    // says Supported while its units resolve to nothing at all.
+    auto created = CreateFamilyDeviceProtocol(
+        policy->plan, *busOps, *busInfo, routeRegistry, *route,
+        irmClient, cmpClient_, timerScheduler_, diceNotifications_,
+        record.link.isochToNode == FW::FwSpeed::S800);
     if (!created) {
+        ASFW_LOG_ERROR(Audio,
+                       "AudioRuntimeRegistry: no protocol for SUPPORTED device "
+                       "GUID=0x%016llx unitOffset=%u builder=%u implementation=%u",
+                       guid, policy->plan.unit.unitDirectoryOffset,
+                       static_cast<unsigned>(policy->plan.profileBuilder),
+                       static_cast<unsigned>(policy->plan.protocolImplementation));
         return nullptr;
     }
 

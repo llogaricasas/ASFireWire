@@ -16,9 +16,7 @@ using ASFW::Discovery::DeviceRegistry;
 using ASFW::Discovery::FWDevice;
 using ASFW::FW::Generation;
 using ASFW::Protocols::AVC::AVCUnit;
-using ASFW::Protocols::AVC::FCPFrame;
 using ASFW::Protocols::AVC::FCPResponseRouter;
-using ASFW::Protocols::AVC::FCPStatus;
 using ASFW::Protocols::AVC::FCPTransport;
 using ASFW::Protocols::AVC::FCPTransportConfig;
 using ASFW::Protocols::AVC::IAVCDiscovery;
@@ -33,9 +31,10 @@ public:
     explicit OneShotDiscovery(std::shared_ptr<FCPTransport> transport)
         : transport_(std::move(transport)) {}
 
-    std::vector<AVCUnit*> GetAllAVCUnits() override { return {}; }
+    std::shared_ptr<AVCUnit> Unit(uint64_t) override { return nullptr; }
+    std::vector<std::shared_ptr<AVCUnit>> Units() override { return {}; }
     void ReScanAllUnits() override {}
-    FCPTransport* GetFCPTransportForNodeID(uint16_t) override { return nullptr; }
+    std::shared_ptr<ASFW::AVC::IAvcUnit> LiveUnit(uint64_t) override { return nullptr; }
 
     std::shared_ptr<FCPTransport> AcquireFCPTransportForNodeID(uint16_t nodeID) override {
         acquiredNodeID_ = nodeID;
@@ -49,13 +48,11 @@ private:
     uint16_t acquiredNodeID_{0};
 };
 
-FCPFrame MakeUnitInfoCommand() {
-    FCPFrame command{};
-    command.length = 3;
-    command.data[0] = 0x00;
-    command.data[1] = 0xFF;
-    command.data[2] = 0x30;
-    return command;
+using Reply = ASFW::AVC::Expected<ASFW::AVC::Response>;
+
+ASFW::AVC::CommandFrame UnitInfo() {
+    return *ASFW::AVC::CommandFrame::Make(ASFW::AVC::CommandType::kControl, ASFW::AVC::SubunitAddress::Unit(),
+                                          ASFW::AVC::Opcode::kUnitInfo, {});
 }
 
 class FCPResponseRouterTests : public ::testing::Test {
@@ -90,14 +87,11 @@ protected:
 TEST_F(FCPResponseRouterTests, RoutesResponseFromWithinRegisteredResponseSpace) {
     auto transport = MakeTransport();
     int completionCount = 0;
-    FCPStatus completionStatus = FCPStatus::kTransportError;
-    ASSERT_TRUE(transport->SubmitCommand(
-                             MakeUnitInfoCommand(),
-                             [&completionCount, &completionStatus](FCPStatus status, const FCPFrame&) {
-                                 ++completionCount;
-                                 completionStatus = status;
-                             })
-                    .IsValid());
+    bool replied = false;
+    transport->Submit(UnitInfo(), Generation{1}, [&completionCount, &replied](Reply reply) {
+        ++completionCount;
+        replied = reply.has_value();
+    });
     ASSERT_TRUE(bus_.CompleteNextWrite(AsyncStatus::kSuccess));
 
     const std::weak_ptr<FCPTransport> weakTransport = transport;
@@ -113,8 +107,13 @@ TEST_F(FCPResponseRouterTests, RoutesResponseFromWithinRegisteredResponseSpace) 
 
     EXPECT_EQ(router.RouteBlockWrite(request), BlockWriteDisposition::kComplete);
     EXPECT_EQ(discovery.AcquiredNodeID(), 2);
+    // Our write response goes out when RouteBlockWrite returns; the command
+    // completes, and may submit the next one, only after that (AV/C General
+    // 4.2 §6.5).
+    EXPECT_EQ(completionCount, 0);
+    scheduler_.Advance(0);
     EXPECT_EQ(completionCount, 1);
-    EXPECT_EQ(completionStatus, FCPStatus::kOk);
+    EXPECT_TRUE(replied);
     EXPECT_TRUE(weakTransport.expired());
 }
 
@@ -143,10 +142,7 @@ TEST_F(FCPResponseRouterTests, RejectsWritesOutsideResponseSpace) {
 TEST_F(FCPResponseRouterTests, UsesCapturedGenerationRatherThanCurrentBusGeneration) {
     auto transport = MakeTransport();
     int completionCount = 0;
-    ASSERT_TRUE(transport->SubmitCommand(
-                             MakeUnitInfoCommand(),
-                             [&completionCount](FCPStatus, const FCPFrame&) { ++completionCount; })
-                    .IsValid());
+    transport->Submit(UnitInfo(), Generation{1}, [&completionCount](Reply) { ++completionCount; });
     ASSERT_TRUE(bus_.CompleteNextWrite(AsyncStatus::kSuccess));
 
     const std::weak_ptr<FCPTransport> weakTransport = transport;
@@ -162,6 +158,8 @@ TEST_F(FCPResponseRouterTests, UsesCapturedGenerationRatherThanCurrentBusGenerat
     };
 
     EXPECT_EQ(router.RouteBlockWrite(request), BlockWriteDisposition::kComplete);
+    EXPECT_EQ(completionCount, 0);
+    scheduler_.Advance(0);
     EXPECT_EQ(completionCount, 1);
     EXPECT_TRUE(weakTransport.expired());
 }
@@ -169,10 +167,7 @@ TEST_F(FCPResponseRouterTests, UsesCapturedGenerationRatherThanCurrentBusGenerat
 TEST_F(FCPResponseRouterTests, DoesNotRouteResponseWithoutCapturedGeneration) {
     auto transport = MakeTransport();
     int completionCount = 0;
-    ASSERT_TRUE(transport->SubmitCommand(
-                             MakeUnitInfoCommand(),
-                             [&completionCount](FCPStatus, const FCPFrame&) { ++completionCount; })
-                    .IsValid());
+    transport->Submit(UnitInfo(), Generation{1}, [&completionCount](Reply) { ++completionCount; });
     ASSERT_TRUE(bus_.CompleteNextWrite(AsyncStatus::kSuccess));
 
     OneShotDiscovery discovery(transport);
@@ -195,6 +190,7 @@ TEST_F(FCPResponseRouterTests, DoesNotRouteResponseWithoutCapturedGeneration) {
         .payload = response,
     };
     EXPECT_EQ(router.RouteBlockWrite(taggedRequest), BlockWriteDisposition::kComplete);
+    scheduler_.Advance(0);
     EXPECT_EQ(completionCount, 1);
     EXPECT_EQ(discovery.AcquiredNodeID(), 2);
 }

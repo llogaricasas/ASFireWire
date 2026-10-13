@@ -56,8 +56,20 @@ protected:
         hardware_.Attach(nullptr, mockDevice_);
     }
 
+    void TearDown() override {
+        // This fixture stands in for IOKit, which owns the provider in
+        // production. Attach() takes its OWN reference (OSRetain), so the
+        // reference created by `new` here is ours to drop -- otherwise the mock
+        // outlives the test and gmock never verifies its expectations.
+        if (mockDevice_ != nullptr) {
+            mockDevice_->release();
+            mockDevice_ = nullptr;
+        }
+    }
+
     HardwareInterface hardware_;
-    MockPCIDevice* mockDevice_{nullptr}; // Owned by hardware_ after Attach
+    // Held by BOTH this fixture and hardware_: Attach() retains. Released above.
+    MockPCIDevice* mockDevice_{nullptr};
 };
 
 namespace {
@@ -135,6 +147,48 @@ TEST_F(HardwareInterfaceOrderTests, WriteLocalIRMResource_WritesDataCompareContr
 
     auto result = hardware_.WriteLocalIRMResource(selectCode, value);
     EXPECT_EQ(result.status, LocalCSRLockResult::Status::Success);
+}
+
+// Linux ohci.c irq_handler (:2203-2268): after the global acknowledgement,
+// read each signalled direction's masked per-context events from the Clear
+// address and clear exactly those bits, once. A direction the global event does not signal is not touched.
+TEST_F(HardwareInterfaceOrderTests, TakeIsochContextEvents_ReadsAndClearsEachSignalledMaskOnce) {
+    InSequence seq;
+
+    EXPECT_CALL(*mockDevice_, MemoryRead32(0, static_cast<uint64_t>(Register32::kIsoRecvIntEventClear), _))
+        .WillOnce([](uint8_t, uint64_t, uint32_t* val) { *val = 0x3; });
+    EXPECT_CALL(*mockDevice_,
+                MemoryWrite32(0, static_cast<uint64_t>(Register32::kIsoRecvIntEventClear), 0x3u));
+    EXPECT_CALL(*mockDevice_, MemoryRead32(0, static_cast<uint64_t>(Register32::kHCControl), _));
+    EXPECT_CALL(*mockDevice_, MemoryRead32(0, static_cast<uint64_t>(Register32::kIsoXmitIntEventClear), _))
+        .WillOnce([](uint8_t, uint64_t, uint32_t* val) { *val = 0x1; });
+    EXPECT_CALL(*mockDevice_,
+                MemoryWrite32(0, static_cast<uint64_t>(Register32::kIsoXmitIntEventClear), 0x1u));
+    EXPECT_CALL(*mockDevice_, MemoryRead32(0, static_cast<uint64_t>(Register32::kHCControl), _));
+
+    const IsochContextEvents events =
+        hardware_.TakeIsochContextEvents(IntEventBits::kIsochRx | IntEventBits::kIsochTx);
+    EXPECT_EQ(events.receive, 0x3u);
+    EXPECT_EQ(events.transmit, 0x1u);
+}
+
+TEST_F(HardwareInterfaceOrderTests, TakeIsochContextEvents_LeavesUnsignalledDirectionsAlone) {
+    EXPECT_CALL(*mockDevice_, MemoryRead32(0, static_cast<uint64_t>(Register32::kIsoRecvIntEventClear), _))
+        .Times(0);
+    EXPECT_CALL(*mockDevice_,
+                MemoryWrite32(0, static_cast<uint64_t>(Register32::kIsoRecvIntEventClear), _))
+        .Times(0);
+    EXPECT_CALL(*mockDevice_, MemoryRead32(0, static_cast<uint64_t>(Register32::kIsoXmitIntEventClear), _))
+        .WillOnce([](uint8_t, uint64_t, uint32_t* val) { *val = 0; });
+    // An empty mask needs no clear.
+    EXPECT_CALL(*mockDevice_,
+                MemoryWrite32(0, static_cast<uint64_t>(Register32::kIsoXmitIntEventClear), _))
+        .Times(0);
+
+    const IsochContextEvents events = hardware_.TakeIsochContextEvents(IntEventBits::kIsochTx);
+    EXPECT_EQ(events.receive, 0u);
+    EXPECT_EQ(events.transmit, 0u);
+    EXPECT_EQ(hardware_.TakeIsochContextEvents(IntEventBits::kBusReset).transmit, 0u);
 }
 
 TEST_F(HardwareInterfaceOrderTests, SetLocalCycleMasterEnabled_InOrder) {

@@ -47,13 +47,16 @@ What is real today:
 - Async FireWire transactions are in place and used by discovery and protocol code.
 - AV/C FCP and CMP plumbing exists and is working on the main test rig.
 - Audio publication and experimental streaming paths exist in-tree.
-- Audio hardware tested by the maintainer: the Apogee Duet FireWire path, Terratec PHASE 88 Rack, and Focusrite Saffire Pro 24 DSP. Contributors have additionally verified the Focusrite Saffire Pro 40 (full duplex 20-in/20-out), PreSonus StudioLive 16.0.2 (full duplex 16-in/16-out), and Midas Venice F32 (full duplex 32-in/32-out).
-- Experimental DICE support is now enabled in-tree for Focusrite Saffire Pro 14, Saffire Pro 24, Saffire Pro 24 DSP, Saffire Pro 40, PreSonus StudioLive 16.0.2, and the Midas Venice F32.
+- Audio hardware tested by the maintainer: the Apogee Duet FireWire path, Terratec PHASE 88 Rack, Focusrite Saffire Pro 24 DSP, and M-Audio FireWire 1814 at 48 kHz. Contributors have additionally verified the Focusrite Saffire Pro 40 (full duplex 20-in/20-out), PreSonus StudioLive 16.0.2 (full duplex 16-in/16-out), and Midas Venice F32 (full duplex 32-in/32-out).
+- **M-Audio FireWire 1814 and ProjectMix I/O special-firmware support is in-tree at 48 kHz.** The 1814's playback, capture, and cold bootloader-to-firmware start were verified on hardware. ProjectMix I/O worked on an earlier development build but has not been independently retested against the merged implementation. Higher rates and optical modes are outside the validated path.
+- Experimental DICE support is now enabled in-tree for Focusrite Saffire Pro 14, Saffire Pro 24, Saffire Pro 24 DSP, Saffire Pro 40, PreSonus StudioLive 16.0.2 and 24.4.2, the PreSonus FireStudio Project, the Midas Venice range (F16/F24/F32 from one catalog row, told apart by reported geometry), the Alesis MultiMix 8/12/16, and Weiss INT202/INT203.
+- **MOTU protocol-v2 support is in-tree** for the 828mkII and UltraLite — a vendor register protocol rather than AV/C or DICE, with 3-byte PCM chunks behind a per-block source packet header. Contributed by [@deweydb](https://github.com/deweydb), built on Jonathan Woodward's ([@Dreambrother7](https://github.com/Dreambrother7)) wire/codec layer.
+- **Mackie support is in-tree** for the Onyx 400F (Echo Fireworks) and the Onyx-i series on the Oxford run, contributed by [@ottendorfcipher](https://github.com/ottendorfcipher). Neither has an audio-verified report yet.
 - **Multi-stream DICE now works.** The Midas Venice F32 runs two 16-channel streams per direction; the original Saffire Pro 40 runs asymmetric 12+8 playback and 10+10 capture streams.
 - **Host-controlled sample-rate switching is implemented**, including 44.1 kHz alongside 48 kHz. The driver decodes the device's advertised clock capabilities and drives DICE `CLOCK_SELECT`, so a rate change in the host (e.g. Logic) reprograms the device live without a reconnect. Switching rates on a CoreAudio aggregate device whose clock master is the FireWire interface is supported.
 - **Per-channel names** (device nickname plus per-channel TX/RX labels) are read from DICE devices and surfaced to CoreAudio.
-- Focusrite Saffire Pro 26, Saffire Pro 40 TCD3070, and Liquid Saffire 56 are recognized but intentionally not enabled yet — their stream layouts still need to be captured from real hardware.
-- PreSonus StudioLive 16.4.2, 24.4.2, and 32.4.2 are recognized by name but not audio-enabled yet: their FireWire channel counts differ from the 16.0.2 and must be captured from real hardware first (a wrong channel count means the device never locks to the stream). If you own one, see the call for testing below.
+- **New in 0.4.0-beta.1, best effort:** a rebuilt AV/C stack (#165) discovers and streams AV/C audio devices (BeBoB, Oxford) that have no catalog entry, from what each device reports about itself. Generic DICE support (#166) enables every recognised DICE model (Focusrite Liquid Saffire 56, Saffire Pro 26, Saffire Pro 40 TCD3070; PreSonus StudioLive 16.4.2 and 32.4.2; Alesis iO14/iO26; Mackie Onyx 1640i DICE run and Blackbird; Weiss ADC2, AFI1, Vesta, DAC2, DAC202, Maya, MAN301) plus DICE units recognised from their Config ROM. None of these has a hardware result yet: some will work, some won't. Turn your volume down before the first attach, and please report every result.
+- MOTU 896HD, Traveler and 8pre, and the Mackie Onyx 1200F (Echo Fireworks run), are recognized by name only — their layouts have not been captured.
 - The project is still not stable enough to recommend as a drop-in replacement for Apple's old FireWire stack.
 
 ## Call for testing
@@ -68,8 +71,26 @@ Please test these currently enabled DICE devices:
 - Focusrite Saffire Pro 40 (original TCD2220 revision; contributor-verified)
 - PreSonus StudioLive 16.0.2 (contributor-verified on one unit; broader validation welcome)
 - Midas Venice F32 (contributor-verified; broader validation welcome)
+- Midas Venice F24 (contributor-verified at S200; see the note below) and F16 (enabled, unconfirmed)
+- PreSonus StudioLive 24.4.2 (enabled from a capture; no streaming result on record)
+- PreSonus FireStudio Project (streamed at 44.1/48 kHz on a contributor's earlier branch, #105; not yet run on this code)
+- Alesis MultiMix 8 / 12 / 16
+- MOTU 828mkII and UltraLite
+- Mackie Onyx 400F and Onyx-i
 
-StudioLive 16.4.2 / 24.4.2 / 32.4.2 owners can help too: the driver recognizes these mixers but does not enable audio yet because their stream layout has not been captured from hardware. If you own one, open an issue — a short register capture using the ASFW app is all that is needed to add support.
+> **MOTU and Mackie need re-validation.** The audio engine's payload-encoding and
+> presentation-timing paths are being refactored behind new interfaces, and MOTU is being
+> migrated onto them. Mackie shares the same receive decode path, so it is exposed to the
+> same changes. Neither family is maintainer-owned hardware, so a regression in either
+> would not be caught locally.
+
+> **Midas Venice F24 works at S200.** On a two-node Thunderbolt bus it advertises S400
+> but does not acknowledge at that speed. A contributor confirmed (30 September 2026) that
+> the driver falls back to S200 for both async and isochronous traffic and plays full
+> tracks cleanly, including a dense Pro Tools session, on a diagnostic build of v0.3.1.
+> An earlier "static, then silence" failure on v0.3.1 has not reproduced since.
+
+StudioLive 16.4.2 / 32.4.2 owners can help too: these mixers now stream through the generic DICE path for the first time, with their channel layout read from the device. If you own one, please report whether it works — and attach the DICE Report from the ASFW app either way.
 
 If you try ASFireWire on one of them, please open a GitHub issue or reach out with:
 
@@ -83,19 +104,17 @@ Even a failed test report is valuable. "It does not enumerate at all" is still u
 
 ## Collecting logs
 
-If you are reporting a bug, please share the logs from the ASFW app:
+After reproducing a problem, export and attach these from the ASFW app when possible:
 
-1. Open **System Logs** in the sidebar.
-2. Reproduce the problem.
-3. Copy the log entries around the failure and attach them to the report.
+1. **1394 Diagnostics** — choose **Save to .txt...**.
+2. **DICE Report** — choose **Save to .txt...**.
+3. **System Logs** — choose **Export Logs** to save the retained driver logs.
 
-Please include the ASFW version, device, and approximate time of the reproduction. Do
-not worry about interpreting the messages or removing repeated lines — the complete
-log is more useful.
-
-If the app cannot show logs, use Console.app to reproduce the problem and export the
-entries mentioning ASFW, then attach that file instead. The [Logging wiki page](https://github.com/mrmidi/ASFireWire/wiki/Logging)
-has optional fallback instructions if a maintainer asks for a broader capture.
+Attach the exported files as-is; there is no need to copy log text into your message.
+Include what happened and when it happened, plus your device, Mac, and macOS version.
+If you use Codex or Claude with ASFW's optional MCP control plane, an MCP-connected
+agent can also inspect live diagnostics. MCP is developer-only, disabled by default,
+and should remain bound to localhost; see [Developer MCP control plane](#developer-mcp-control-plane).
 
 ## Hardware compatibility
 
@@ -118,7 +137,14 @@ Audio-device support in tree today:
 - PreSonus StudioLive 16.0.2
 - Midas Venice F32 (multi-stream DICE, 32-in/32-out)
 - Terratec PHASE 88 Rack
+- PreSonus StudioLive 24.4.2 (asymmetric multi-stream DICE, 16+10 playback / 16+16 capture; enabled from a contributed register capture)
+- PreSonus FireStudio Project (single-stream DICE, 10+1 each way; enabled from the register capture and hardware results in #105)
+- Midas Venice F16 and F24 (same catalog row as the F32; the variant is named from reported geometry)
+- Alesis MultiMix 8 / 12 / 16 (one row for the range — all three publish the same vendor/model; enabled from a contributed dump of a 12-input unit)
 - Weiss INT202 and INT203 (DICE 2-channel layout; wired up but **never run against real hardware**)
+- MOTU 828mkII and UltraLite (protocol v2; the 828mkII's Config ROM was captured from a real unit, but **no audio-verified report is on record**)
+- Mackie Onyx 400F (Echo Fireworks: EFC clock/transport control on the AV/C+CMP base; static 10x10 geometry gated on the device's HWINFO — **never run against real hardware**)
+- Mackie Onyx-i series, Oxford run (built on a live **Onyx 820i** identity and stream-format capture; that capture is not an audio-verified result)
 
 Personally tested with working audio (hardware owned by the maintainer):
 
@@ -143,7 +169,10 @@ Recognized but not enabled yet:
 - Focusrite Saffire Pro 26
 - Focusrite Saffire Pro 40 TCD3070
 - Focusrite Liquid Saffire 56
-- PreSonus StudioLive 16.4.2 / 24.4.2 / 32.4.2 (stream layout not yet captured from hardware)
+- PreSonus StudioLive 16.4.2 / 32.4.2 (stream layout not yet captured from hardware)
+- MOTU 896HD, Traveler, 8pre (chunk layout not confirmed against hardware)
+- Mackie Onyx 1640i (both runs), Onyx Blackbird, Onyx 1200F
+- Alesis iO14 / iO26 (geometry never captured)
 - Weiss ADC2, Vesta, DAC2/Minerva, AFI1, DAC202, Maya, MAN301 (identified by name; audio enablement needs a verified stream/clock trace per model)
 
 In theory the driver can be extended to other OHCI controllers and many more FireWire devices, but hardware access is still the limiting factor. Host-controller matching and audio-device enablement are intentionally conservative until more real machines are tested.
@@ -471,7 +500,7 @@ itself.
 
 If the machine ever ends up in a boot panic loop with the driver installed: boot
 into Recovery, `csrutil disable`, boot normally, uninstall the extension
-(`systemextensionsctl uninstall - net.mrmidi.ASFW.ASFWDriver`), then re-enable SIP.
+(`systemextensionsctl uninstall - net.asfw.driver`), then re-enable SIP.
 As a last resort, `sudo nvram boot-args="io=0"` makes macOS log the failure instead
 of panicking (clear with `sudo nvram -d boot-args`).
 
@@ -508,6 +537,8 @@ For bug reports, see [Reporting Issues (wiki)](https://github.com/mrmidi/ASFireW
 ## Contributing
 
 Nice place to start with — [DeepWiki page for ASFW](https://deepwiki.com/mrmidi/ASFireWire).
+
+For a new FireWire audio device, see [Adding FireWire audio hardware](documentation/ADDING_AUDIO_HARDWARE.md).
 
 Contributions are VERY welcome! If you want to contribute to the project, please follow these steps:
 

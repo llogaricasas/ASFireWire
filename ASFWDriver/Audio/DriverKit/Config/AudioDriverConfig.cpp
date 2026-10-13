@@ -1,6 +1,7 @@
 #include "AudioDriverConfig.hpp"
 
 #include "../../Model/AudioPropertyKeys.hpp"
+#include "../../../Logging/Logging.hpp"
 
 #include <DriverKit/OSArray.h>
 #include <DriverKit/OSBoolean.h>
@@ -26,6 +27,10 @@ void ParseIdentityProperties(OSDictionary* properties, ParsedAudioDriverConfig& 
     }
     if (auto* model = OSDynamicCast(OSNumber, properties->getObject(Keys::kModelId))) {
         inOutConfig.modelId = model->unsigned32BitValue();
+    }
+    if (auto* builder =
+            OSDynamicCast(OSNumber, properties->getObject(Keys::kProfileBuilderId))) {
+        inOutConfig.profileBuilderId = builder->unsigned32BitValue();
     }
     if (auto* inputChannels = OSDynamicCast(OSNumber, properties->getObject(Keys::kInputChannelCount))) {
         inOutConfig.inputChannelCount = inputChannels->unsigned32BitValue();
@@ -142,17 +147,175 @@ void BuildChannelNamesFromPlugs(ParsedAudioDriverConfig& inOutConfig) {
     }
 }
 
+// Parse one direction's per-stream geometry. An entry missing its PCM count is
+// not describable, so the whole array is rejected rather than partially
+// accepted: a half-read geometry would silently mis-frame the streams it did
+// read, which is the failure this property exists to prevent.
+void ParseWireStreams(OSDictionary* properties,
+                      const char* key,
+                      ParsedWireStream (&outStreams)[kMaxConfiguredStreams],
+                      uint32_t& outCount) {
+    outCount = 0;
+    auto* array = OSDynamicCast(OSArray, properties->getObject(key));
+    if (array == nullptr) {
+        return;
+    }
+
+    const uint32_t published = array->getCount();
+    if (published > kMaxConfiguredStreams) {
+        ASFW_LOG(Audio,
+                 "AudioDriverConfig: %{public}s publishes %u streams, more than this build "
+                 "can configure (%u) - ignoring the whole array rather than truncating it",
+                 key, published, kMaxConfiguredStreams);
+        return;
+    }
+
+    ParsedWireStream parsed[kMaxConfiguredStreams]{};
+    for (uint32_t i = 0; i < published; ++i) {
+        auto* entry = OSDynamicCast(OSDictionary, array->getObject(i));
+        if (entry == nullptr) {
+            ASFW_LOG(Audio, "AudioDriverConfig: %{public}s entry %u is not a dictionary", key, i);
+            return;
+        }
+        auto* pcm = OSDynamicCast(OSNumber, entry->getObject(Keys::kStreamPcmChannels));
+        if (pcm == nullptr || pcm->unsigned32BitValue() == 0) {
+            ASFW_LOG(Audio, "AudioDriverConfig: %{public}s entry %u states no PCM channels", key, i);
+            return;
+        }
+        parsed[i].pcmChannels = pcm->unsigned32BitValue();
+        if (auto* slots =
+                OSDynamicCast(OSNumber, entry->getObject(Keys::kStreamAm824Slots))) {
+            parsed[i].am824Slots = slots->unsigned32BitValue();
+        }
+        if (auto* midi =
+                OSDynamicCast(OSNumber, entry->getObject(Keys::kStreamMidiPorts))) {
+            parsed[i].midiPorts = midi->unsigned32BitValue();
+        }
+        if (auto* offset =
+                OSDynamicCast(OSNumber, entry->getObject(Keys::kStreamChannelOffset))) {
+            parsed[i].channelOffset = offset->unsigned32BitValue();
+        }
+        if (auto* map = OSDynamicCast(OSArray, entry->getObject(Keys::kStreamPcmSlotMap))) {
+            parsed[i].hasPcmSlotMap = true;
+            const auto count = map->getCount();
+            if (count > parsed[i].pcmSlotMap.slotForChannel.size() ||
+                (count != 0 && count != parsed[i].pcmChannels)) return;
+            parsed[i].pcmSlotMap.slotCount = count;
+            parsed[i].pcmSlotMap.channelCount = count;
+            for (uint32_t channel = 0; channel < count; ++channel) {
+                auto* slot = OSDynamicCast(OSNumber, map->getObject(channel));
+                if (slot == nullptr || slot->unsigned32BitValue() >= parsed[i].am824Slots) return;
+                parsed[i].pcmSlotMap.slotForChannel[channel] = static_cast<uint8_t>(slot->unsigned32BitValue());
+            }
+        }
+        // A data block has to be at least as wide as the PCM it carries.
+        if (parsed[i].am824Slots == 0) {
+            parsed[i].am824Slots = parsed[i].pcmChannels + parsed[i].midiPorts;
+        }
+    }
+
+    for (uint32_t i = 0; i < published; ++i) {
+        outStreams[i] = parsed[i];
+    }
+    outCount = published;
+}
+
 void ParseAudioDriverConfigFromProperties(OSDictionary* properties,
                                           ParsedAudioDriverConfig& inOutConfig) {
     if (!properties) {
         return;
     }
 
+    if (auto* controls = OSDynamicCast(OSArray, properties->getObject(::ASFW::Audio::Model::kAvcControlsProperty))) {
+        inOutConfig.avcControlCount = 0;
+        for (uint32_t i = 0; i < std::min(controls->getCount(), ::ASFW::Audio::Model::kMaxAvcControls); ++i) {
+            auto* entry = OSDynamicCast(OSDictionary, controls->getObject(i));
+            if (!entry) continue;
+            const auto get = [&](const char* key) -> uint32_t {
+                auto* value = OSDynamicCast(OSNumber, entry->getObject(key));
+                return value != nullptr ? value->unsigned32BitValue() : 0;
+            };
+            auto& control = inOutConfig.avcControls[inOutConfig.avcControlCount++];
+            if (auto* name = OSDynamicCast(OSString, entry->getObject("Name")))
+                strlcpy(control.name, name->getCStringNoCopy(), sizeof(control.name));
+            control.token = get("Token"); control.scope = get("Scope"); control.element = get("Element");
+            control.hasMute = get("HasMute") != 0; control.muted = get("Muted") != 0;
+            control.hasVolume = get("HasVolume") != 0; control.current = static_cast<int16_t>(get("Current"));
+            control.range = {static_cast<int16_t>(get("Minimum")), static_cast<int16_t>(get("Maximum")), static_cast<int16_t>(get("Resolution"))};
+            if (!control.range.Valid()) control.hasVolume = false;
+        }
+    }
     ParseIdentityProperties(properties, inOutConfig);
     ParseDevicePresentationProperties(properties, inOutConfig);
     ParseSampleRates(properties, inOutConfig);
+    if (auto* value = OSDynamicCast(OSNumber, properties->getObject(Keys::kRateRouteIncarnation)))
+        inOutConfig.rateRouteIncarnation = value->unsigned64BitValue();
+    if (auto* value = OSDynamicCast(OSNumber, properties->getObject(Keys::kRateRouteEpoch)))
+        inOutConfig.rateRouteEpoch = value->unsigned64BitValue();
+    if (auto* value = OSDynamicCast(OSNumber, properties->getObject(Keys::kRateBusGeneration)))
+        inOutConfig.rateBusGeneration = value->unsigned32BitValue();
+    if (auto* value = OSDynamicCast(OSNumber, properties->getObject(Keys::kUsesRateFormations)))
+        inOutConfig.usesRateFormations = value->unsigned32BitValue() != 0;
+    inOutConfig.rateFormationCandidates.clear();
+    if (auto* catalog = OSDynamicCast(OSArray, properties->getObject(Keys::kRateFormations))) {
+        std::vector<::ASFW::Audio::Runtime::RateFormation> parsed;
+        bool valid = catalog->getCount() <= 7;
+        for (uint32_t i = 0; valid && i < catalog->getCount(); ++i) {
+            auto* entry = OSDynamicCast(OSDictionary, catalog->getObject(i));
+            if (!entry) { valid = false; break; }
+            auto* rate = OSDynamicCast(OSNumber, entry->getObject(Keys::kCurrentSampleRate));
+            auto* mode = OSDynamicCast(OSNumber, entry->getObject(Keys::kStreamMode));
+            auto* protocol = OSDynamicCast(OSNumber, entry->getObject(Keys::kFormationProtocolSupported));
+            auto* validated = OSDynamicCast(OSNumber, entry->getObject(Keys::kFormationHardwareValidated));
+            if (rate == nullptr || mode == nullptr || protocol == nullptr || validated == nullptr || mode->unsigned32BitValue() > 1 ||
+                !::ASFW::Encoding::AmdtpRateGeometryForSampleRate(rate->unsigned32BitValue()) ||
+                std::ranges::any_of(parsed, [&](const auto& f) { return f.sampleRateHz == rate->unsigned32BitValue(); })) {
+                valid = false; break;
+            }
+            ParsedWireStream playback[kMaxConfiguredStreams]{}, capture[kMaxConfiguredStreams]{};
+            uint32_t playbackCount = 0, captureCount = 0;
+            ParseWireStreams(entry, Keys::kPlaybackStreams, playback, playbackCount);
+            ParseWireStreams(entry, Keys::kCaptureStreams, capture, captureCount);
+            if (!playbackCount || !captureCount) { valid = false; break; }
+            ::ASFW::Audio::Runtime::RateFormation formation{};
+            formation.sampleRateHz = rate->unsigned32BitValue();
+            formation.mode = mode->unsigned32BitValue() == 1
+                ? ::ASFW::Encoding::StreamMode::kBlocking : ::ASFW::Encoding::StreamMode::kNonBlocking;
+            formation.protocolSupported = protocol->unsigned32BitValue() != 0;
+            formation.hardwareValidated = validated->unsigned32BitValue() != 0;
+            if (auto* packed = OSDynamicCast(OSNumber, entry->getObject("ASFWMotuPackedPcm")))
+                formation.packedPcm = packed->unsigned32BitValue() != 0;
+            if (auto* value = OSDynamicCast(OSNumber, entry->getObject("ASFWMotuCaptureMessageChunks")))
+                formation.packedCaptureMessageChunks = value->unsigned32BitValue();
+            if (auto* value = OSDynamicCast(OSNumber, entry->getObject("ASFWMotuPlaybackMessageChunks")))
+                formation.packedPlaybackMessageChunks = value->unsigned32BitValue();
+            for (uint32_t j = 0; j < playbackCount; ++j)
+                formation.playback.push_back({playback[j].pcmChannels, playback[j].am824Slots,
+                    inOutConfig.usesRateFormations ? (playback[j].midiPorts ? 1U : 0U) : playback[j].midiPorts,
+                    playback[j].pcmSlotMap, inOutConfig.usesRateFormations ? playback[j].midiPorts : 0U});
+            for (uint32_t j = 0; j < captureCount; ++j)
+                formation.capture.push_back({capture[j].pcmChannels, capture[j].am824Slots,
+                    inOutConfig.usesRateFormations ? (capture[j].midiPorts ? 1U : 0U) : capture[j].midiPorts,
+                    capture[j].pcmSlotMap, inOutConfig.usesRateFormations ? capture[j].midiPorts : 0U});
+            parsed.push_back(std::move(formation));
+        }
+        if (valid) inOutConfig.rateFormationCandidates = std::move(parsed);
+        else ASFW_LOG(Audio, "AudioDriverConfig: rejected incomplete/ambiguous rate formation catalog");
+    }
     ParsePlugNames(properties, inOutConfig);
     ParseChannelNames(properties, inOutConfig);
+    ParseWireStreams(properties, Keys::kPlaybackStreams,
+                     inOutConfig.playbackStreams, inOutConfig.playbackStreamCount);
+    ParseWireStreams(properties, Keys::kCaptureStreams,
+                     inOutConfig.captureStreams, inOutConfig.captureStreamCount);
+    if (auto* required =
+            OSDynamicCast(OSNumber, properties->getObject(Keys::kResolvedGeometryRequired))) {
+        inOutConfig.resolvedGeometryRequired = required->unsigned32BitValue() != 0;
+    }
+    if (auto* fromDevice =
+            OSDynamicCast(OSNumber, properties->getObject(Keys::kDeviceSampleRates))) {
+        inOutConfig.deviceSampleRates = fromDevice->unsigned32BitValue() != 0;
+    }
     BuildChannelNamesFromPlugs(inOutConfig);
 }
 

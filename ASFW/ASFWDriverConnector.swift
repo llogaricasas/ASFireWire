@@ -11,11 +11,11 @@ final class ASFWDriverConnector: ObservableObject {
         case getBusResetCount = 0
         case getBusResetHistory = 1
         case getControllerStatus = 2
-        case getMetricsSnapshot = 3
+        // 3 retired (FW-171): the driver only ever answered kIOReturnUnsupported.
         case clearHistory = 4
         case getSelfIDCapture = 5
         case getTopologySnapshot = 6
-        case ping = 7
+        // Selector 7 retired (GUI health check).
         case asyncRead = 8
         case asyncWrite = 9
         case registerStatusListener = 10
@@ -40,10 +40,11 @@ final class ASFWDriverConnector: ObservableObject {
         case testCMPDisconnectOPCR = 29
         case testCMPConnectIPCR = 30
         case testCMPDisconnectIPCR = 31
-        // Isoch Stream Control & Metrics
+        // Isoch Stream Control
         case startIsochReceive = 32
         case stopIsochReceive = 33
-        case getIsochRxMetrics = 34
+        // 34/35 retired (FW-171): zeroed metrics / no-op reset. Use
+        // getAudioTelemetry (1013) for audio receive health.
         // IT DMA Allocation (no CMP)
         case startIsochTransmit = 36
         case stopIsochTransmit = 37
@@ -60,6 +61,9 @@ final class ASFWDriverConnector: ObservableObject {
         case requestUserBusReset = 61
         case startAudioStreaming = 62
         case stopAudioStreaming = 63
+        // One unit's FCP exchange log, paged (UserClient/WireFormats/AVCExchangeLogWire.hpp).
+        case getFCPExchangeLog = 65
+        case getAVCDiscoveryDocument = 68
         // Read-only audio telemetry diagnostics.
         case getAudioTelemetry = 1013
         // Driver-owned LogRing category names and named filter presets.
@@ -98,7 +102,7 @@ final class ASFWDriverConnector: ObservableObject {
     // MARK: - Connection State
 
     var connection: io_connect_t = 0
-    let connectionQueue = DispatchQueue(label: "net.mrmidi.ASFWDriverConnector.connection")
+    let connectionQueue = DispatchQueue(label: "net.asfw.app.DriverConnector.connection")
 
     /// Marks `connectionQueue` so `deinit` can tell whether it is already running on
     /// it. The async-notification event handler takes a temporary strong `self` for the

@@ -1,6 +1,8 @@
 #include "FireWireBusImpl.hpp"
 #include "../Bus/TopologyManager.hpp"
+#include "../Bus/TopologySpeed.hpp"
 #include "../Logging/Logging.hpp"
+#include "Interfaces/ILinkSpeedSource.hpp"
 #include <algorithm>
 #include <atomic>
 #include <map>
@@ -57,8 +59,9 @@ void CompleteStaleGenerationAsync(IAsyncControllerPort& async,
 
 } // namespace
 
-FireWireBusImpl::FireWireBusImpl(IAsyncControllerPort& async, Driver::TopologyManager& topo)
-    : async_(async), topo_(topo) {}
+FireWireBusImpl::FireWireBusImpl(IAsyncControllerPort& async, Driver::TopologyManager& topo,
+                                 ILinkSpeedSource* observedSpeeds)
+    : async_(async), topo_(topo), observedSpeeds_(observedSpeeds) {}
 
 AsyncHandle FireWireBusImpl::ReadBlock(FW::Generation gen, FW::NodeId node, FWAddress addr,
                                        uint32_t length, FW::FwSpeed speed,
@@ -119,32 +122,55 @@ AsyncHandle FireWireBusImpl::Lock(FW::Generation gen, FW::NodeId node, FWAddress
 bool FireWireBusImpl::Cancel(AsyncHandle handle) { return async_.Cancel(handle); }
 
 FW::FwSpeed FireWireBusImpl::GetSpeed(FW::NodeId nodeId) const {
-    // Get the latest topology snapshot
-    auto snapshot = topo_.LatestSnapshot();
-    if (!snapshot) {
-        return FW::FwSpeed::S100; // Default to S100 if no topology available
+    // Self-ID bounds the physical path but does not prove the target link layer
+    // will acknowledge requests at that speed. Clamp the path ceiling with
+    // discovery's observed operational speed for this node.
+    //
+    // Linux keeps one speed per device and does exactly this clamping
+    // (references/linux-ohci-firewire-low-level-stack/core-device.c:615-640):
+    // fw_device::max_speed is seeded from Self-ID, probed downwards with test
+    // reads until one completes, and then used for EVERY transaction to that
+    // device (:557, :958, :977, :1132). We previously kept the probe result
+    // private to the Config-ROM scan, so DICE/SBP-2/AV/C re-hit a link already
+    // known to be dead — a Midas Venice F24 advertised S400, answered only at
+    // S200, and its DICE section read timed out for exactly this reason.
+    const FW::FwSpeed advertised = PathSpeedCeiling(nodeId);
+    if (observedSpeeds_ == nullptr) {
+        return advertised;
+    }
+    const auto observed = observedSpeeds_->ObservedSpeed(nodeId);
+    if (!observed) {
+        // No evidence yet is not evidence of a slow link.
+        return advertised;
+    }
+    // Lower of the two. An observation may only ever slow us down: node IDs are
+    // reassigned across bus resets, so a stale entry must not be able to raise a
+    // node above what the current topology says it supports.
+    return static_cast<uint8_t>(*observed) < static_cast<uint8_t>(advertised) ? *observed
+                                                                              : advertised;
+}
+
+bool FireWireBusImpl::RecordVerifiedSpeed(FW::Generation generation, FW::NodeId nodeId,
+                                          FW::FwSpeed speed) {
+    if (observedSpeeds_ == nullptr || !HasCurrentGeneration(async_, generation)) {
+        return false;
+    }
+    observedSpeeds_->RecordVerifiedCeiling(nodeId, speed);
+    return true;
+}
+
+FW::FwSpeed FireWireBusImpl::PathSpeedCeiling(FW::NodeId nodeId) const {
+    const auto snapshot = topo_.LatestSnapshot();
+    if (!snapshot || snapshot->localNodeId == Driver::kInvalidPhysicalId) {
+        return FW::FwSpeed::S100;
     }
 
-    // Find the node in the topology
-    for (const auto& node : snapshot->physical.nodes) {
-        if (node.physicalId == nodeId.value) {
-            // Convert maxSpeedMbps to FwSpeed enum
-            switch (node.maxSpeedMbps) {
-            case 100:
-                return FW::FwSpeed::S100;
-            case 200:
-                return FW::FwSpeed::S200;
-            case 400:
-                return FW::FwSpeed::S400;
-            case 800:
-                return FW::FwSpeed::S800;
-            default:
-                return FW::FwSpeed::S100;
-            }
-        }
-    }
-
-    return FW::FwSpeed::S100; // Default if node not found
+    // A node's Self-ID speed is only its PHY ceiling. Every PHY on the route,
+    // including the host and intermediate repeaters, bounds a transmitted
+    // packet. Keep the bus facade's ceiling consistent with isoch planning.
+    const auto pathSpeed = Driver::PathSpeedCodeBetween(
+        *snapshot, snapshot->localNodeId, nodeId.value);
+    return pathSpeed ? static_cast<FW::FwSpeed>(*pathSpeed) : FW::FwSpeed::S100;
 }
 
 uint32_t FireWireBusImpl::HopCount(FW::NodeId nodeA, FW::NodeId nodeB) const {

@@ -6,6 +6,8 @@
 //
 
 #include "IsochHandler.hpp"
+#include "../../Service/DriverContext.hpp"
+#include "../../Audio/Core/AudioCoordinator.hpp"
 #include "../../Controller/ControllerCore.hpp"
 #include "../../Bus/IRM/IRMClient.hpp"
 #include "../../Isoch/IsochReceiveContext.hpp"
@@ -13,8 +15,7 @@
 #include "../../Logging/Logging.hpp"
 #include "../../Protocols/AVC/AVCDiscovery.hpp"
 #include "../../Protocols/AVC/CMP/CMPClient.hpp"
-#include "../../Protocols/AVC/StreamFormats/AVCSignalFormatCommand.hpp"
-#include "../../Shared/SharedDataModels.hpp"
+#include "../../Protocols/AVC/Commands/GeneralCommands.hpp"
 #include "ASFWDriver.h" // Generated header from .iig
 #include "ControllerCoreAccess.hpp"
 #include <DriverKit/IOLib.h>
@@ -25,6 +26,24 @@ namespace ASFW::UserClient {
 
 IsochHandler::IsochHandler(::ASFWDriver* driver, uint64_t ownerToken)
     : driver_(driver), ownerToken_(ownerToken) {}
+
+kern_return_t IsochHandler::MotuCapture(IOUserClientMethodArguments* args) {
+    if (!args || !args->scalarInput || args->scalarInputCount != 3 ||
+        args->scalarInput[1] >= Driver::IsochService::kMaxStreamsPerDirection ||
+        args->scalarInput[2] > 2) return kIOReturnBadArgument;
+    auto* context = driver_ ? static_cast<ServiceContext*>(driver_->GetServiceContext()) : nullptr;
+    if (!context || !context->audioCoordinator) return kIOReturnNotReady;
+    std::string output;
+    const auto result = context->audioCoordinator->MotuCaptureCommand(
+        args->scalarInput[0], static_cast<uint32_t>(args->scalarInput[1]),
+        static_cast<uint32_t>(args->scalarInput[2]), output);
+    if (result != kIOReturnSuccess) return result;
+    if (args->scalarInput[2] == 2) {
+        args->structureOutput = OSData::withBytes(output.data(), output.size());
+        if (!args->structureOutput) return kIOReturnNoMemory;
+    }
+    return kIOReturnSuccess;
+}
 
 void IsochHandler::ReleaseOwner() noexcept {
     if (driver_ && ownsDVCapture_) {
@@ -57,12 +76,12 @@ kern_return_t IsochHandler::TestIRMAllocation(IOUserClientMethodArguments* args)
     // 1. Get AVC Unit to set Sample Rate
     // Note: We scan for the first available AVC unit for this test
     auto* avcDiscovery = controllerCore->GetAVCDiscovery();
-    auto units = avcDiscovery->GetAllAVCUnits();
+    const auto units = avcDiscovery->Units();
     if (units.empty()) {
         ASFW_LOG(UserClient, "❌ No AVC Unit found for sample rate configuration.");
         return kIOReturnNotFound;
     }
-    auto* avcUnit = units[0]; // Assume first unit is target
+    const auto& avcUnit = units[0]; // Assume first unit is target
 
     // 2. Set Sample Rate to 48kHz using Unit Plug Signal Format (Oxford/Linux style)
     // The Linux driver sets format on Unit Plug 0 (Input and Output).
@@ -73,26 +92,21 @@ kern_return_t IsochHandler::TestIRMAllocation(IOUserClientMethodArguments* args)
 
     ASFW_LOG(UserClient, "Step 1: Setting Unit Plug 0 to 48kHz (Oxford style)...");
 
-    ASFW::Protocols::AVC::AVCCdb cdb;
-    cdb.ctype = static_cast<uint8_t>(ASFW::Protocols::AVC::AVCCommandType::kControl);
-    cdb.subunit = 0xFF; // Unit
-    cdb.opcode = 0x19;  // INPUT PLUG SIGNAL FORMAT
+    AVC::Cmd::PlugSignalFormatOperands ops{
+        .direction = AVC::Cmd::PlugSignalDirection::kInput,
+        .plugId = 0x00,
+        .format = AVC::Cmd::PlugSignalFormat{
+            .plugId = 0x00,
+            .fmt = 0x90, // AM824
+            .fdf = {0x02, 0xFF, 0xFF}, // 48kHz (Standard FDF/SFC code)
+        },
+    };
 
-    cdb.operands[0] = 0x00; // Plug 0
-    cdb.operands[1] = 0x90; // AM824
-    cdb.operands[2] = 0x02; // 48kHz (Standard FDF/SFC code) - Confirmed by Golden Log
-    cdb.operands[3] = 0xFF; // Padding/Sync
-    cdb.operands[4] = 0xFF; // Padding/Sync
-    cdb.operandLength = 5;
-
-    // Use shared_ptr to ensure valid shared_from_this() logic
-    auto cmd = std::make_shared<ASFW::Protocols::AVC::AVCCommand>(avcUnit->GetFCPTransport(), cdb);
-
-    cmd->Submit([irmClient, driver = driver_, cmd](ASFW::Protocols::AVC::AVCResult result,
-                                                   const ASFW::Protocols::AVC::AVCCdb& response) {
-        if (!ASFW::Protocols::AVC::IsSuccess(result)) {
-            ASFW_LOG(UserClient, "❌ Failed to set 48kHz on Unit Plug 0: %d",
-                     static_cast<int>(result));
+    avcUnit->Control(AVC::Cmd::PlugSignalFormatCommand{.operands = ops},
+                     [irmClient, driver = driver_](AVC::Expected<AVC::Cmd::PlugSignalFormat> result) {
+        if (!result) {
+            ASFW_LOG(UserClient, "❌ Failed to set 48kHz on Unit Plug 0: %u",
+                     static_cast<unsigned>(result.error().kind));
             // Fallback or abort? Let's try Output Plug if Input failed, or just abort.
             return;
         }
@@ -339,75 +353,6 @@ kern_return_t IsochHandler::StopDVCapture(IOUserClientMethodArguments* args) {
         ownsDVCapture_ = false;
     }
     return kr;
-}
-
-// ============================================================================
-// Isoch Metrics
-// ============================================================================
-
-kern_return_t IsochHandler::GetIsochRxMetrics(IOUserClientMethodArguments* args) {
-    ASFW_LOG_V3(UserClient, "GetIsochRxMetrics called");
-
-    // Get the isoch receive context to fetch metrics
-    auto* context = static_cast<ASFW::Isoch::IsochReceiveContext*>(
-        driver_->GetIsochReceiveContext());
-    if (!context) {
-        ASFW_LOG_V3(UserClient, "GetIsochRxMetrics: No active context");
-        // Return zeroed snapshot
-        ASFW::Metrics::IsochRxSnapshot snapshot{};
-        OSData* data = OSData::withBytes(&snapshot, sizeof(snapshot));
-        if (!data)
-            return kIOReturnNoMemory;
-        args->structureOutput = data;
-        return kIOReturnSuccess;
-    }
-
-    // Build snapshot (currently zeroes out due to direct-only architecture)
-    ASFW::Metrics::IsochRxSnapshot snapshot{};
-    snapshot.totalPackets = 0;
-    snapshot.dataPackets = 0;
-    snapshot.emptyPackets = 0;
-    snapshot.drops = 0;
-    snapshot.errors = 0;
-
-    // Latency histogram
-    snapshot.latencyHist[0] = 0;
-    snapshot.latencyHist[1] = 0;
-    snapshot.latencyHist[2] = 0;
-    snapshot.latencyHist[3] = 0;
-
-    snapshot.lastPollLatencyUs = 0;
-    snapshot.lastPollPackets = 0;
-
-    // CIP info
-    snapshot.cipSID = 0;
-    snapshot.cipDBS = 0;
-    snapshot.cipFDF = 0;
-    snapshot.cipSYT = 0;
-    snapshot.cipDBC = 0;
-
-    OSData* data = OSData::withBytes(&snapshot, sizeof(snapshot));
-    if (!data)
-        return kIOReturnNoMemory;
-    args->structureOutput = data;
-
-    return kIOReturnSuccess;
-}
-
-kern_return_t IsochHandler::ResetIsochRxMetrics(IOUserClientMethodArguments* arguments) {
-    if (!driver_)
-        return kIOReturnNotReady;
-
-    // Get context
-    auto* context = static_cast<ASFW::Isoch::IsochReceiveContext*>(
-        driver_->GetIsochReceiveContext());
-    if (!context) {
-        return kIOReturnNotReady;
-    }
-
-    ASFW_LOG(UserClient, "ResetIsochRxMetrics: resetting metrics (no-op in direct architecture)");
-
-    return kIOReturnSuccess;
 }
 
 // ============================================================================

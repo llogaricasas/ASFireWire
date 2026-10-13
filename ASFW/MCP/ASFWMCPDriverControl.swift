@@ -1,6 +1,7 @@
 import Foundation
 
 protocol ASFWDriverControlling {
+    func fetchDriverVersion() async -> DriverVersionInfo?
     func fetchTelemetrySnapshot(configuration: ASFWMCPRuntimeConfiguration) async -> ASFWMCPTelemetrySnapshot
     func fetchTopology() async -> ASFWMCPTopologySnapshot?
     func fetchConfigROM(nodeId: UInt32, generation: UInt32) async -> ASFWMCPConfigRomSummary?
@@ -10,6 +11,9 @@ protocol ASFWDriverControlling {
     func listNodes() async -> [ASFWMCPNodeSummary]
     func listAVCUnits() async -> [ASFWMCPAVCUnitSummary]
     func avcSubunitCapabilities(guid: UInt64, type: UInt8, id: UInt8) async -> ASFWMCPAVCSubunitCapabilities?
+    func avcSubunitDescriptor(guid: UInt64, type: UInt8, id: UInt8) async -> Data?
+    /// The unit's versioned discovery document (driver state; no bus traffic).
+    func avcDiscoveryDocument(guid: UInt64) async -> Data?
     func listRecentTransactions(limit: Int) async -> [ASFWMCPTransactionEvent]
     func executeReadQuadlet(_ request: ASFWMCPReadQuadletRequest) async -> ASFWMCPTransactionResult
     func executeReadBlock(_ request: ASFWMCPReadBlockRequest) async -> ASFWMCPTransactionResult
@@ -23,6 +27,8 @@ protocol ASFWDriverControlling {
     func queryLogRecords(_ query: ASFWLogRingQuery) async -> ASFWLogRingQueryResponse?
     func logRingStats() async -> ASFWLogRingStats?
     func fetchAudioStreamHealth() async -> [ASFWMCPAudioStreamHealth]
+    /// Full stable audio telemetry summary (wire v4), or nil when unavailable.
+    func fetchAudioTelemetry() async -> ASFWMCPValue?
 }
 
 actor MockASFWDriverControl: ASFWDriverControlling {
@@ -35,12 +41,18 @@ actor MockASFWDriverControl: ASFWDriverControlling {
     private let topologyValid: Bool
     private let droppedEventCount: UInt32
     private let timeoutCount: UInt32
+    private let driverVersion: DriverVersionInfo?
     private var attemptedWriteCount: Int = 0
     private var duetInputFdf: UInt8 = 0x02
     private var duetOutputFdf: UInt8 = 0x02
     private var phase88Streaming = false
 
+    func fetchDriverVersion() async -> DriverVersionInfo? {
+        driverVersion
+    }
+
     init(
+        driverVersion: DriverVersionInfo? = nil,
         generation: UInt32 = 17,
         nodes: [ASFWMCPNodeSummary] = MockASFWDriverControl.defaultNodes,
         transactions: [ASFWMCPTransactionEvent] = MockASFWDriverControl.defaultTransactions,
@@ -51,6 +63,7 @@ actor MockASFWDriverControl: ASFWDriverControlling {
         droppedEventCount: UInt32 = 0,
         timeoutCount: UInt32 = 0
     ) {
+        self.driverVersion = driverVersion
         self.generation = generation
         self.nodes = nodes
         self.transactions = transactions
@@ -260,6 +273,20 @@ actor MockASFWDriverControl: ASFWDriverControlling {
                 ]
             )]
         )
+    }
+
+    func avcSubunitDescriptor(guid: UInt64, type: UInt8, id: UInt8) async -> Data? {
+        guard (await listAVCUnits()).contains(where: { $0.guid == guid &&
+            $0.subunits.contains(where: { $0.type == type && $0.id == id })
+        }) else {
+            return nil
+        }
+        return Data([0x00, 0x08, 0x02, 0x02, 0x02, 0x02, 0x00, 0x00])
+    }
+
+    func avcDiscoveryDocument(guid: UInt64) async -> Data? {
+        guard (await listAVCUnits()).contains(where: { $0.guid == guid }) else { return nil }
+        return Data(#"{"format":"asfw.avc.discovery","version":1,"session":1,"route":{"guid":"0x0011223344556677","generation":1,"node":0},"snapshot":{"complete":true,"cancelled":false,"terminalError":null,"probeCount":3,"failedProbes":[]},"graph":null,"exchanges":{"session":1,"dropped":0,"records":[]}}"#.utf8)
     }
 
     func listRecentTransactions(limit: Int) async -> [ASFWMCPTransactionEvent] {
@@ -605,6 +632,18 @@ actor MockASFWDriverControl: ASFWDriverControlling {
             replayEntries: 7_936,
             replayEpochResets: 1
         )]
+    }
+
+    func fetchAudioTelemetry() async -> ASFWMCPValue? {
+        // Shape only: the projection itself is covered with the decoder fixture.
+        .object([
+            "wireVersion": .int(4),
+            "captureHostTicks": .uint64(1_000_000),
+            "hostTimebaseNumer": .int(125),
+            "hostTimebaseDenom": .int(3),
+            "endpointCount": .int(0),
+            "endpoints": .array([])
+        ])
     }
 
     func recordUnexpectedWriteAttempt() {

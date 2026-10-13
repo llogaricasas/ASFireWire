@@ -2,7 +2,10 @@
 
 #ifdef ASFW_HOST_TEST
 
+#include <DriverKit/OSObject.h>
+
 #include <cstdint>
+#include <vector>
 
 using IOUserAudioObjectID = uint64_t;
 using IOUserAudioClassID = uint32_t;
@@ -22,9 +25,35 @@ enum IOUserAudioObjectPropertyScope : uint32_t {
     IOUserAudioObjectPropertyScopeGlobal = static_cast<uint32_t>('glob'),
 };
 
+struct IOUserAudioStreamBasicDescription {
+    double mSampleRate{0};
+    IOUserAudioFormatID mFormatID{0};
+    IOUserAudioFormatFlags mFormatFlags{0};
+    uint32_t mBytesPerPacket{0};
+    uint32_t mFramesPerPacket{0};
+    uint32_t mBytesPerFrame{0};
+    uint32_t mChannelsPerFrame{0};
+    uint32_t mBitsPerChannel{0};
+    uint32_t mReserved{0};
+};
+
+// AudioDriverKitTypes.h: how IO is starting or stopping.
+enum class IOUserAudioStartStopFlags : uint64_t {
+    None = 0,
+    Prewarm = (1ULL << 0),
+};
+
+class IOUserAudioStream;
+
 class IOUserAudioDevice {
 public:
     virtual ~IOUserAudioDevice() = default;
+
+    virtual kern_return_t RemoveStream(IOUserAudioStream* stream) {
+        removedStreams.push_back(stream);
+        return kIOReturnSuccess;
+    }
+    std::vector<IOUserAudioStream*> removedStreams;
 
     virtual void GetCurrentZeroTimestamp(uint64_t* sampleTime, uint64_t* hostTime) {
         if (sampleTime) {
@@ -36,9 +65,16 @@ public:
     }
 
     virtual void UpdateCurrentZeroTimestamp(uint64_t, uint64_t) { /* no-op stub */ }
+
+    [[nodiscard]] virtual uint32_t GetZeroTimestampPeriod() const { return zeroTimestampPeriod; }
+
+    [[nodiscard]] uint32_t GetObjectID() const { return objectId; }
+
+    uint32_t zeroTimestampPeriod{0};
+    uint32_t objectId{2};
 };
 
-class IOUserAudioStream {
+class IOUserAudioStream : public OSObject {
 public:
     virtual ~IOUserAudioStream() = default;
 };

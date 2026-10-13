@@ -53,10 +53,14 @@ Plugins/VersionGeneratorPlugin
 # LLM Tools
 
 .claude/
+.agents/
+skills-lock.json
 opencode.json
 
 # Xcode per-user state
 **/xcuserdata/
+ASFW.xcodeproj/xcuserdata/
+ASFW.xcodeproj/project.xcworkspace/xcuserdata/
 
 # Local Codex scratch builds
 build-codex/
@@ -65,7 +69,7 @@ build-codex/
 node_modules/
 
 # Xcode generated projects (XcodeGen output — regenerate with `xcodegen generate`)
-/ASFW.xcodeproj/
+# ASFW.xcodeproj is committed for Xcode Cloud compatibility; project.yml remains source of truth.
 ADKVirtualAudioLab/ADKVirtualAudioLab.xcodeproj/
 
 # In-tree reference stacks (third-party, local only — wire-compat doctrine refs)
@@ -86,6 +90,7 @@ __pycache__/
 
 # Log dumps
 /tools/*.txt
+!/tools/CMakeLists.txt
 /tools/*.log
 
 # mimo

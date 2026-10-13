@@ -11,6 +11,12 @@ inline constexpr const char* kSampleRates = "ASFWSampleRates";
 inline constexpr const char* kGuid = "ASFWGUID";
 inline constexpr const char* kVendorId = "ASFWVendorID";
 inline constexpr const char* kModelId = "ASFWModelID";
+// The profile builder the device catalog resolved for this device, as a
+// uint32. Carried across the nub so the AudioDriverKit side does not repeat
+// the identity match from (vendorId, modelId) -- a pair that cannot express a
+// published model_id of 0 and so cannot identify a MOTU device at all.
+// Absent or zero means "not resolved"; see DeviceProfiles/Audio/AudioDeviceCatalog.hpp.
+inline constexpr const char* kProfileBuilderId = "ASFWProfileBuilderID";
 inline constexpr const char* kInputChannelCount = "ASFWInputChannelCount";
 inline constexpr const char* kOutputChannelCount = "ASFWOutputChannelCount";
 inline constexpr const char* kInputPlugName = "ASFWInputPlugName";
@@ -22,6 +28,59 @@ inline constexpr const char* kInputChannelNames = "ASFWInputChannelNames";
 inline constexpr const char* kOutputChannelNames = "ASFWOutputChannelNames";
 inline constexpr const char* kCurrentSampleRate = "ASFWCurrentSampleRate";
 inline constexpr const char* kStreamMode = "ASFWStreamMode";
+
+// Per-stream wire geometry, resolved from the device's own registers and
+// validated against the profile before publication. OSArray of OSDictionary,
+// one entry per isochronous stream, in stream order.
+//
+// This exists because the aggregate channel counts above cannot describe an
+// asymmetric device. The recorded Midas Venice F24 carries 16 + 8 playback
+// channels; an aggregate of 24 is true but unusable for framing, and the
+// profile's own constants describe an F32 (16 + 16). Without this the audio
+// side had no way to learn the real per-stream shape, so it built packets from
+// compiled-in constants while the transport reserved bandwidth from the device.
+//
+// Directions are named for the HOST: playback is host -> device (DICE RX),
+// capture is device -> host (DICE TX).
+inline constexpr const char* kPlaybackStreams = "ASFWPlaybackStreams";
+inline constexpr const char* kCaptureStreams = "ASFWCaptureStreams";
+// Candidate inventory only: it does not expand HAL advertisement.
+// Preserve the serialized keys used by existing nubs across the neutral API rename.
+inline constexpr const char* kRateRouteIncarnation = "ASFWAvcRouteIncarnation";
+inline constexpr const char* kRateRouteEpoch = "ASFWAvcRouteEpoch";
+inline constexpr const char* kRateBusGeneration = "ASFWAvcBusGeneration";
+inline constexpr const char* kRateFormations = "ASFWRateFormations";
+inline constexpr const char* kUsesRateFormations = "ASFWDiceRateFormations";
+inline constexpr const char* kFormationProtocolSupported = "ProtocolSupported";
+inline constexpr const char* kFormationHardwareValidated = "HardwareValidated";
+
+// Keys within one stream entry.
+inline constexpr const char* kStreamPcmChannels = "PCM";
+inline constexpr const char* kStreamAm824Slots = "Slots";
+inline constexpr const char* kStreamMidiPorts = "MIDI";
+/// First host channel this stream carries: the running sum of the PCM channel
+/// counts of the streams before it, NOT index * width. Those coincide only
+/// while every stream is the same width. The vendor drivers carry the same
+/// running base (AlesisFirewireAudioEngine::CreateStreams advances it by each
+/// stream's own count).
+inline constexpr const char* kStreamPcmSlotMap = "PCMMap";
+inline constexpr const char* kStreamChannelOffset = "Offset";
+
+/// Set when the publisher resolved per-stream geometry from the device and the
+/// audio side must NOT fall back to its profile's constants.
+///
+/// Without this, losing the stream arrays — a failed allocation, a property the
+/// nub rejected — is indistinguishable from a family that never had geometry to
+/// publish, and the fallback silently reinstates exactly the mismatch the
+/// resolution removed. A DICE device that reaches publication has always
+/// resolved its geometry, so absence of the arrays alongside this flag is a
+/// transport fault and must fail rather than degrade.
+inline constexpr const char* kResolvedGeometryRequired = "ASFWResolvedGeometryRequired";
+
+/// The published sample rates are the device's own (DICE CLOCK_CAPABILITIES,
+/// capped at the validated ceiling). The audio side offers exactly these and
+/// does not replace them with a profile's list.
+inline constexpr const char* kDeviceSampleRates = "ASFWDeviceSampleRates";
 
 inline constexpr const char* kBoolClassId = "ClassID";
 inline constexpr const char* kBoolScope = "Scope";

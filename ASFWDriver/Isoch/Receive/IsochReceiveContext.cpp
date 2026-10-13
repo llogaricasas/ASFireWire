@@ -65,6 +65,18 @@ kern_return_t IsochReceiveContext::Configure(uint8_t channel, uint8_t contextInd
 // ============================================================================
 
 kern_return_t IsochReceiveContext::Start() {
+    unsigned waits = 0;
+    while (rxLock_.test_and_set(std::memory_order_acquire)) {
+        if (waits++ == 100) {
+            ASFW_LOG_ERROR(Isoch, "[StopTrace] stage=rx-start-gate context=%u timeout", contextIndex_);
+            return kIOReturnTimeout;
+        }
+        IOSleep(1);
+    }
+    struct GateScope final {
+        std::atomic_flag& gate;
+        ~GateScope() { gate.clear(std::memory_order_release); }
+    } gateScope{rxLock_};
     if (GetState() != IRPolicy::State::Stopped) {
         return kIOReturnInvalid;
     }
@@ -82,32 +94,49 @@ kern_return_t IsochReceiveContext::Start() {
     const uint32_t contextMatch = 0xF0000000 | (channel_ & 0x3F);
     const uint32_t ctlValue = Driver::ContextControl::kRun | Driver::ContextControl::kIsochHeader;
     const uint32_t contextMask = 1u << contextIndex_;
+    uint32_t ctrlBefore = 0;
+    uint32_t pendingEvents = 0;
     {
         auto access = hardware_->TryBeginAccess();
         if (!access) return kIOReturnNotReady;
+        // What the context held before this start (one line per start). The
+        // Set address returns the unmasked events.
+        ctrlBefore = access.Read(registers_.ContextControlSet);
+        pendingEvents = access.Read(ASFW::Driver::Register32::kIsoRecvIntEventSet);
         access.Write(registers_.ContextMatch, contextMatch);
         access.Write(registers_.CommandPtr, cmdPtr);
         access.Write(registers_.ContextControlClear, 0xFFFFFFFFu);
-        access.Write(registers_.ContextControlSet, ctlValue);
+        // Stopping a context sets its event bit (OHCI 1.2 draft §3.1.1.3).
+        // Clear this context's stale bit and unmask it before RUN, as Linux
+        // ohci_start_iso does (ohci.c:3209), so the clear cannot take a
+        // completion of this run.
+        access.Write(ASFW::Driver::Register32::kIsoRecvIntEventClear, contextMask);
         access.Write(ASFW::Driver::Register32::kIsoRecvIntMaskSet, contextMask);
+        access.Write(registers_.ContextControlSet, ctlValue);
     }
-    ASFW_LOG(Isoch, "Start: Enabled IR interrupt for context %u (mask=0x%08x)", contextIndex_, contextMask);
+    ASFW_LOG(Isoch, "IR: start ctx=%u ctrlBefore=0x%08x pendingEvents=0x%08x",
+             contextIndex_, ctrlBefore, pendingEvents);
 
-    while (rxLock_.test_and_set(std::memory_order_acquire)) {
-    }
-
+    IOLockLock(lock_);
     Transition(IRPolicy::State::Running, 0, "Start");
+    IOLockUnlock(lock_);
     rxRing_.ResetForStart();
 
     if (receiveConsumer_) {
         receiveConsumer_->OnReceiveActivated();
     }
-    rxLock_.clear(std::memory_order_release);
     return kIOReturnSuccess;
 }
 
 kern_return_t IsochReceiveContext::Stop() {
+    unsigned waits = 0;
     while (rxLock_.test_and_set(std::memory_order_acquire)) {
+        if (waits++ == 100) {
+            ASFW_LOG_ERROR(Isoch,
+                "[StopTrace] stage=rx-poll-gate context=%u timeout action=retain-binding", contextIndex_);
+            return kIOReturnTimeout;
+        }
+        IOSleep(1);
     }
 
     if (GetState() == IRPolicy::State::Stopped) {
@@ -124,7 +153,9 @@ kern_return_t IsochReceiveContext::Stop() {
             // Provider revocation is proof that this controller cannot issue a
             // late DMA write. Retaining the direct binding in that case turns
             // a safe surprise-removal into a leak/UAF hazard.
+            IOLockLock(lock_);
             Transition(IRPolicy::State::Stopped, 0, "Stop/provider-gone");
+            IOLockUnlock(lock_);
             if (receiveConsumer_) {
                 receiveConsumer_->OnReceiveQuiesced();
             }
@@ -173,13 +204,15 @@ kern_return_t IsochReceiveContext::Stop() {
             ? kIOReturnDMAError
             : kIOReturnTimeout;
         ASFW_LOG_ERROR(Isoch,
-                       "IR: stop did not quiesce context=%u control=0x%08x kr=0x%08x; retaining direct binding",
-                       contextIndex_, control, failure);
+                       "IR: stop did not quiesce context=%u control=0x%08x kr=0x%08x (%{public}s); retaining direct binding",
+                       contextIndex_, control, failure, ASFW::Logging::IOReturnName(failure));
         rxLock_.clear(std::memory_order_release);
         return failure;
     }
 
+    IOLockLock(lock_);
     Transition(IRPolicy::State::Stopped, 0, "Stop");
+    IOLockUnlock(lock_);
 
     if (receiveConsumer_) {
         receiveConsumer_->OnReceiveQuiesced();
@@ -251,19 +284,12 @@ void IsochReceiveContext::SetReceiveConsumer(
     receiveConsumer_ = consumer;
 }
 
-void IsochReceiveContext::LogHardwareState() {
-}
-
 void IsochReceiveContext::DrainZtsTelemetry(uint32_t maxRecords) {
     if (receiveConsumer_) receiveConsumer_->DrainReceiveTelemetry(maxRecords);
 }
 
-void IsochReceiveContext::DrainPayloadWriterTelemetry() {
-    if (receiveConsumer_) receiveConsumer_->DrainPayloadTelemetry();
-}
-
-void IsochReceiveContext::LogTxSytTrace() {
-    if (receiveConsumer_) receiveConsumer_->LogTransmitTimingTrace();
+void IsochReceiveContext::ServiceConsumerDiagnostics() {
+    if (receiveConsumer_) receiveConsumer_->ServiceConsumerDiagnostics();
 }
 
 } // namespace ASFW::Isoch

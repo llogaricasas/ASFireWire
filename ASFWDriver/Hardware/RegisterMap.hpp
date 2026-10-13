@@ -38,12 +38,10 @@ enum class Register32 : uint32_t {
     kIntEventClear = 0x084,
     kIntMaskSet = 0x088,
     kIntMaskClear = 0x08C,
-    kIsoXmitEvent = 0x090, // Read-only: current isochronous transmit interrupt event status
     kIsoXmitIntEventSet = 0x090,
     kIsoXmitIntEventClear = 0x094,
     kIsoXmitIntMaskSet = 0x098,
     kIsoXmitIntMaskClear = 0x09C,
-    kIsoRecvEvent = 0x0A0, // Read-only: current isochronous receive interrupt event status
     kIsoRecvIntEventSet = 0x0A0,
     kIsoRecvIntEventClear = 0x0A4,
     kIsoRecvIntMaskSet = 0x0A8,
@@ -102,7 +100,6 @@ struct HCControlBits {
     static constexpr uint32_t kLinkEnable = 1u << 17;
     static constexpr uint32_t kPostedWriteEnable = 1u << 18;
     static constexpr uint32_t kLPS = 1u << 19;
-    static constexpr uint32_t kCycleMatchEnable = 1u << 20;
     static constexpr uint32_t kAPhyEnhanceEnable =
         1u << 22; // OHCI §5.7.2: Enable IEEE1394a enhancements in Link
     static constexpr uint32_t kProgramPhyEnable = 1u << 23;

@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include "ResolvedTimingGeometry.hpp"
+#include "../Wire/AMDTP/PcmSlotMap.hpp"
+
+#include <span>
+#include <vector>
+#include <algorithm>
+
+namespace ASFW::Audio::Runtime {
+
+// Packed MOTU capture can carry 34 PCM channels in only 28 quadlets (both
+// ADAT banks at 1x). Host buffer/name capacity is distinct from the 32-slot
+// AM824 map and its bit masks. Linux motu-protocol-v3.c:209-239,274-281.
+inline constexpr uint32_t kMaxPackedPcmChannels = 34;
+inline constexpr uint32_t kMaxHostPcmChannels = kMaxPackedPcmChannels;
+
+// A formation describes one rate, not the shape observed at discovery time.
+// Protocol adapters supply these facts; generic code never scales ADAT widths.
+struct RateWireStream final {
+    uint32_t pcmChannels{0};
+    uint32_t dataBlockSize{0};
+    uint32_t midiSlots{0};
+    Wire::PcmSlotMap pcmSlots{};
+    // DICE multiplexes up to eight physical ports into one AM824 slot.
+    uint32_t midiPortCount{0};
+    friend bool operator==(const RateWireStream&, const RateWireStream&) = default;
+};
+
+struct RateFormation final {
+    uint32_t sampleRateHz{0};
+    Encoding::StreamMode mode{Encoding::StreamMode::kBlocking};
+    std::vector<RateWireStream> playback;
+    std::vector<RateWireStream> capture;
+    bool protocolSupported{false};
+    bool hardwareValidated{false};
+    bool packedPcm{false}; // MOTU: 3-byte chunks, not PCM quadlet slots.
+    uint32_t packedCaptureMessageChunks{2};
+    uint32_t packedPlaybackMessageChunks{2};
+    friend bool operator==(const RateFormation&, const RateFormation&) = default;
+};
+
+[[nodiscard]] inline uint32_t HostChannelLimit(std::span<const RateFormation> formations) noexcept {
+    return std::ranges::any_of(formations, &RateFormation::packedPcm)
+        ? kMaxPackedPcmChannels : Encoding::kMaxPcmChannels;
+}
+
+struct ConfigurationAllocation final {
+    uint32_t frameCapacity{0};
+    uint32_t playbackChannelCapacity{0};
+    uint32_t captureChannelCapacity{0};
+    uint32_t maxPacketBytes{0};
+    friend bool operator==(const ConfigurationAllocation&, const ConfigurationAllocation&) = default;
+};
+
+enum class ConfigurationError : uint8_t {
+    RateNotOffered, ProtocolUnsupported, HardwareUnvalidated,
+    InvalidFormation, InvalidTiming, ExceedsAllocation,
+};
+
+// Hardware batches use an explicitly opted-in build. This exemption never
+// changes the capability's hardwareValidated record.
+enum class ConfigurationValidationPolicy : uint8_t { ValidatedOnly, HardwareBatch };
+
+struct ResolvedAudioConfiguration final {
+    uint64_t revision{0};
+    RateFormation formation;
+    ResolvedTimingGeometry timing;
+    ConfigurationAllocation allocation;
+    uint32_t playbackChannels{0};
+    uint32_t captureChannels{0};
+    uint32_t maxPacketFrames{0};
+    uint64_t playbackAllocationBytes{0};
+    uint64_t captureAllocationBytes{0};
+};
+
+// Returned values become immutable snapshots at the coordinator boundary.
+// Validation is side-effect free and shares the existing timing authority.
+[[nodiscard]] inline std::expected<ResolvedAudioConfiguration, ConfigurationError>
+ResolveAudioConfiguration(uint32_t rate, std::span<const RateFormation> formations,
+                          const DeviceTimingPolicy& policy,
+                          ConfigurationAllocation allocation,
+                          uint64_t revision,
+                          ConfigurationValidationPolicy validation = ConfigurationValidationPolicy::ValidatedOnly) {
+    const RateFormation* selected = nullptr;
+    for (const auto& formation : formations) {
+        if (formation.sampleRateHz != rate) continue;
+        if (selected) return std::unexpected(ConfigurationError::InvalidFormation);
+        selected = &formation;
+    }
+    if (!selected) return std::unexpected(ConfigurationError::RateNotOffered);
+    if (!selected->protocolSupported) return std::unexpected(ConfigurationError::ProtocolUnsupported);
+    if (!selected->hardwareValidated && validation != ConfigurationValidationPolicy::HardwareBatch)
+        return std::unexpected(ConfigurationError::HardwareUnvalidated);
+    const auto channelLimit = selected->packedPcm ? kMaxPackedPcmChannels : Encoding::kMaxPcmChannels;
+    if ((selected->mode != Encoding::StreamMode::kBlocking &&
+         selected->mode != Encoding::StreamMode::kNonBlocking) ||
+        allocation.playbackChannelCapacity > channelLimit ||
+        allocation.captureChannelCapacity > channelLimit)
+        return std::unexpected(ConfigurationError::InvalidFormation);
+    const auto timing = ResolveTimingGeometry(rate, selected->mode, policy, allocation.frameCapacity);
+    if (!timing) return std::unexpected(ConfigurationError::InvalidTiming);
+    const auto geometry = Encoding::AmdtpRateGeometryForSampleRate(rate);
+    const uint32_t packetFrames = selected->mode == Encoding::StreamMode::kBlocking
+        ? geometry->sytIntervalFrames : geometry->nominalFramesPerCycle;
+    if (selected->playback.size() > 4 || selected->capture.size() > 4)
+        return std::unexpected(ConfigurationError::InvalidFormation);
+    if (selected->playback.empty() && selected->capture.empty())
+        return std::unexpected(ConfigurationError::InvalidFormation);
+    const auto validateDirection = [&](const auto& streams, uint32_t capacity, uint32_t messageChunks)
+        -> std::expected<uint32_t, ConfigurationError> {
+        uint32_t channels = 0;
+        for (const auto& stream : streams) {
+            if (!stream.pcmChannels || stream.pcmChannels > channelLimit ||
+                stream.dataBlockSize > Encoding::kMaxAmdtpDbs ||
+                stream.midiSlots > stream.dataBlockSize ||
+                (selected->packedPcm
+                    ? (stream.midiSlots != 0 || !stream.pcmSlots.IsIdentity() ||
+                       messageChunks > 2 ||
+                       stream.dataBlockSize != 1 + ((messageChunks + stream.pcmChannels) * 3 + 3) / 4)
+                    : (stream.pcmChannels > stream.dataBlockSize - stream.midiSlots ||
+                       !stream.pcmSlots.FitsWithin(stream.pcmChannels, stream.dataBlockSize))))
+                return std::unexpected(ConfigurationError::InvalidFormation);
+            uint32_t used = 0;
+            for (uint32_t channel = 0; !selected->packedPcm && channel < stream.pcmChannels; ++channel) {
+                const uint32_t bit = uint32_t{1} << stream.pcmSlots.SlotFor(channel);
+                if (used & bit) return std::unexpected(ConfigurationError::InvalidFormation);
+                used |= bit;
+            }
+            if (uint64_t{8} + uint64_t(packetFrames) * stream.dataBlockSize * 4 > allocation.maxPacketBytes)
+                return std::unexpected(ConfigurationError::ExceedsAllocation);
+            if (stream.pcmChannels > capacity || channels > capacity - stream.pcmChannels)
+                return std::unexpected(ConfigurationError::ExceedsAllocation);
+            channels += stream.pcmChannels;
+        }
+        return channels;
+    };
+    const auto playback = validateDirection(selected->playback, allocation.playbackChannelCapacity, selected->packedPlaybackMessageChunks);
+    if (!playback) return std::unexpected(playback.error());
+    const auto capture = validateDirection(selected->capture, allocation.captureChannelCapacity, selected->packedCaptureMessageChunks);
+    if (!capture) return std::unexpected(capture.error());
+    return ResolvedAudioConfiguration{
+        .revision = revision, .formation = *selected, .timing = *timing,
+        .allocation = allocation, .playbackChannels = *playback, .captureChannels = *capture,
+        .maxPacketFrames = packetFrames,
+        .playbackAllocationBytes = uint64_t(allocation.frameCapacity) * allocation.playbackChannelCapacity * 4,
+        .captureAllocationBytes = uint64_t(allocation.frameCapacity) * allocation.captureChannelCapacity * 4,
+    };
+}
+
+// Capacity is independent of the active format. Reserve once for the largest
+// complete formation; changing a rate must not replace mappings held by ADK.
+[[nodiscard]] inline std::expected<ConfigurationAllocation, ConfigurationError>
+MaximumFormationAllocation(std::span<const RateFormation> formations,
+                           ConfigurationAllocation baseline) {
+    constexpr DeviceTimingPolicy probePolicy{64, 64, 128, 128};
+    auto result = baseline;
+    for (const auto& formation : formations) {
+        const auto limit = formation.packedPcm ? kMaxPackedPcmChannels : Encoding::kMaxPcmChannels;
+        const ConfigurationAllocation ceiling{49152, limit, limit, 4104};
+        const auto resolved = ResolveAudioConfiguration(formation.sampleRateHz, formations,
+            probePolicy, ceiling, 0, ConfigurationValidationPolicy::HardwareBatch);
+        if (!resolved) return std::unexpected(resolved.error());
+        result.frameCapacity = std::max(result.frameCapacity, resolved->timing.frameRingFrames);
+        result.playbackChannelCapacity = std::max(result.playbackChannelCapacity, resolved->playbackChannels);
+        result.captureChannelCapacity = std::max(result.captureChannelCapacity, resolved->captureChannels);
+        for (const auto& direction : {std::span(formation.playback), std::span(formation.capture)})
+            for (const auto& stream : direction)
+                result.maxPacketBytes = std::max(result.maxPacketBytes,
+                    8U + resolved->maxPacketFrames * stream.dataBlockSize * 4U);
+    }
+    return result;
+}
+
+} // namespace ASFW::Audio::Runtime

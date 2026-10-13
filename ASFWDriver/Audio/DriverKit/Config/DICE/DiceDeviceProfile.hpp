@@ -15,29 +15,14 @@
 
 namespace ASFW::Isoch::Audio::DICE {
 
-struct DiceDeviceIdentity final {
-    uint64_t guid{0};
-    uint32_t vendorId{0};
-    uint32_t modelId{0};
-};
-
 class IDiceDeviceProfile : public IAudioStreamProfile {
 public:
     virtual ~IDiceDeviceProfile() override = default;
 
-    /// Returns true if this profile matches the given hardware vendor, model, or GUID.
-    [[nodiscard]] virtual bool Matches(const DiceDeviceIdentity& identity) const noexcept = 0;
+
 
     /// Returns the DICE specific hardware/software quirks (e.g. PCM format, DBS policy).
     [[nodiscard]] virtual DiceDeviceQuirks Quirks() const noexcept = 0;
-
-    /// Sample rates advertised to CoreAudio. Default is the universal DICE 1x
-    /// baseline (44.1/48 kHz); 2x/4x are omitted until their stream geometry is
-    /// verified end-to-end (see kDiceMaxSupportedRateHz). Profiles for devices
-    /// with a different 1x set may override.
-    [[nodiscard]] std::vector<uint32_t> SupportedSampleRates() const override {
-        return {44100u, 48000u};
-    }
 
     // DICE control profiles retain their wire-format and quirk policy here;
     // neutral stream geometry lives in IAudioStreamProfile.

@@ -152,8 +152,8 @@ void ApogeeVendorCommand::AppendControlValue(std::vector<uint8_t>& operands) con
             break;
         case Code::MixerSrc:
             // Gain is big-endian on the wire, like every IEEE 1394 payload.
-            operands.push_back(static_cast<uint8_t>((u16Value >> 8U) & 0xFFU));
-            operands.push_back(static_cast<uint8_t>(u16Value & 0xFFU));
+            operands.push_back(::ASFW::AVC::HighByte(u16Value));
+            operands.push_back(::ASFW::AVC::LowByte(u16Value));
             break;
         case Code::HwState:
             operands.insert(operands.end(), hwState.begin(), hwState.end());
@@ -240,6 +240,15 @@ bool ApogeeVendorCommand::ParseStatusPayload(std::span<const uint8_t> payload) {
     }
 
     return false;
+}
+
+bool ApogeeVendorCommand::ParseStatusPayload(::ASFW::AVC::CompanyId companyId,
+                                             std::span<const uint8_t> payload) {
+    std::vector<uint8_t> completeOperands;
+    completeOperands.reserve(companyId.size() + payload.size());
+    completeOperands.insert(completeOperands.end(), companyId.begin(), companyId.end());
+    completeOperands.insert(completeOperands.end(), payload.begin(), payload.end());
+    return ParseStatusPayload(completeOperands);
 }
 
 } // namespace ASFW::Audio::Oxford::Apogee

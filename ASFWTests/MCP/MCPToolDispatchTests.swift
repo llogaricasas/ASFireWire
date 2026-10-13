@@ -2,6 +2,27 @@ import Testing
 @testable import ASFW
 
 struct MCPToolDispatchTests {
+    @Test func bebobShellDiagnosticsNeverWriteWhenPolicyIsClosed() async {
+        let driver = MockASFWDriverControl()
+        let core = ASFWMCPCore(configuration: .readOnlyDeveloper, driver: driver)
+        let result = await core.callTool(name: "asfw_bebob_get_streaming_stats", arguments: .object([
+            "nodeId": .int(1), "generation": .int(17)
+        ]))
+        #expect(!result.ok)
+        #expect(await driver.unexpectedWriteAttemptCount() == 0)
+    }
+
+    @Test func bebobShellRejectsMultipleLinesBeforeAnyWrite() async {
+        let driver = MockASFWDriverControl()
+        let core = ASFWMCPCore(configuration: gateOpen, driver: driver)
+        let result = await core.callTool(name: "asfw_bebob_shell_execute", arguments: .object([
+            "nodeId": .int(1), "generation": .int(17),
+            "command": .string("fw show\nfw flash")
+        ]))
+        #expect(!result.ok)
+        #expect(await driver.unexpectedWriteAttemptCount() == 0)
+    }
+
     private var gateOpen: ASFWMCPRuntimeConfiguration {
         ASFWMCPRuntimeConfiguration(
             mode: .developerWriteEnabled,
@@ -263,6 +284,58 @@ struct MCPToolDispatchTests {
         ])
 
         let result = await transport.callTool("asfw_avc_get_subunit_capabilities", arguments: args)
+
+        #expect(result.ok == false)
+        #expect(result.errors.first?.code == .capabilityUnavailable)
+        #expect(await driver.unexpectedWriteAttemptCount() == 0)
+    }
+
+    @Test func discoveryDocumentToolReturnsTheDocumentWithoutBusTraffic() async throws {
+        let driver = MockASFWDriverControl()
+        let transport = ASFWMCPMockTransport(core: ASFWMCPCore(configuration: .readOnlyDeveloper, driver: driver))
+        let result = await transport.callTool("asfw_avc_get_discovery_document",
+                                              arguments: .object(["targetGuid": .uint64(0x0011223344556677)]))
+        let data = try object(result)
+        #expect(result.ok)
+        #expect(data["kind"] == .string("avcDiscoveryDocument"))
+        guard case .object(let document)? = data["document"] else { Issue.record("no document object"); return }
+        #expect(document["format"] == .string("asfw.avc.discovery"))
+        #expect(document["version"] == .int(1))
+        guard case .object(let snapshot)? = document["snapshot"] else { Issue.record("no snapshot"); return }
+        #expect(snapshot["complete"] == .bool(true))
+        #expect(await driver.unexpectedWriteAttemptCount() == 0)
+    }
+
+    @Test func avcDescriptorReturnsDescriptorHexForDiscoveredSubunit() async throws {
+        let driver = MockASFWDriverControl()
+        let transport = ASFWMCPMockTransport(core: ASFWMCPCore(configuration: .readOnlyDeveloper, driver: driver))
+        let args: ASFWMCPValue = .object([
+            "targetGuid": .uint64(0x0011223344556677),
+            "subunitType": .int(0x0C),
+            "subunitId": .int(0),
+        ])
+
+        let result = await transport.callTool("asfw_avc_get_subunit_descriptor", arguments: args)
+        let data = try object(result)
+
+        #expect(result.ok)
+        #expect(data["kind"] == .string("avcSubunitDescriptor"))
+        #expect(data["targetGuid"] == .string("0x0011223344556677"))
+        #expect(data["byteCount"] == .int(8))
+        #expect(data["hex"] == .string("0008020202020000"))
+        #expect(await driver.unexpectedWriteAttemptCount() == 0)
+    }
+
+    @Test func avcDescriptorRefusesUnavailableDiscoveryTarget() async {
+        let driver = MockASFWDriverControl()
+        let transport = ASFWMCPMockTransport(core: ASFWMCPCore(configuration: .readOnlyDeveloper, driver: driver))
+        let args: ASFWMCPValue = .object([
+            "targetGuid": .uint64(0xDEAD_BEEF_0000_0001),
+            "subunitType": .int(0x0C),
+            "subunitId": .int(0),
+        ])
+
+        let result = await transport.callTool("asfw_avc_get_subunit_descriptor", arguments: args)
 
         #expect(result.ok == false)
         #expect(result.errors.first?.code == .capabilityUnavailable)

@@ -39,7 +39,13 @@ enum class ITState {
     Unconfigured,
     Configured,
     Running,
-    Stopped
+    Stopped,
+    // A transport fault cleared RUN, but the context may still be ACTIVE:
+    // after RUN is cleared, ACTIVE may stay set while in-flight operations
+    // complete (OHCI 1.1 §3.1.1). Only Stop() leaves this state, once it has
+    // seen ACTIVE clear; until then the context is neither restarted nor given
+    // new memory.
+    Faulted
 };
 
 /**
@@ -63,7 +69,9 @@ public:
         Driver::HardwareInterface* hw,
         std::shared_ptr<Memory::IIsochDMAMemory> dmaMemory) noexcept;
 
-    kern_return_t Configure(uint8_t channel, uint8_t sid) noexcept;
+    /// @param speed Wire speed for transmitted packets. Required, and must be
+    /// the same speed the reservation charged the IRM for.
+    kern_return_t Configure(uint8_t channel, uint8_t sid, FW::FwSpeed speed) noexcept;
 
     // Select which OHCI IT hardware context backs this stream. Defaults to 0
     // (master); secondary streams must use their own context (== streamIndex) or
@@ -94,15 +102,31 @@ public:
     void SetTxPreparationCallback(TxPreparationCallback callback) noexcept;
 
     State GetState() const noexcept { return state_; }
+    // Running or Faulted: DMA may be active, so the context's memory bindings
+    // must stay until Stop() has quiesced it.
+    [[nodiscard]] bool NeedsQuiesce() const noexcept {
+        return state_ == State::Running || state_ == State::Faulted;
+    }
     
     uint64_t PacketsAssembled() const noexcept { return packetsAssembled_; }
     
-    void LogStatistics() const noexcept;
     void DumpDescriptorRing(uint32_t startPacket = 0, uint32_t numPackets = 8) const noexcept;
 
+#ifdef ASFW_HOST_TEST
+    // Host tests stand in for the controller: they write OUTPUT_LAST status
+    // into the slab to say which packets it finished.
+    Tx::IsochTxDmaRing& RingForTesting() noexcept { return ring_; }
+    bool AcquireRefillGateForTesting() noexcept {
+        return !refillInProgress_.test_and_set(std::memory_order_acquire);
+    }
+    void ReleaseRefillGateForTesting() noexcept {
+        refillInProgress_.clear(std::memory_order_release);
+    }
+#endif
+
 private:
-    void WakeHardware() noexcept;
     void DoRefillOnce(uint64_t eventHostTicks, bool publishTimingEvent) noexcept;
+    // Caller holds refillInProgress_ and no HardwareAccessScope.
     void StopImmediatelyForTxFault() noexcept;
 
     // ==========================================================================
@@ -110,8 +134,9 @@ private:
     // ==========================================================================
     Tx::IsochTxDmaRing ring_{};
 
-    State state_{State::Unconfigured};
+    std::atomic<State> state_{State::Unconfigured};
     uint8_t channel_{0};
+    FW::FwSpeed speed_{FW::FwSpeed::S400};
     uint8_t contextIndex_{0};
     
     Driver::HardwareInterface* hardware_{nullptr};
@@ -127,19 +152,13 @@ private:
     uint32_t irqStallTicks_{0};
 
     // Consecutive watchdog kicks with zero interrupts observed. The watchdog
-    // bridges interrupt-delivery jitter only: its cadence is far coarser than
-    // the 48-packet descriptor ring, so a stream carried by the watchdog
-    // re-transmits stale ring laps between kicks. A sustained silent streak
-    // is a dead interrupt path and the context must stop honestly.
+    // bridges interrupt-delivery jitter only. Before the finite IT queue (T5)
+    // a watchdog-carried stream re-transmitted stale ring laps between kicks;
+    // now the queue stops at its mapped end instead. Either way a sustained
+    // silent streak is a dead interrupt path and the context stops honestly.
     static constexpr uint32_t kIrqSilentKickFatalThreshold = 16;
     uint32_t irqSilentKickStreak_{0};
 
-    // Refill Latency Histogram (buckets: <50us, 50-200us, 200-500us, >500us)
-    std::atomic<uint64_t> latencyBucket0_{0};
-    std::atomic<uint64_t> latencyBucket1_{0};
-    std::atomic<uint64_t> latencyBucket2_{0};
-    std::atomic<uint64_t> latencyBucket3_{0};
-    std::atomic<uint32_t> maxRefillLatencyUs_{0};
     std::atomic<uint64_t> irqWatchdogKicks_{0};
     TxPreparationCallback txPreparationCallback_{};
 

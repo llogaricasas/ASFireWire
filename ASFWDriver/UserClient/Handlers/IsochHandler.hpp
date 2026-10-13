@@ -34,6 +34,8 @@ public:
     kern_return_t TestCMPConnectIPCR(IOUserClientMethodArguments* args);
     kern_return_t TestCMPDisconnectIPCR(IOUserClientMethodArguments* args);
 
+    kern_return_t MotuCapture(IOUserClientMethodArguments* args);
+
     // Isoch Streaming Control
     kern_return_t StartIsochReceive(IOUserClientMethodArguments* args);
     kern_return_t StopIsochReceive(IOUserClientMethodArguments* args);
@@ -43,8 +45,6 @@ public:
     kern_return_t StopDVCapture(IOUserClientMethodArguments* args);
     
     // Isoch Metrics
-    kern_return_t GetIsochRxMetrics(IOUserClientMethodArguments* args);
-    kern_return_t ResetIsochRxMetrics(IOUserClientMethodArguments* args);
     
     // IT Streaming Control (DMA allocation only - no CMP)
     kern_return_t StartIsochTransmit(IOUserClientMethodArguments* args);

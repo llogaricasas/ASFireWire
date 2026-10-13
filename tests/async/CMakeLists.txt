@@ -62,10 +62,32 @@ add_async_test(DescriptorRingDMATests
     DescriptorRingDMATests.cpp
     "${ASFW_DRIVER_DIR}/Shared/Rings/DescriptorRing.cpp"
 )
+add_async_test(ATManagerHotAppendTests
+    ATManagerHotAppendTests.cpp
+    "${ASFW_DRIVER_DIR}/Async/Engine/ATTrace.cpp"
+    "${ASFW_DRIVER_DIR}/Common/BarrierUtils.cpp"
+    "${ASFW_DRIVER_DIR}/Async/Tx/DescriptorBuilder.cpp"
+    "${ASFW_DRIVER_DIR}/Shared/Memory/DMAMemoryManager.cpp"
+    "${ASFW_DRIVER_DIR}/Shared/Rings/DescriptorRing.cpp"
+)
+
+add_async_test(ATCompletionScanTests
+    ATCompletionScanTests.cpp
+    "${ASFW_DRIVER_DIR}/Async/Engine/ATTrace.cpp"
+    "${ASFW_DRIVER_DIR}/Common/BarrierUtils.cpp"
+    "${ASFW_DRIVER_DIR}/Async/Tx/DescriptorBuilder.cpp"
+    "${ASFW_DRIVER_DIR}/Shared/Memory/DMAMemoryManager.cpp"
+    "${ASFW_DRIVER_DIR}/Shared/Rings/DescriptorRing.cpp"
+)
 
 # AT Descriptor Tests
 add_async_test(ATDescriptorTests
     ATDescriptorTests.cpp
+)
+
+# ContextBase ContextControl bit decoding
+add_async_test(ContextBaseTests
+    ContextBaseTests.cpp
 )
 
 # Buffer Ring DMA Tests
@@ -84,6 +106,14 @@ add_async_test(ARStreamProcessorTests
     "${ASFW_DRIVER_DIR}/Common/BarrierUtils.cpp"
 )
 
+# AR Stream fuzz (randomized OHCI bufferFill hardware model, long-run framing)
+add_async_test(ARStreamFuzzTests
+    ARStreamFuzzTests.cpp
+    "${ASFW_DRIVER_DIR}/Shared/Rings/BufferRing.cpp"
+    "${ASFW_DRIVER_DIR}/Async/Rx/ARPacketParser.cpp"
+    "${ASFW_DRIVER_DIR}/Common/BarrierUtils.cpp"
+)
+
 # Synthetic bus-reset marker decoding (quadlet offset vs Linux/Apple)
 add_async_test(BusResetMarkerTests
     BusResetMarkerTests.cpp
@@ -97,6 +127,22 @@ add_async_test(LabelAllocatorTests
 )
 
 # Async Bus Contract Tests
+# Link speed: Self-ID advertisement clamped by observed evidence
+add_async_test(LinkSpeedClampTests
+    LinkSpeedClampTests.cpp
+    "../support/AsyncSubsystemContractStub.cpp"
+    "${ASFW_DRIVER_DIR}/Async/FireWireBusImpl.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/TopologyManager.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/SelfIDStreamParser.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/SelfIDTopologyNormalizer.cpp"
+    "${ASFW_DRIVER_DIR}/Bus/GenerationTracker.cpp"
+    "${ASFW_DRIVER_DIR}/Async/Track/LabelAllocator.cpp"
+    "${ASFW_DRIVER_DIR}/Async/Track/PayloadRegistry.cpp"
+    "${ASFW_DRIVER_DIR}/Async/Core/Transaction.cpp"
+    "${ASFW_DRIVER_DIR}/Async/Core/TransactionManager.cpp"
+    "${ASFW_DRIVER_DIR}/Discovery/SpeedPolicy.cpp"
+)
+
 add_async_test(AsyncBusContractTests
     AsyncBusContractTests.cpp
     "../support/AsyncSubsystemContractStub.cpp"

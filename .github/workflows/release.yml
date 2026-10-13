@@ -29,9 +29,10 @@ jobs:
   # The Swift path is deliberately NOT used as a gate: run_swift_tests pipes xcodebuild
   # into `grep ... || true`, so it reports success even when tests fail (build.sh:235).
   # Swift/XCTest coverage comes from build-and-test.yml on PRs and main.
+  # C++26 needs the Xcode 27 toolchain; see build-and-test.yml.
   test:
     name: C++ tests
-    runs-on: macos-26
+    runs-on: xcode-27
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
     steps:
@@ -45,7 +46,7 @@ jobs:
   release:
     name: Build & package unsigned
     needs: test
-    runs-on: macos-26
+    runs-on: xcode-27
     env:
       CONFIGURATION: Release
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
@@ -56,6 +57,11 @@ jobs:
         run: |
           xcode-select -p
           xcodebuild -version
+
+      - name: Install Metal toolchain
+        # Xcode 26+ ships the Metal compiler as a separate component; the
+        # analyzer's .metal shaders need it and the runner image lacks it.
+        run: xcodebuild -downloadComponent MetalToolchain
 
       # Derive every version string from the tag so they cannot drift apart.
       # There are two independent sources in the repo:
@@ -147,6 +153,9 @@ jobs:
           fi
           cat >> NOTES.md <<EOF
           ## Install
+
+          Signed builds are available at **[asfw.net](https://www.asfw.net)** for now.
+          This GitHub release remains an unsigned tester bundle.
 
           Experimental prebuilt tester bundle — the app is unsigned until \`install.sh\` runs locally.
           The installer checks that SIP is disabled, ad-hoc signs the app and dext, and copies

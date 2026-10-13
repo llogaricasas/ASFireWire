@@ -7,6 +7,7 @@
 //
 
 #define _LIBCPP_NO_ABI_TAG 1
+#include "Audio/Protocols/AVC/DiscoveryCoordinator.hpp"
 #include <DriverKit/DriverKit.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
 #include <DriverKit/IODispatchQueue.h>
@@ -28,10 +29,11 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include "Common/ActionTeardown.hpp"
 #include <string>
 
-#include <net.mrmidi.ASFW.ASFWDriver/ASFWDriver.h>           // generated from .iig
-#include <net.mrmidi.ASFW.ASFWDriver/ASFWDriverUserClient.h> // generated from .iig
+#include <net.asfw.driver/ASFWDriver.h>           // generated from .iig
+#include <net.asfw.driver/ASFWDriverUserClient.h> // generated from .iig
 
 #include "Async/AsyncSubsystem.hpp"
 #include "Async/DMAMemoryImpl.hpp"
@@ -56,6 +58,7 @@
 #include "Discovery/DeviceRegistry.hpp"
 #include "Discovery/FWDevice.hpp"
 #include "Hardware/HardwareInterface.hpp"
+#include "Hardware/InterruptDrain.hpp"
 #include "Hardware/InterruptManager.hpp"
 #include "Hardware/OHCIConstants.hpp"
 #include "Hardware/RegisterMap.hpp"
@@ -76,7 +79,7 @@
 #include "SCSIController/SBP2NubPublisher.hpp"
 #include "SCSIController/SBP2TargetBridge.hpp"
 #include "Shared/Memory/DMAMemoryManager.hpp"
-#include <net.mrmidi.ASFW.ASFWDriver/ASFWAudioNub.h>
+#include <net.asfw.driver/ASFWAudioNub.h>
 
 using namespace ASFW::Driver;
 
@@ -305,6 +308,7 @@ bool ASFWDriver::init() {
 }
 
 void ASFWDriver::free() {
+    ASFW_LOG(Controller, "ASFWDriver: free()");
     if (ivars) {
         if (ivars->context) {
             ivars->context->Reset();
@@ -404,7 +408,8 @@ kern_return_t ASFWDriver::StartRuntime(IOService* provider) {
     // Initialize AsyncSubsystem (requires hardware, workQueue, and a completion action)
     if (ctx.deps.asyncSubsystem && ctx.deps.hardware && ctx.workQueue && ctx.interruptAction) {
         kr = ctx.deps.asyncSubsystem->Start(*ctx.deps.hardware, this, ctx.workQueue.get(),
-                                            ctx.interruptAction.get());
+                                            ctx.interruptAction.get(), size_t{64} * 1024u,
+                                            ctx.teardownCompletion);
         if (kr != kIOReturnSuccess) {
             ASFW_LOG(Controller, "AsyncSubsystem::Start() failed: 0x%08x", kr);
             return failStart(kr, "async subsystem start failed");
@@ -436,7 +441,8 @@ kern_return_t ASFWDriver::StartRuntime(IOService* provider) {
         auto& bus = ctx.controller->Bus();
         ctx.deps.avcDiscovery = std::make_shared<ASFW::Protocols::AVC::AVCDiscovery>(
             this, *ctx.deps.deviceRegistry, *ctx.deps.deviceManager, bus, bus, *ctx.deps.sbp2SessionScheduler,
-            ctx.audioCoordinator.get());
+            std::make_shared<ASFW::Audio::AVC::DiscoveryCoordinator>(
+                *ctx.deps.deviceRegistry, bus, bus, ctx.audioCoordinator.get()));
         ctx.controller->SetAVCDiscovery(ctx.deps.avcDiscovery);
         ASFW_LOG(Controller, "✅ AVCDiscovery initialized");
     }
@@ -480,6 +486,7 @@ kern_return_t ASFWDriver::StartRuntime(IOService* provider) {
 
     if (ctx.audioCoordinator) {
         ctx.audioCoordinator->SetCMPClient(ctx.deps.cmpClient.get());
+        ctx.audioCoordinator->SetIRMClient(ctx.deps.irmClient.get());
     }
 
     // Allocate the queryable log ring before configuration so its
@@ -520,7 +527,28 @@ kern_return_t ASFWDriver::StartRuntime(IOService* provider) {
 }
 
 kern_return_t IMPL(ASFWDriver, Stop) {
-    RequestRuntimeQuiesce(static_cast<uint32_t>(QuiesceReason::kPlannedStop));
+    if (ivars && ivars->stopPending) {
+        return kIOReturnSuccess;
+    }
+    if (ivars) ivars->stopPending = true;
+    auto completion = ivars && ivars->context
+        ? ivars->context->teardownCompletion
+        : std::make_shared<ASFW::Common::TeardownCompletion>();
+    // Keep the service/provider valid until the deferred superclass Stop.
+    // No synchronous wait: cancellation completions need the Default queue.
+    retain();
+    provider->retain();
+    ASFW_LOG(Controller, "[Teardown] ASFWDriver Stop begin driver=%p", this);
+    // Stop is also delivered on surprise PCI removal. The provider's
+    // Terminated notification can still be queued on this same dispatch
+    // queue, so waiting for it before revoking BAR access is too late.
+    // Terminal service Stop must use the existing software-only teardown;
+    // planned runtime quiesce while the provider is alive is separate.
+    if (ivars && ivars->context && ivars->context->deps.hardware) {
+        ivars->context->deps.hardware->LatchProviderRevokedAndDrain();
+    }
+    RequestRuntimeQuiesce(static_cast<uint32_t>(QuiesceReason::kProviderRevoked));
+    ASFW_LOG(Controller, "[Teardown] ASFWDriver Stop runtime quiesce returned");
     if (ivars) {
         if (ivars->wakeVerifyTimer) {
             // Final stop is terminal.  DriverKit retains the timer's action
@@ -530,22 +558,30 @@ kern_return_t IMPL(ASFWDriver, Stop) {
             auto* action = ivars->wakeVerifyAction;
             ivars->wakeVerifyTimer = nullptr;
             ivars->wakeVerifyAction = nullptr;
+            ASFW_LOG(Controller, "[Teardown] wake verify cancel requested source=%p action=%p", timer, action);
+            auto done = completion->Begin();
             const kern_return_t kr = timer->Cancel(^{
-                if (action) {
-                    action->release();
-                }
+                ASFW_LOG(Controller, "[Teardown] wake verify cancel completed source=%p action=%p", timer, action);
                 timer->release();
+                ASFW::Common::CancelAndReleaseOwnedAction(action, "wake verify", done);
             });
             if (kr != kIOReturnSuccess) {
-                if (action) {
-                    action->release();
-                }
+                ASFW_LOG_ERROR(Controller, "[Teardown] wake verify cancel failed kr=0x%x", kr);
                 timer->release();
+                ASFW::Common::CancelAndReleaseOwnedAction(action, "wake verify", done);
             }
         }
         ivars->powerProvider = nullptr;
     }
-    return Stop(provider, SUPERDISPATCH);
+    ASFW_LOG(Controller, "[Teardown] ASFWDriver Stop waiting for cancellation drain");
+    completion->FinishWhenDrained([this, provider] {
+        ASFW_LOG(Controller, "[Teardown] ASFWDriver cancellations drained; calling superclass Stop");
+        const auto kr = Stop(provider, SUPERDISPATCH);
+        ASFW_LOG(Controller, "[Teardown] ASFWDriver Stop complete kr=0x%x", kr);
+        provider->release();
+        release();
+    });
+    return kIOReturnSuccess;
 }
 
 void ASFWDriver::RequestRuntimeQuiesce(uint32_t rawReason) {
@@ -878,6 +914,7 @@ kern_return_t IMPL(ASFWDriver, NewUserClient) {
         return kIOReturnNoResources;
     }
 
+    ASFW_LOG(UserClient, "[Lifecycle] NewUserClient manual Start client=%p provider=%p", client, this);
     ret = client->Start(this);
     if (ret != kIOReturnSuccess) {
         ASFW_LOG(Controller, "NewUserClient Start failed: 0x%08x", ret);
@@ -917,12 +954,34 @@ void ASFWDriver::InterruptOccurred_Impl(ASFWDriver_InterruptOccurred_Args) {
     // ticks made every downstream "now(ns) − timestamp" ≈ uptime, which silently
     // defeated the IEEE 1394-2008 §8.2.1 two-second repeated-reset holdoff and
     // forced the Annex H post-reset timing gates permanently open.
+    ctx.irqEntries.fetch_add(1, std::memory_order_relaxed);
+    struct IrqExit {
+        ServiceContext& context;
+        ~IrqExit() { context.irqExits.fetch_add(1, std::memory_order_release); }
+    } irqExit{ctx};
     const uint64_t timestampNs = ASFW::Timing::hostTicksToNanos(time);
-    auto snap = ctx.deps.hardware->CaptureInterruptSnapshot(timestampNs);
-    ASFW_LOG_V2(Controller, "InterruptOccurred: captured snapshot intEvent=0x%08x", snap.intEvent);
-    ctx.interruptDispatcher.HandleSnapshot(snap, *ctx.controller, *ctx.deps.hardware,
-                                           *ctx.workQueue, ctx.isoch, ctx.statusPublisher,
-                                           ctx.deps.asyncController.get());
+    auto& hardware = *ctx.deps.hardware;
+    auto* interrupts = ctx.deps.interrupts.get();
+    const uint32_t stillPending = ASFW::Driver::ServiceUntilDeasserted(
+        [&] { return hardware.CaptureInterruptSnapshot(timestampNs); },
+        [&] { return interrupts != nullptr ? interrupts->EnabledMask() : 0U; },
+        [&](const ASFW::Driver::InterruptSnapshot& snap) {
+            ASFW_LOG_V2(Controller, "InterruptOccurred: captured snapshot intEvent=0x%08x",
+                        snap.intEvent);
+            ctx.interruptDispatcher.HandleSnapshot(snap, *ctx.controller, hardware,
+                                                   *ctx.workQueue, ctx.isoch,
+                                                   ctx.statusPublisher,
+                                                   ctx.deps.asyncController.get());
+        });
+    if (stillPending != 0U && interrupts != nullptr) {
+        // An event that will not acknowledge. Returning with it pending would
+        // leave the driver deaf; make the controller send a fresh MSI instead.
+        ASFW_LOG_ERROR(Controller,
+                       "InterruptOccurred: events 0x%08x still pending after %d passes; "
+                       "retriggering the interrupt",
+                       stillPending, ASFW::Driver::kMaxInterruptPasses);
+        interrupts->RetriggerPendingInterrupt(&hardware);
+    }
 }
 
 void ASFWDriver::ScheduleAsyncWatchdog(uint64_t delayUsec) {
@@ -955,6 +1014,42 @@ void ASFWDriver::AsyncWatchdogTimerFired_Impl(ASFWDriver_AsyncWatchdogTimerFired
         // chain permanently on a transient non-running state; the chain's
         // real kill switch is the timer disable in watchdog.Stop()/Reset().
         if (ctx.lifecycle && ctx.lifecycle->AdmitsNormalWork()) {
+            // Read-only anomaly probe. Linux ohci.c:2203-2225 samples IntEvent
+            // before acknowledging it; this probe deliberately never clears it.
+            // 100 ms sampling avoids MMIO/logging on each watchdog or IRQ tick.
+            if (++ctx.irqProbeTicks >= 100 && ctx.deps.hardware && ctx.deps.interrupts) {
+                ctx.irqProbeTicks = 0;
+                auto access = ctx.deps.hardware->TryBeginAccess();
+                if (access) {
+                    using namespace ASFW::Driver;
+                    const auto events = access.Read(Register32::kIntEventSet);
+                    const auto mask = access.Read(Register32::kIntMaskSet);
+                    constexpr uint32_t relevant = IntEventBits::kReqTxComplete | IntEventBits::kRespTxComplete |
+                        IntEventBits::kARRQ | IntEventBits::kARRS | IntEventBits::kRQPkt | IntEventBits::kRSPkt |
+                        IntEventBits::kBusReset | IntEventBits::kSelfIDComplete;
+                    const auto pending = events & mask & relevant;
+                    const auto entries = ctx.irqEntries.load(std::memory_order_acquire);
+                    const auto exits = ctx.irqExits.load(std::memory_order_acquire);
+                    if (events != UINT32_MAX && pending && entries == ctx.irqProbeLastEntries) {
+                        ++ctx.irqPendingSamples;
+                        if (ctx.irqPendingSamples >= 5 && ctx.irqProbeReports < 3) {
+                            ++ctx.irqProbeReports;
+                            ASFW_LOG_ERROR(Controller,
+                                "[IrqStall] pending=0x%08x events=0x%08x mask=0x%08x shadow=0x%08x entries=%llu exits=%llu samples=%u node=0x%08x atReq=0x%08x atRsp=0x%08x arReq=0x%08x arRsp=0x%08x",
+                                pending, events, mask, ctx.deps.interrupts->EnabledMask(), entries, exits,
+                                ctx.irqPendingSamples, access.Read(Register32::kNodeID),
+                                access.Read(static_cast<Register32>(DMAContextHelpers::AsReqTrContextControlSet)),
+                                access.Read(static_cast<Register32>(DMAContextHelpers::AsRspTrContextControlSet)),
+                                access.Read(static_cast<Register32>(DMAContextHelpers::AsReqRcvContextControlSet)),
+                                access.Read(static_cast<Register32>(DMAContextHelpers::AsRspRcvContextControlSet)));
+                        }
+                    } else {
+                        ctx.irqPendingSamples = 0;
+                        ctx.irqProbeReports = 0;
+                    }
+                    ctx.irqProbeLastEntries = entries;
+                }
+            }
             ctx.watchdog.HandleTick(ctx.controller.get(), ctx.deps.asyncController.get(),
                                     ctx.isoch.ReceiveContext(), ctx.isoch.TransmitContext(),
                                     ctx.statusPublisher);
@@ -1120,8 +1215,8 @@ kern_return_t ASFWDriver::StartAudioStreaming(uint64_t guid) {
                        "device-config", guid, record.has_value(), protocol != nullptr);
         return kIOReturnNotReady;
     }
-    auto* transport = ctx.deps.avcDiscovery->GetFCPTransportForNodeID(record->nodeId);
-    if (!ASFW::Audio::HasReadyAVCStartRoute(record->nodeId, transport != nullptr)) {
+    auto avcUnit = ctx.deps.avcDiscovery->LiveUnit(guid);
+    if (!ASFW::Audio::HasReadyAVCStartRoute(record->nodeId, avcUnit != nullptr)) {
         ASFW_LOG(Audio,
                  "[BeBoB] developer stream start refused; no live FCP route GUID=0x%016llx node=%u",
                  guid, record->nodeId);
@@ -1131,7 +1226,7 @@ kern_return_t ASFWDriver::StartAudioStreaming(uint64_t guid) {
     if (!route) {
         return kIOReturnNotReady;
     }
-    protocol->UpdateRuntimeContext(*route, transport);
+    protocol->UpdateRuntimeContext(*route, std::move(avcUnit));
     ASFW_LOG(Audio, "[BeBoB] developer stream start GUID=0x%016llx", guid);
     return ctx.audioCoordinator->StartStreaming(guid);
 }
@@ -1164,13 +1259,13 @@ kern_return_t ASFWDriver::StartIsochReceive(uint8_t channel, uint32_t wireFormat
         return kIOReturnSuccess;
     }
 
-    // Audio receive is owned by AudioDuplexCoordinator, which installs its
+    // Audio receive is owned by the audio session (Audio/Session), which installs its
     // content consumer before arming IR. This legacy driver entry point cannot
     // safely synthesize that owner from a raw wire-format value.
     (void)wireFormatRaw;
     (void)am824Slots;
     ASFW_LOG_ERROR(Controller,
-                   "[Isoch] StartIsochReceive is retired; use AudioDuplexCoordinator");
+                   "[Isoch] StartIsochReceive is retired; use the audio session");
     return kIOReturnUnsupported;
 }
 
@@ -1237,6 +1332,76 @@ kern_return_t ASFWDriver::CopyDVCaptureMemory(
     return ivars->context->dvCapture.CopyMemory(ownerToken, options, memory);
 }
 
+kern_return_t ASFWDriver::CopyAudioObserverMemory(
+    uint64_t guid,
+    uint64_t* outMemoryGeneration,
+    IOMemoryDescriptor** outMemory) {
+    if (outMemoryGeneration) { *outMemoryGeneration = 0; }
+    if (outMemory) { *outMemory = nullptr; }
+    if (guid == 0 || !outMemoryGeneration || !outMemory) {
+        return kIOReturnBadArgument;
+    }
+    if (!ivars || !ivars->context || !ivars->context->deps.audioRuntimeRegistry) {
+        return kIOReturnNotReady;
+    }
+    auto endpoint = ivars->context->deps.audioRuntimeRegistry->FindEndpointRuntime(guid);
+    if (!endpoint) {
+        return kIOReturnNotFound;
+    }
+    ASFW::Audio::AudioOutputObserverState state{};
+    const kern_return_t kr = endpoint->CopyOutputObserverMemory(outMemory, state);
+    if (kr == kIOReturnSuccess) {
+        *outMemoryGeneration = state.memoryGeneration;
+    }
+    return kr;
+}
+
+kern_return_t ASFWDriver::CopyAudioObserverState(
+    uint64_t guid,
+    uint64_t* outWriteEndFrame,
+    uint64_t* outOldestValidFrame,
+    uint64_t* outSessionEpoch,
+    uint64_t* outDiscontinuityEpoch,
+    uint64_t* outMemoryGeneration,
+    uint32_t* outActiveRingFrames,
+    uint32_t* outChannels,
+    uint32_t* outSampleRateHz) {
+    if (outWriteEndFrame) { *outWriteEndFrame = 0; }
+    if (outOldestValidFrame) { *outOldestValidFrame = 0; }
+    if (outSessionEpoch) { *outSessionEpoch = 0; }
+    if (outDiscontinuityEpoch) { *outDiscontinuityEpoch = 0; }
+    if (outMemoryGeneration) { *outMemoryGeneration = 0; }
+    if (outActiveRingFrames) { *outActiveRingFrames = 0; }
+    if (outChannels) { *outChannels = 0; }
+    if (outSampleRateHz) { *outSampleRateHz = 0; }
+    if (guid == 0 || !outWriteEndFrame || !outOldestValidFrame ||
+        !outSessionEpoch || !outDiscontinuityEpoch || !outMemoryGeneration ||
+        !outActiveRingFrames || !outChannels || !outSampleRateHz) {
+        return kIOReturnBadArgument;
+    }
+    if (!ivars || !ivars->context || !ivars->context->deps.audioRuntimeRegistry) {
+        return kIOReturnNotReady;
+    }
+    auto endpoint = ivars->context->deps.audioRuntimeRegistry->FindEndpointRuntime(guid);
+    if (!endpoint) {
+        return kIOReturnNotFound;
+    }
+    ASFW::Audio::AudioOutputObserverState state{};
+    const kern_return_t kr = endpoint->CopyOutputObserverState(state);
+    if (kr != kIOReturnSuccess) {
+        return kr;
+    }
+    *outWriteEndFrame = state.writeEndFrame;
+    *outOldestValidFrame = state.oldestValidFrame;
+    *outSessionEpoch = state.sessionEpoch;
+    *outDiscontinuityEpoch = state.discontinuityEpoch;
+    *outMemoryGeneration = state.memoryGeneration;
+    *outActiveRingFrames = state.activeRingFrames;
+    *outChannels = state.channels;
+    *outSampleRateHz = state.sampleRateHz;
+    return kIOReturnSuccess;
+}
+
 // =============================================================================
 // MARK: - Isochronous Transmit
 // =============================================================================
@@ -1253,7 +1418,11 @@ kern_return_t ASFWDriver::StartIsochTransmit(uint8_t channel) {
 
     const uint8_t sid = static_cast<uint8_t>(ctx.deps.hardware->ReadNodeID() & 0x3Fu);
 
-    return ctx.isoch.StartTransmit(channel, *ctx.deps.hardware, sid);
+    // A user-client diagnostic path with no device behind it, so there is no
+    // per-device link speed to follow. S400 is the same speed this path has
+    // always transmitted at; the audio path derives its speed from the target
+    // device and passes it explicitly.
+    return ctx.isoch.StartTransmit(channel, *ctx.deps.hardware, sid, ASFW::FW::FwSpeed::S400);
 }
 
 kern_return_t ASFWDriver::StopIsochTransmit() {

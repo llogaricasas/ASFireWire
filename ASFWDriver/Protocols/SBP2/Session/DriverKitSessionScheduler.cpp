@@ -1,10 +1,11 @@
+#include "../../../Common/ActionTeardown.hpp"
 #include "DriverKitSessionScheduler.hpp"
 
 #include "../../../Common/TimingUtils.hpp"
 #include "../../../Logging/Logging.hpp"
 
 #ifndef ASFW_HOST_TEST
-#include <net.mrmidi.ASFW.ASFWDriver/ASFWDriver.h>
+#include <net.asfw.driver/ASFWDriver.h>
 #endif
 
 #include <algorithm>
@@ -49,8 +50,10 @@ DriverKitSessionScheduler::~DriverKitSessionScheduler() {
     }
 }
 
-kern_return_t DriverKitSessionScheduler::Prepare(::ASFWDriver& service,
-                                                 OSSharedPtr<IODispatchQueue> workQueue) {
+kern_return_t DriverKitSessionScheduler::Prepare(
+    ::ASFWDriver& service, OSSharedPtr<IODispatchQueue> workQueue,
+    std::shared_ptr<ASFW::Common::TeardownCompletion> completion) {
+    teardownCompletion_ = std::move(completion);
     if (!workQueue) {
         return kIOReturnNotReady;
     }
@@ -102,11 +105,27 @@ void DriverKitSessionScheduler::Reset() noexcept {
         pending_.clear();
     }
 
+    // Disabling alone leaves the handler retained (IOTimerDispatchSource.iig,
+    // SetHandler). Cancel terminally, keeping the source and its driver-targeted
+    // action alive until queued callbacks have returned, as the watchdog does.
     if (timer_) {
-        (void)timer_->SetEnableWithCompletion(false, nullptr);
+        auto* timer = timer_.detach();
+        auto* action = action_.detach();
+        ASFW_LOG(Controller, "[Teardown] SBP2 timer cancel requested source=%p action=%p", timer, action);
+        auto done = teardownCompletion_ ? teardownCompletion_->Begin() : std::function<void()>{};
+        const kern_return_t kr = timer->Cancel(^{
+            ASFW_LOG(Controller, "[Teardown] SBP2 timer cancel completed source=%p action=%p", timer, action);
+            timer->release();
+            ASFW::Common::CancelAndReleaseOwnedAction(action, "SBP2 timer", done);
+        });
+        if (kr != kIOReturnSuccess) {
+            ASFW_LOG_ERROR(Controller, "[SBP2Timer] cancellation failed: 0x%x", kr);
+            timer->release();
+            ASFW::Common::CancelAndReleaseOwnedAction(action, "SBP2 timer", done);
+        }
+    } else {
+        action_.reset();
     }
-    action_.reset();
-    timer_.reset();
     workQueue_.reset();
 }
 
@@ -227,6 +246,11 @@ void DriverKitSessionScheduler::ArmTimerUnlocked(IOTimerDispatchSource* timer,
     // IOKit registry busy-timeout kernel panic (2026-06-22).
     (void)timer->WakeAtTime(kIOTimerClockMachAbsoluteTime, deadlineTicks, 0);
 #endif
+}
+
+uint64_t DriverKitSessionScheduler::NowNs() const noexcept {
+    (void)ASFW::Timing::initializeHostTimebase();
+    return ASFW::Timing::hostTicksToNanos(mach_absolute_time());
 }
 
 uint64_t DriverKitSessionScheduler::DeadlineTicksFromNow(uint64_t delayNs) const noexcept {
