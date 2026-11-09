@@ -12,6 +12,10 @@
 #   ./build-signed.sh             # -> build/signed/ASFW.app
 #   ./build-signed.sh --install   # ...and copy it to /Applications, then open it
 #   ./build-signed.sh --no-bump   # keep CFBundleVersion unchanged
+#   ./build-signed.sh --cxx23     # Xcode 26.x: its DriverKit SDK cannot build the
+#                                 # C++26 default (see the .github CI note); build
+#                                 # as C++23 with tools/cxx23-compat.hpp force-included
+#   ./build-signed.sh --set KEY=VALUE   # extra xcodebuild setting (repeatable)
 #
 set -Eeuo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,13 +26,19 @@ OUT_DIR="./build/signed"
 INSTALL_DIR="${ASFW_INSTALL_DIR:-/Applications}"
 INSTALL=false
 NO_BUMP=false
+EXTRA_SETTINGS=()
 
-for arg in "$@"; do
-  case "$arg" in
-    --install) INSTALL=true;;
-    --no-bump) NO_BUMP=true;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0;;
-    *) echo "[ERROR] unknown arg: $arg" >&2; exit 1;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --install) INSTALL=true; shift;;
+    --no-bump) NO_BUMP=true; shift;;
+    --set) EXTRA_SETTINGS+=("$2"); shift 2;;
+    --cxx23)
+      EXTRA_SETTINGS+=("CLANG_CXX_LANGUAGE_STANDARD=gnu++23")
+      EXTRA_SETTINGS+=("OTHER_CPLUSPLUSFLAGS=\$(inherited) -include \$(SRCROOT)/tools/cxx23-compat.hpp -Wno-c++26-extensions")
+      shift;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0;;
+    *) echo "[ERROR] unknown arg: $1" >&2; exit 1;;
   esac
 done
 
@@ -55,6 +65,7 @@ xcodebuild \
   -destination "platform=macOS,arch=$(uname -m)" \
   -allowProvisioningUpdates \
   -quiet \
+  ${EXTRA_SETTINGS[@]+"${EXTRA_SETTINGS[@]}"} \
   build
 
 APP="${DERIVED}/Build/Products/${CONFIGURATION}/ASFW.app"
