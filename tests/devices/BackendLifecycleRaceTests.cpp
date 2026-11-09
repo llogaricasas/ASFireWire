@@ -126,7 +126,7 @@ struct TestFixture {
         }};
     AudioNubPublisher publisher{nullptr};
     ASFW::Audio::DICE::DiceNotificationRouter diceNotifications{registry};
-    // DICE runs on the audio device host (AUDIO_DEVICE_HOST.md §6 E5). The
+    // DICE runs on the audio device host. The
     // adapter is declared first so it outlives the host's teardown.
     DiceFamilyAdapter diceAdapter{diceNotifications};
     AudioDeviceHost dice{publisher, registry, runtime, sessions, hostTransport};
@@ -136,8 +136,6 @@ struct TestFixture {
     void SeedDiceDevice(uint64_t guid) {
         ConfigROM rom{};
         rom.gen = Generation{1};
-        rom.firstSeen = Generation{1};
-        rom.lastValidated = Generation{1};
         rom.nodeId = 2;
         rom.bib.guid = guid;
         rom.bib.maxRec = 8;

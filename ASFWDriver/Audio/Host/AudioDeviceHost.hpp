@@ -3,7 +3,7 @@
 //
 // AudioDeviceHost.hpp - The one lifecycle shell around every audio family.
 //
-// documentation/AUDIO_DEVICE_HOST.md. Replaces the shell the four backends
+// Replaces the shell the four backends
 // each wrote for themselves: publication admission, route checks, one work
 // queue, per-device recovery dedupe, and teardown. A family supplies only a
 // FamilyAdapter (how to describe the endpoint, whether a fault is real, which
@@ -23,6 +23,7 @@
 #pragma once
 
 #include "FamilyAdapter.hpp"
+#include "IAudioEndpointObserver.hpp"
 #include "PublicationGate.hpp"
 #include "../Protocols/DeviceProtocolChoice.hpp"
 
@@ -116,6 +117,12 @@ public:
     /// device callback. The adapter must outlive the host's teardown.
     void Install(AudioBackendKind kind, FamilyAdapter& adapter) noexcept;
 
+    /// Told after an endpoint is published or confirmed unchanged. Composition
+    /// time only; the observer must outlive the host's teardown. Null detaches.
+    void SetEndpointObserver(IAudioEndpointObserver* observer) noexcept {
+        endpointObserver_.store(observer, std::memory_order_release);
+    }
+
     /// Which family serves `guid` now, if its current policy names one.
     [[nodiscard]] std::optional<AudioBackendKind> KindForGuid(uint64_t guid) const noexcept;
 
@@ -175,10 +182,15 @@ private:
                 const char* detail = nullptr) noexcept;
 
     [[nodiscard]] FamilyAdapter* AdapterFor(AudioBackendKind kind) const noexcept;
+    void NotifyEndpointPublished(uint64_t guid, AudioBackendKind kind,
+                                 const Model::ASFWAudioDevice& description) noexcept;
     [[nodiscard]] bool TryBeginRecovery(uint64_t guid) noexcept;
     void FinishRecovery(uint64_t guid) noexcept;
     void Dispatch(std::function<void()> work) noexcept;
-    void ProbeClock(uint64_t guid, const char* family, uint32_t detail) noexcept;
+    void QueueClockProbe(uint64_t guid, const char* family, uint32_t detail, bool configChanged) noexcept;
+    enum class ClockProbeResult { Settled, AwaitingLock, RateChanged };
+    [[nodiscard]] ClockProbeResult ProbeClock(uint64_t guid, const char* family,
+                                            uint32_t detail, bool configChanged) noexcept;
     [[nodiscard]] bool Stopping() const noexcept { return stopping_.load(std::memory_order_acquire); }
 
     AudioNubPublisher& publisher_;
@@ -188,6 +200,7 @@ private:
     IIsochDuplexHostTransport& hostTransport_;
 
     std::array<FamilyAdapter*, 4> adapters_{};
+    std::atomic<IAudioEndpointObserver*> endpointObserver_{nullptr};
 
     OSSharedPtr<IODispatchQueue> workQueue_{};
     PublicationGate gate_{};
@@ -197,6 +210,13 @@ private:
 
     IOLock* lock_{nullptr};
     std::unordered_set<uint64_t> recoveringGuids_{};                               // lock_
+    struct PendingClockProbe {
+        uint32_t detail{0};
+        bool configChanged{false};
+        bool dirty{false};
+        bool queued{false};
+    };
+    std::unordered_map<uint64_t, PendingClockProbe> clockProbes_{};                // lock_
     std::unordered_map<uint64_t, Model::ASFWAudioDevice> discoveredByGuid_{};      // lock_
 
     std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(HostOutcome::kCount)>,

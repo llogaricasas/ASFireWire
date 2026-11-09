@@ -5,7 +5,7 @@
 // Zero-timestamp publication: the one call into UpdateCurrentZeroTimestamp
 // (PublishSharedZeroTimestampToHAL), the RX anchor action, the M-Audio TX
 // clock observation, and the StartIO clock-domain / timeline-epoch choice.
-// documentation/HARDWARE_TIMELINE_OWNERSHIP.md. The TX producer lives in
+// The TX producer lives in
 // ASFWAudioDriverTxProducer.cpp.
 //
 
@@ -189,15 +189,15 @@ void ObserveMAudioTxClock(ASFWAudioDriver_IVars& ivars,
         correlationBusTicks = correlationTicks;
 
         const auto* slot = ivars.runtime.txStreamEngine.Timeline().SlotByIndex(packetIndex);
-        if (!slot || !slot->isData || slot->framesInPacket == 0 ||
+        if (!slot || !slot->isData.load(std::memory_order_relaxed) || slot->framesInPacket.load(std::memory_order_relaxed) == 0 ||
             dataPacketCount == dataPackets.size()) {
             continue;
         }
         dataPackets[dataPacketCount++] = {
             .completionBusTicks = completionTicks,
             .correlationBusTicks = correlationTicks,
-            .sampleFrame = slot->firstAudioFrame,
-            .frameCount = slot->framesInPacket,
+            .sampleFrame = slot->firstAudioFrame.load(std::memory_order_relaxed),
+            .frameCount = slot->framesInPacket.load(std::memory_order_relaxed),
             .sytOffsetTicks =
                 ASFW::Audio::Families::BeBoB::MAudio::
                     SytOffsetTicksForPacketIndex(packetIndex),
@@ -232,7 +232,7 @@ void ObserveMAudioTxClock(ASFWAudioDriver_IVars& ivars,
     }
     // Same path as the RX clock: the timeline's boundary goes into the anchor
     // mailbox, and PublishSharedZeroTimestampToHAL is the one place that calls
-    // UpdateCurrentZeroTimestamp (documentation/HARDWARE_TIMELINE_OWNERSHIP.md).
+    // UpdateCurrentZeroTimestamp.
     const auto published = control->PublishHostClockAnchor(
         boundary.boundary.sampleFrame, boundary.boundary.hostTicks,
         boundary.boundary.hostNanosPerSampleQ8, boundary.boundary.epoch);

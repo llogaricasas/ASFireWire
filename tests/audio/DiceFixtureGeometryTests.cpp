@@ -32,8 +32,6 @@
 // differ only in GUID, serial and geometry. Nothing but the measured channel
 // count can tell them apart.
 //
-// documentation/DICE_TCAT_ARCHITECTURE.md sec 2.8 is the prose version.
-//
 // That last one is why the MultiMix matters most: stream0 x count gives 24
 // where the streams actually sum to 14, so a regression to multiplication is
 // off by ten channels rather than by a plausible-looking few.
@@ -234,7 +232,7 @@ constexpr DiceFixture kFixtures[] = {
     },
     {
         .name = "Alesis MultiMix",
-        .dump = "documentation/fixtures/alesismultimix.txt",
+        .dump = "documentation/fixtures/DICE/alesismultimix.txt",
         .guid = 0x00059504000005FEULL,
         .clockCaps = 0x11000006,
         .role = {.discriminatesAggregation = true,

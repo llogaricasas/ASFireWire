@@ -24,6 +24,13 @@ namespace ASFW::IRM {
     class IRMClient;
 }
 
+namespace ASFW::Audio::DICE::Diagnostics {
+struct DiceLockSnapshot;
+struct DiceReceiverDumpSnapshot;
+}
+
+namespace ASFW::Audio::Controls { class IControlProvider; }
+
 namespace ASFW::Audio {
 class FamilyDriver;
 }
@@ -35,7 +42,7 @@ namespace ASFW::Audio {
 /// Device protocols are instantiated by CreateFamilyDeviceProtocol when a
 /// audio endpoint is resolved during discovery. Each protocol handler
 /// encapsulates vendor-specific control logic (DSP, routing, etc.).
-class IDeviceProtocol {
+class IDeviceProtocol : public std::enable_shared_from_this<IDeviceProtocol> {
 public:
     virtual ~IDeviceProtocol() = default;
     
@@ -63,6 +70,23 @@ public:
         return false;
     }
 
+    // Copied family-specific diagnostics; never issues remote I/O.
+    virtual bool CopyDiceReceiverLock(DICE::Diagnostics::DiceLockSnapshot& out) const {
+        (void)out;
+        return false;
+    }
+
+    // Starts a receiver-register dump; the driver decides whether it may.
+    virtual IOReturn RequestDiceReceiverDump(bool fifoEvents) {
+        (void)fifoEvents;
+        return kIOReturnUnsupported;
+    }
+    // Copied result of the last dump; never issues remote I/O.
+    virtual bool CopyDiceReceiverDump(DICE::Diagnostics::DiceReceiverDumpSnapshot& out) const {
+        (void)out;
+        return false;
+    }
+
     // Immutable protocol-discovered formation snapshot, distinct from the
     // current stream observation and from hardware qualification evidence.
     virtual std::shared_ptr<const std::vector<Runtime::RateFormation>> RateFormations() const {
@@ -78,6 +102,10 @@ public:
     virtual void EnsureRuntimeStreamGeometry(std::function<void(IOReturn)> callback) {
         callback(kIOReturnSuccess);
     }
+
+    // Cancel deferred publication preparation before the host drains admission.
+    // Does not stop active streams or issue hardware transactions.
+    virtual void CancelPendingPreparation() {}
 
     /// Query per-channel device labels discovered from the protocol's stream
     /// format (e.g. DICE TX/RX name sections). `inNames` is host input/capture,
@@ -116,42 +144,14 @@ public:
         (void)avcUnit;
     }
 
+    /// Optional semantic control provider, owned by this protocol.
+    virtual Controls::IControlProvider* Controls() noexcept { return nullptr; }
+
     // Explicit discovery/reset hook, including idle devices. The caller retains
     // the protocol until completion. Register protocols restore notification IO
     // here; ordinary protocols have no reset registration work.
     virtual void RebindNotifications(VoidCallback callback) { callback(kIOReturnSuccess); }
 
-    /// Check if protocol can expose/control a boolean control.
-    // These virtuals intentionally match the host-facing `(class, element[, value])` contract.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-    virtual bool SupportsBooleanControl(uint32_t classIdFourCC,
-                                        uint32_t element) const {
-        (void)classIdFourCC;
-        (void)element;
-        return false;
-    }
-
-    /// Read protocol-backed boolean control value.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-    virtual IOReturn GetBooleanControlValue(uint32_t classIdFourCC,
-                                            uint32_t element,
-                                            bool& outValue) {
-        (void)classIdFourCC;
-        (void)element;
-        (void)outValue;
-        return kIOReturnUnsupported;
-    }
-
-    /// Write protocol-backed boolean control value.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-    virtual IOReturn SetBooleanControlValue(uint32_t classIdFourCC,
-                                            uint32_t element,
-                                            bool value) {
-        (void)classIdFourCC;
-        (void)element;
-        (void)value;
-        return kIOReturnUnsupported;
-    }
 };
 
 } // namespace ASFW::Audio

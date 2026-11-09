@@ -2,8 +2,7 @@
 // Copyright (c) 2026 ASFireWire Project
 //
 // AvcFamilyAdapterTests.cpp
-// The AV/C adapter on the audio device host (documentation/AUDIO_DEVICE_HOST.md
-// §4.2, §6 E4). Plain values in, plain values out: no host, no bus, no driver.
+// The AV/C adapter on the audio device host. Plain values in, plain values out: no host, no bus, no driver.
 // Describe returns what discovery pushed or refuses; JudgeRuntimeFault is the
 // 256 ms settle that AVCAudioBackend::HandleTimingLoss ran, driven here through
 // a scripted FaultContext whose Sleep advances a fake clock.
@@ -60,8 +59,6 @@ DeviceRecord SeedDevice(DeviceRegistry& registry, uint64_t guid, uint32_t vendor
                         uint32_t modelId, uint32_t unitSpecId, uint32_t unitSwVersion) {
     ConfigROM rom{};
     rom.gen = Generation{1};
-    rom.firstSeen = Generation{1};
-    rom.lastValidated = Generation{1};
     rom.nodeId = 2;
     rom.bib.guid = guid;
     rom.bib.maxRec = 8;

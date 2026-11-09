@@ -5,6 +5,7 @@
 //  Created by ASFireWire Project on 07.10.2025.
 //
 
+import CoreAudio
 import SwiftUI
 import Foundation
 
@@ -15,10 +16,14 @@ struct ModernContentView: View {
     @StateObject private var romExplorerVM: RomExplorerViewModel
     @StateObject private var diagnosticsStore: DiagnosticsStore
     @StateObject private var diceReportStore: DiceReportStore
+    @StateObject private var diceDiagnosticsStore: DiceDiagnosticsStore
     @StateObject private var avcReportStore: AvcReportStore
     @StateObject private var avcUnitsStore: AvcUnitsStore
+    @StateObject private var deviceControlsVM: DeviceControlsViewModel
     @StateObject private var mcpVM: ASFWMCPControlViewModel
+    @StateObject private var roundTripVM: RoundTripLatencyViewModel
     @State private var publishedAudioDevices: [AudioWrapperDevice] = []
+    @State private var deviceListObserver: AudioPropertyObserver?
     @State private var selectedSection: SidebarSection? = .overview
     @AppStorage(AdvancedToolsSettings.storageKey)
     private var showAdvancedTools = AdvancedToolsSettings.defaultEnabled
@@ -36,17 +41,39 @@ struct ModernContentView: View {
             connector: debugViewModel.connector,
             topologyViewModel: topologyViewModel
         ))
-        _diagnosticsStore = StateObject(wrappedValue: DiagnosticsStore(connector: debugViewModel.connector))
+        let diagnostics = DiagnosticsStore(connector: debugViewModel.connector)
+        _diagnosticsStore = StateObject(wrappedValue: diagnostics)
         _diceReportStore = StateObject(wrappedValue: DiceReportStore(connector: debugViewModel.connector))
+        _diceDiagnosticsStore = StateObject(wrappedValue: DiceDiagnosticsStore(connector: debugViewModel.connector))
         _avcReportStore = StateObject(wrappedValue: AvcReportStore(connector: debugViewModel.connector))
         _avcUnitsStore = StateObject(wrappedValue: AvcUnitsStore(connector: debugViewModel.connector))
+        _deviceControlsVM = StateObject(wrappedValue: DeviceControlsViewModel(source: debugViewModel.connector))
         _mcpVM = StateObject(wrappedValue: ASFWMCPControlViewModel(connector: debugViewModel.connector))
+        // A measurement owns the audio device; the app's own driver reads would
+        // perturb the timing, so they pause for its duration. Paused: the 2 s
+        // discovery poll and status-driven snapshot fetches (DebugViewModel), the
+        // status-driven topology refresh (TopologyViewModel) and the
+        // status-driven diagnostics refresh (DiagnosticsStore). The other
+        // pollers (telemetry, geometry, Saffire mixer, driver log, analyzer) run
+        // only while their own page is shown, and leaving this page cancels the run.
+        _roundTripVM = StateObject(wrappedValue: RoundTripLatencyViewModel(
+            pauseDriverPolling: { paused in
+                debugViewModel.setDriverPollingPaused(paused)
+                diagnostics.setStatusRefreshPaused(paused)
+                if paused {
+                    topologyViewModel.stopAutoRefresh()
+                } else {
+                    topologyViewModel.startAutoRefresh()
+                }
+            }))
     }
 
     enum SidebarSection: String, CaseIterable, Identifiable {
         case overview = "Overview"
+        case about = "About ASFireWire"
         case busInspector = "Bus Inspector"
         case avcUnits = "AV/C Units"
+        case deviceControls = "Device Controls"
         case avcCommands = "AV/C Commands"
         case controller = "Controller Status"
         case async = "Async Commands"
@@ -59,9 +86,10 @@ struct ModernContentView: View {
         case mcpSettings = "MCP Control"
         case audio = "Core Audio"
         case audioAnalyzer = "Audio Analyzer"
-        case duet = "Duet"
+        case roundTripLatency = "Round-Trip Latency"
         case diagnostics = "Driver Report"
         case diceReport = "DICE Report"
+        case diceDiagnostics = "DICE Diagnostics"
         case avcReport = "AV/C Report"
 
         var id: String { rawValue }
@@ -69,8 +97,10 @@ struct ModernContentView: View {
         var systemImage: String {
             switch self {
             case .overview: return "info.circle"
+            case .about: return "heart.text.square"
             case .busInspector: return "network"
             case .avcUnits: return "music.note"
+            case .deviceControls: return "slider.vertical.3"
             case .avcCommands: return "command"
             case .controller: return "cpu"
             case .async: return "bolt.horizontal.circle"
@@ -83,17 +113,18 @@ struct ModernContentView: View {
             case .mcpSettings: return "point.3.connected.trianglepath.dotted"
             case .audio: return "hifispeaker.fill"
             case .audioAnalyzer: return "waveform"
-            case .duet: return "slider.horizontal.below.square.filled.and.square"
+            case .roundTripLatency: return "arrow.left.arrow.right"
             case .diagnostics: return "heart.text.square"
             case .diceReport: return "doc.text.magnifyingglass"
+            case .diceDiagnostics: return "waveform.path.ecg"
             case .avcReport: return "doc.text.magnifyingglass"
             }
         }
 
         var group: SidebarGroup {
             switch self {
-            case .overview: .general
-            case .busInspector, .avcUnits, .duet, .audioAnalyzer: .devices
+            case .overview, .about: .general
+            case .busInspector, .avcUnits, .deviceControls, .audioAnalyzer: .devices
             case .dvCapture: .video
             case .diagnostics, .diceReport, .avcReport: .reports
             case .logs, .loggingSettings: .support
@@ -102,25 +133,45 @@ struct ModernContentView: View {
         }
 
         var requiresAdvancedTools: Bool { group == .advanced }
-    }
-    
-    private var visibleSections: [SidebarSection] {
-        SidebarSection.allCases.filter { section in
-            guard showAdvancedTools || !section.requiresAdvancedTools else { return false }
-            switch section {
-            case .avcUnits, .avcCommands, .avcReport: return debugVM.hasAVCDevice
-            case .diceReport: return debugVM.hasDICEDevice
-            case .duet: return debugVM.hasDuetDevice
-            case .audioAnalyzer, .audioTelemetry, .audioGeometry:
-                return !publishedAudioDevices.isEmpty
+
+        /// Whether the sidebar lists this section. Advanced sections need the
+        /// advanced toggle; device sections need the device they act on.
+        func isVisible(showAdvancedTools: Bool,
+                       hasAVCDevice: Bool,
+                       hasDICEDevice: Bool,
+                       hasASFWAudioDevice: Bool) -> Bool {
+            guard showAdvancedTools || !requiresAdvancedTools else { return false }
+            switch self {
+            case .avcUnits, .avcCommands, .avcReport: return hasAVCDevice
+            case .diceReport, .diceDiagnostics: return hasDICEDevice
+            case .audioAnalyzer, .audioTelemetry, .audioGeometry, .roundTripLatency:
+                return hasASFWAudioDevice
             default: return true
             }
+        }
+
+        /// The selection after the visible set changed: a section that
+        /// disappeared (device unplugged, advanced tools switched off) falls back
+        /// to Overview.
+        static func resolvedSelection(_ selection: SidebarSection?,
+                                      visible: [SidebarSection]) -> SidebarSection? {
+            guard let selection, !visible.contains(selection) else { return selection }
+            return .overview
+        }
+    }
+
+    private var visibleSections: [SidebarSection] {
+        SidebarSection.allCases.filter { section in
+            section.isVisible(showAdvancedTools: showAdvancedTools,
+                              hasAVCDevice: debugVM.hasAVCDevice,
+                              hasDICEDevice: debugVM.hasDICEDevice,
+                              hasASFWAudioDevice: !publishedAudioDevices.isEmpty)
         }
     }
 
     private func refreshPublishedAudioDevices() {
         publishedAudioDevices = AudioSystem.shared.devices.filter {
-            ASFWAudioObserverClient.guid(fromDeviceUID: $0.uid) != nil
+            RtlAvailability.isASFWDevice(uid: $0.uid)
         }
     }
 
@@ -157,10 +208,14 @@ struct ModernContentView: View {
                 case .overview:
                     OverviewView(viewModel: driverVM,
                                  requireNewerBuild: $requireNewerBuild)
+                case .about:
+                    AboutView()
                 case .busInspector:
                     BusInspectorView(debugViewModel: debugVM, topologyViewModel: topologyVM, romViewModel: romExplorerVM)
                 case .avcUnits:
                     AvcUnitsView(store: avcUnitsStore, connector: debugVM.connector, developerTools: showAdvancedTools)
+                case .deviceControls:
+                    DeviceControlsView(model: deviceControlsVM)
                 case .avcCommands:
                     AVCCommandView(viewModel: debugVM)
                 case .controller:
@@ -185,12 +240,15 @@ struct ModernContentView: View {
                     AudioDebugView()
                 case .audioAnalyzer:
                     AudioAnalyzerView(devices: publishedAudioDevices, refresh: refreshPublishedAudioDevices)
-                case .duet:
-                    DuetControlView(connector: debugVM.connector)
+                case .roundTripLatency:
+                    RoundTripLatencyView(viewModel: roundTripVM, publishedDevices: publishedAudioDevices,
+                                         mcpServerEnabled: mcpVM.isEnabled)
                 case .diagnostics:
                     DiagnosticsView(store: diagnosticsStore, showAdvancedTools: showAdvancedTools)
                 case .diceReport:
                     DiceReportView(store: diceReportStore)
+                case .diceDiagnostics:
+                    DiceDiagnosticsView(store: diceDiagnosticsStore)
                 case .avcReport:
                     AvcReportView(store: avcReportStore)
                 case .none:
@@ -233,6 +291,12 @@ struct ModernContentView: View {
             debugVM.setDriverViewModel(driverVM)
             debugVM.connect()
             topologyVM.startAutoRefresh()
+            // Devices appearing and disappearing show or hide the audio sections
+            // at once; the 2 s refresh below stays as the backstop.
+            deviceListObserver = AudioPropertyObserver(
+                objectID: AudioObjectID(kAudioObjectSystemObject),
+                selectors: [kAudioHardwarePropertyDevices]
+            ) { refreshPublishedAudioDevices() }
             romExplorerVM.setConnector(debugVM.connector, topologyViewModel: topologyVM)
             if mcpVM.isEnabled {
                 Task { await mcpVM.start() }
@@ -242,13 +306,19 @@ struct ModernContentView: View {
             Task { await mcpVM.stop() }
             debugVM.disconnect()
             topologyVM.stopAutoRefresh()
+            deviceListObserver?.invalidate()
+            deviceListObserver = nil
         }
         .task {
             // Discovery can finish after the bus status notification. Poll its cached
             // inventory globally so AV/C navigation also updates while on Overview.
             while !Task.isCancelled {
-                debugVM.refreshDiscovery()
-                refreshPublishedAudioDevices()
+                // A timing measurement is running: leave the driver and the
+                // audio device alone until it ends.
+                if !debugVM.isDriverPollingPaused {
+                    debugVM.refreshDiscovery()
+                    refreshPublishedAudioDevices()
+                }
                 do { try await Task.sleep(for: .seconds(2)) } catch { return }
             }
         }
@@ -256,9 +326,7 @@ struct ModernContentView: View {
             topologyVM.refresh()
         }
         .onChange(of: visibleSections) { _, sections in
-            if let selectedSection, !sections.contains(selectedSection) {
-                self.selectedSection = .overview
-            }
+            selectedSection = SidebarSection.resolvedSelection(selectedSection, visible: sections)
         }
         .onChange(of: topologyVM.topology?.generation) { _, _ in
             // Update available nodes when topology generation changes

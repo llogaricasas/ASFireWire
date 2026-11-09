@@ -1,6 +1,8 @@
 #include "../Common/ActionTeardown.hpp"
 #include "DriverContext.hpp"
 
+#include <algorithm>
+
 #include <net.asfw.driver/ASFWDriver.h>
 
 #include <PCIDriverKit/IOPCIFamilyDefinitions.h>
@@ -31,6 +33,8 @@
 #include "../Hardware/HardwareInterface.hpp"
 #include "../Hardware/InterruptManager.hpp"
 #include "../Logging/Logging.hpp"
+#include "../Midi/Core/MidiEndpointPublication.hpp"
+#include "../Midi/Core/MidiNubPublisher.hpp"
 #include "../Protocols/AVC/FCPResponseRouter.hpp"
 #include "../Protocols/AVC/AVCDiscovery.hpp"
 #include "../Protocols/SBP2/AddressSpaceManager.hpp"
@@ -49,7 +53,7 @@ void ServiceContext::DisarmProviderNotifications() {
         auto* source = providerNotifications.detach();
         auto* action = providerNotificationAction.detach();
         ASFW_LOG(Controller, "[Teardown] provider notifications cancel requested source=%p action=%p", source, action);
-        auto done = teardownCompletion->Begin();
+        auto done = teardownCompletion->Begin("provider notifications");
         const kern_return_t kr = source->Cancel(^{
             ASFW_LOG(Controller, "[Teardown] provider notifications cancel completed source=%p action=%p", source, action);
             source->release();
@@ -84,6 +88,14 @@ void ServiceContext::Reset(ResetMode mode) {
     // The registry is co-owned by the controller's own deps_ copy, which must be dropped
     // explicitly: ~ControllerCore destroys busImpl_ before deps_, so letting the registry
     // die with the controller would call through a dangling bus.
+    // MIDI goes before the audio it rides. Detach the observer first so no
+    // publication can reach a MIDI object that is going away, then terminate
+    // the MIDI nubs: their services hold a retained view of a seam that the
+    // endpoints below are about to drop, and a rebuild (wake) publishes the
+    // endpoints again with a fresh seam, which needs fresh nubs.
+    if (audioCoordinator) audioCoordinator->SetEndpointObserver(nullptr);
+    if (midiNubPublisher) midiNubPublisher->TerminateAll();
+    midiPublication.reset();
     ASFW_LOG(Controller, "[Teardown] release audio coordinator begin");
     audioCoordinator.reset();
     ASFW_LOG(Controller, "[Teardown] release audio coordinator complete");
@@ -94,6 +106,8 @@ void ServiceContext::Reset(ResetMode mode) {
         controller->AttachROMScanner(nullptr);
     }
     deps.audioRuntimeRegistry.reset();
+    // The endpoints named the publisher as their receive wake; it outlives them.
+    midiNubPublisher.reset();
     // Same hazard for SBP-2: SessionRegistry and every LoginSession borrow the
     // controller-owned bus (EnsureSbp2Deps passes controller->Bus()).
     // ~SessionRegistry logs out still-logged-in sessions and ~LoginSession
@@ -268,6 +282,13 @@ void DriverWiring::EnsureDeps(ASFWDriver* driver, ::ServiceContext& ctx) {
         ASFW_LOG(Controller, "[Controller] ✅ AudioCoordinator initialized");
     }
 
+    if (ctx.audioCoordinator && d.audioRuntimeRegistry && !ctx.midiPublication) {
+        ctx.midiNubPublisher = std::make_shared<ASFW::Midi::MidiNubPublisher>(driver);
+        ctx.midiPublication = std::make_shared<ASFW::Midi::MidiEndpointPublication>(
+            *d.audioRuntimeRegistry, *ctx.midiNubPublisher, *ctx.midiNubPublisher);
+        ctx.audioCoordinator->SetEndpointObserver(ctx.midiPublication.get());
+    }
+
     if (ctx.audioCoordinator) {
         std::weak_ptr<ASFW::Audio::AudioCoordinator> weakAudio = ctx.audioCoordinator;
         d.cycleInconsistentCallback = [weakAudio] {
@@ -311,7 +332,7 @@ kern_return_t DriverWiring::EnsureSbp2Deps(ASFWDriver& service, ::ServiceContext
     if (d.audioRuntimeRegistry && d.sbp2SessionScheduler) {
         d.audioRuntimeRegistry->SetTimerScheduler(d.sbp2SessionScheduler.get());
     }
-    // Keeps the DICE restart quiet period (AUDIO_SESSION_REDESIGN.md S4a).
+    // Keeps the DICE restart quiet period.
     if (ctx.audioCoordinator && d.sbp2SessionScheduler) {
         ctx.audioCoordinator->SetSessionTimer(d.sbp2SessionScheduler.get());
     }
@@ -319,10 +340,24 @@ kern_return_t DriverWiring::EnsureSbp2Deps(ASFWDriver& service, ::ServiceContext
     if (!d.sbp2SessionRegistry && ctx.controller && d.sbp2AddressSpaceManager &&
         d.deviceRegistry && d.deviceManager && d.sbp2SessionScheduler) {
         auto& bus = ctx.controller->Bus();
+        // SBP-2 §5.1.2: max_payload is bounded by our own max_rec; the login
+        // response and link speed clip it further (FetchAgent::MaxPayloadLog).
+        uint16_t maxPayload = 0;
+        if (d.hardware) {
+            if (auto access = d.hardware->TryBeginAccess()) {
+                const auto options = FW::DecodeBusOptions(access.Read(Register32::kBusOptions));
+                maxPayload = static_cast<uint16_t>(std::min(
+                    FW::MaxAsyncPayloadBytesFromMaxRec(options.maxRec), 4096u));
+            }
+        }
+        if (maxPayload == 0) {
+            ASFW_LOG(Controller, "[Controller] SBP2 max_payload: BusOptions unreadable, using 512");
+            maxPayload = 512;
+        }
         d.sbp2SessionRegistry = std::make_shared<ASFW::Protocols::SBP2::SessionRegistry>(
             bus, bus, *d.sbp2AddressSpaceManager, *d.deviceRegistry, *d.deviceManager,
             *d.sbp2SessionScheduler,
-            ctx.workQueue.get());
+            ctx.workQueue.get(), maxPayload);
         if (d.busReset) {
             // Last-resort recovery for targets whose fetch engine wedges so hard
             // that even the LUN-reset management ORB is never fetched (LS-9000).
@@ -334,6 +369,17 @@ kern_return_t DriverWiring::EnsureSbp2Deps(ASFWDriver& service, ::ServiceContext
                                                   "SBP2 LUN-reset escalation");
                 }
             });
+        }
+        if (d.hardware) {
+            std::weak_ptr<HardwareInterface> weakHardware = d.hardware;
+            d.sbp2SessionRegistry->SetPhysicalDmaEnabler(
+                [weakHardware](uint16_t node, uint16_t generation)
+                    -> std::expected<void, PhysicalDmaError> {
+                    if (auto hardware = weakHardware.lock()) {
+                        return hardware->EnablePhysicalRequests(node, generation);
+                    }
+                    return std::unexpected(PhysicalDmaError::HardwareGone);
+                });
         }
         ASFW_LOG(Controller, "[Controller] SBP2 SessionRegistry initialized");
     }

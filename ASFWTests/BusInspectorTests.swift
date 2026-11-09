@@ -25,7 +25,7 @@ struct BusInspectorTests {
 
     @Test func everydayFeaturesAndReportsStayOutsideAdvancedTools() {
         let sections: [ModernContentView.SidebarSection] = [
-            .dvCapture, .busInspector, .avcUnits, .duet, .audioAnalyzer,
+            .dvCapture, .busInspector, .avcUnits, .deviceControls, .audioAnalyzer,
             .diagnostics, .diceReport, .avcReport, .logs, .loggingSettings
         ]
         #expect(sections.allSatisfy { !$0.requiresAdvancedTools })
@@ -33,6 +33,8 @@ struct BusInspectorTests {
         #expect(ModernContentView.SidebarSection.avcCommands.requiresAdvancedTools)
         #expect(ModernContentView.SidebarSection.busReset.requiresAdvancedTools)
         #expect(!ModernContentView.SidebarSection.allCases.contains { $0.rawValue == "Saffire" })
+        // Duet controls live in Device Controls, drawn from the driver's model.
+        #expect(!ModernContentView.SidebarSection.allCases.contains { $0.rawValue == "Duet" })
         #if DEBUG
         #expect(AdvancedToolsSettings.defaultEnabled)
         #else
@@ -98,5 +100,41 @@ struct BusInspectorTests {
         #expect(model.statusMessage == nil)
         #expect(model.isLoading == false)
         #expect(model.liveReadState == .idle)
+    }
+
+    // Node IDs can be reassigned on a bus reset, so after a generation change
+    // the selected ID may name a different device.
+    @Test func generationChangeDropsSelectionInsteadOfRemappingByNodeID() {
+        let topologyVM = TopologyViewModel(connector: ASFWDriverConnector())
+        topologyVM.topology = topology(3)
+        let model = RomExplorerViewModel(topologyViewModel: topologyVM)
+        model.selectNode(node(1))
+
+        topologyVM.topology = topology(4)
+        model.refreshAvailableNodes()
+
+        #expect(model.selectedNode == nil)
+        #expect(model.statusMessage == RomExplorerViewModel.busResetMessage)
+    }
+
+    @Test func sameGenerationRefreshKeepsSelection() {
+        let topologyVM = TopologyViewModel(connector: ASFWDriverConnector())
+        topologyVM.topology = topology(3)
+        let model = RomExplorerViewModel(topologyViewModel: topologyVM)
+        model.selectNode(node(1))
+
+        topologyVM.topology = topology(3)
+        model.refreshAvailableNodes()
+
+        #expect(model.selectedNode?.nodeId == 1)
+        #expect(model.statusMessage == nil)
+    }
+
+    @Test func topologyIsStaleOnlyWhenTheDriverGenerationDiffers() {
+        #expect(RomExplorerViewModel.isTopologyStale(viewGeneration: 3, driverGeneration: 4))
+        #expect(!RomExplorerViewModel.isTopologyStale(viewGeneration: 3, driverGeneration: 3))
+        #expect(!RomExplorerViewModel.isTopologyStale(viewGeneration: 3, driverGeneration: nil))
+        // The driver reports the 8-bit bus generation.
+        #expect(!RomExplorerViewModel.isTopologyStale(viewGeneration: 259, driverGeneration: 3))
     }
 }

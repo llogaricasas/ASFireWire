@@ -6,6 +6,7 @@
 //
 
 #pragma once
+#include "../Controls/CoreAudioControlProperties.hpp"
 
 #include "AudioPropertyKeys.hpp"
 #include "AvcVolumeMapping.hpp"
@@ -41,6 +42,7 @@ struct ASFWAudioWireStream {
     uint32_t midiPorts{0};
     uint32_t channelOffset{0};
     Wire::PcmSlotMap pcmSlotMap{};
+    uint32_t packedPcmChunks{0};
 
     friend bool operator==(const ASFWAudioWireStream&,
                            const ASFWAudioWireStream&) noexcept = default;
@@ -87,6 +89,7 @@ struct ASFWAudioDevice {
     /// publishing (DICE); see PropertyKeys::kResolvedGeometryRequired.
     bool resolvedGeometryRequired{false};
     bool graphResolved{false};
+    std::vector<Controls::CoreAudioControl> parameterControls;
     std::vector<AvcPublishedControl> avcControls;
 
     /// `sampleRates` came from the device (DICE CLOCK_CAPABILITIES) and the
@@ -208,7 +211,7 @@ struct ASFWAudioDevice {
                     uint32_t offset = 0;
                     for (const auto& stream : direction) {
                         result.push_back({stream.pcmChannels, stream.dataBlockSize,
-                            stream.midiPortCount ? stream.midiPortCount : stream.midiSlots, offset, stream.pcmSlots});
+                            stream.midiPortCount ? stream.midiPortCount : stream.midiSlots, offset, stream.pcmSlots, stream.packedPcmChunks});
                         offset += stream.pcmChannels;
                     }
                     return result;
@@ -218,6 +221,7 @@ struct ASFWAudioDevice {
                          formation.mode == Encoding::StreamMode::kBlocking ? 1U : 0U) ||
                     !add(PropertyKeys::kFormationProtocolSupported, formation.protocolSupported) ||
                     !add(PropertyKeys::kFormationHardwareValidated, formation.hardwareValidated) ||
+                    !add(PropertyKeys::kFormationLayoutProvisional, formation.layoutProvisional) ||
                     !add("ASFWMotuPackedPcm", formation.packedPcm) ||
                     !add("ASFWMotuCaptureMessageChunks", formation.packedCaptureMessageChunks) ||
                     !add("ASFWMotuPlaybackMessageChunks", formation.packedPlaybackMessageChunks) ||
@@ -242,28 +246,10 @@ struct ASFWAudioDevice {
             properties->setObject(PropertyKeys::kDeviceSampleRates, fromDevice.get());
         }
 
-        auto controls = OSSharedPtr(OSArray::withCapacity(static_cast<uint32_t>(avcControls.size())), OSNoRetain);
-        if (!controls) return false;
-        for (const auto& control : avcControls) {
-            auto entry = OSSharedPtr(OSDictionary::withCapacity(10), OSNoRetain);
-            if (!entry) return false;
-            const auto add = [&](const char* key, uint32_t value) {
-                auto number = OSSharedPtr(OSNumber::withNumber(value, 32), OSNoRetain);
-                if (!number) return false;
-                entry->setObject(key, number.get()); return true;
-            };
-            if (!add("Token", control.token) || !add("Scope", control.scope) || !add("Element", control.element) ||
-                !add("HasMute", control.hasMute) || !add("Muted", control.muted) || !add("HasVolume", control.hasVolume) ||
-                !add("Current", static_cast<uint16_t>(control.current)) ||
-                !add("Minimum", static_cast<uint16_t>(control.range.minimum)) ||
-                !add("Maximum", static_cast<uint16_t>(control.range.maximum)) ||
-                !add("Resolution", static_cast<uint16_t>(control.range.resolution))) return false;
-            auto name = OSSharedPtr(OSString::withCString(control.name), OSNoRetain);
-            if (!name) return false;
-            entry->setObject("Name", name.get());
-            controls->setObject(entry.get());
-        }
-        properties->setObject(kAvcControlsProperty, controls.get());
+        auto parameterProperties = Controls::EncodeControls(parameterControls);
+        if (!parameterProperties) return false;
+        properties->setObject(Controls::kControlsProperty, parameterProperties.get());
+
         return true;
     }
 
@@ -286,7 +272,8 @@ private:
             auto slots = OSSharedPtr(OSNumber::withNumber(stream.am824Slots, 32), OSNoRetain);
             auto midi = OSSharedPtr(OSNumber::withNumber(stream.midiPorts, 32), OSNoRetain);
             auto offset = OSSharedPtr(OSNumber::withNumber(stream.channelOffset, 32), OSNoRetain);
-            if (!entry || !pcm || !slots || !midi || !offset) {
+            auto chunks = OSSharedPtr(OSNumber::withNumber(stream.packedPcmChunks, 32), OSNoRetain);
+            if (!entry || !pcm || !slots || !midi || !offset || !chunks) {
                 // A partial array describes a device that does not exist. The
                 // caller turns this into a failed publication rather than a
                 // published device with the wrong shape.
@@ -304,6 +291,7 @@ private:
             entry->setObject(PropertyKeys::kStreamAm824Slots, slots.get());
             entry->setObject(PropertyKeys::kStreamMidiPorts, midi.get());
             entry->setObject(PropertyKeys::kStreamChannelOffset, offset.get());
+            if (stream.packedPcmChunks) entry->setObject("ASFWMotuPcmChunks", chunks.get());
             array->setObject(entry.get());
         }
         properties->setObject(key, array.get());

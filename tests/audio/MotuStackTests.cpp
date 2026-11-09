@@ -64,7 +64,7 @@ TEST(MotuStack, ProprietaryReceivePrefixIsScopedToV3Codec) {
 // choice; activation is. Each FireWire-only model waits for the regulator's
 // lock before the device may fetch.
 TEST(MotuStack, ActivationPoliciesAreChosenPerModel) {
-    for (auto version : {1U,2U,3U,5U,9U,13U,15U,21U,23U,25U,27U}) {
+    for (auto version : {1U,2U,3U,5U,9U,13U,15U,21U,23U,25U,27U,57U}) {
         ASSERT_TRUE(FireWireOnly(version));
         EXPECT_TRUE(FindModel(version)->runtime.requireTimingBeforeFetch) << version;
     }
@@ -87,14 +87,14 @@ TEST(MotuStack, PresentationLeadIsThreeCyclesForEveryModel) {
     }
 }
 
-// The absolute-phase setpoint is a model parameter too: +510 ticks at 48 kHz
+// The absolute-phase setpoint is a model parameter too: +13 ticks at 48 kHz
 // for every model, the value seen on the wire of the official 828mk3 driver.
-TEST(MotuStack, AbsolutePhaseSetpointIs510TicksAt48kForEveryModel) {
-    EXPECT_EQ(kDefaultAbsolutePhaseSetpointTicks48k, 510);
-    EXPECT_EQ(k828mk3Policy.absolutePhaseSetpointTicks48k, 510);
+TEST(MotuStack, PresentationOffsetIs13FramesForEveryModel) {
+    EXPECT_EQ(kDefaultPresentationOffsetFrames, 13);
+    EXPECT_EQ(k828mk3Policy.presentationOffsetFrames, 13);
     for (const auto& model : kModels) {
         SCOPED_TRACE(model.name);
-        EXPECT_EQ(model.runtime.absolutePhaseSetpointTicks48k, 510);
+        EXPECT_EQ(model.runtime.presentationOffsetFrames, 13);
     }
 }
 

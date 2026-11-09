@@ -363,3 +363,44 @@ TEST(NubGeometryRoundTrip, Packed34ChannelCaptureAndLastNameSurvivePublication) 
     ASSERT_EQ(parsed.captureStreamCount,1U); EXPECT_EQ(parsed.captureStreams[0].pcmChannels,34U);
     EXPECT_EQ(parsed.rateFormationCandidates,dev.rateFormationCandidates);
 }
+
+TEST(NubGeometryRoundTrip, MotuHostAndWireWidthsSurviveTheCrossingSeparately) {
+    ASFWAudioDevice device{};
+    device.currentSampleRate=48000; device.sampleRates={48000}; device.usesRateFormations=true;
+    ASFW::Audio::Runtime::RateFormation formation{};
+    formation.sampleRateHz=48000;formation.protocolSupported=true;formation.packedPcm=true;
+    formation.playback={{14,13,0,{},0,14}};
+    formation.capture={{14,16,0,{},0,18}};
+    device.rateFormationCandidates={formation};
+    device.outputChannelCount=14;device.inputChannelCount=14;device.channelCount=14;
+    device.playbackStreams={{14,13,0,0,{},14}};
+    device.captureStreams={{14,16,0,0,{},18}};
+    bool published=false;
+    const auto parsed=RoundTrip(device,published);
+    ASSERT_TRUE(published);
+    ASSERT_EQ(parsed.rateFormationCandidates.size(),1U);
+    EXPECT_EQ(parsed.captureStreams[0].pcmChannels,14U);
+    EXPECT_EQ(parsed.captureStreams[0].packedPcmChunks,18U);
+    EXPECT_EQ(parsed.rateFormationCandidates[0].capture[0].packedPcmChunks,18U);
+    EXPECT_EQ(parsed.rateFormationCandidates[0].playback[0].packedPcmChunks,14U);
+}
+
+TEST(NubGeometryRoundTrip, ProvisionalLayoutFlagSurvivesTheCrossing) {
+    auto device = MakeVeniceF24();
+    ASFW::Audio::Runtime::RateFormation base{};
+    base.sampleRateHz = 48000;
+    base.protocolSupported = true;
+    base.playback = {{2, 3, 1, {}}};
+    base.capture = base.playback;
+    auto placeholder = base;
+    placeholder.sampleRateHz = 96000;
+    placeholder.layoutProvisional = true;
+    device.rateFormationCandidates = {base, placeholder};
+    bool published = false;
+    const auto parsed = RoundTrip(device, published);
+    ASSERT_TRUE(published);
+    ASSERT_EQ(parsed.rateFormationCandidates.size(), 2U);
+    EXPECT_FALSE(parsed.rateFormationCandidates[0].layoutProvisional);
+    EXPECT_TRUE(parsed.rateFormationCandidates[1].layoutProvisional);
+    EXPECT_EQ(parsed.rateFormationCandidates, device.rateFormationCandidates);
+}

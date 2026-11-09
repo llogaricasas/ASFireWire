@@ -1,6 +1,6 @@
 // TxPacketizerTestSupport.hpp -- frame packets the way DiceTxStreamEngine does.
 //
-// The packetizer keeps no audio-frame cursor (documentation/TX_OWNERSHIP.md):
+// The packetizer keeps no audio-frame cursor:
 // its caller decides DATA vs NO-DATA and the frames of each packet, and owns
 // the frame cursor. Tests that drive the packetizer directly use this helper,
 // which mirrors DiceTxStreamEngine::PrepareNextTransmitSlot's framing step,
@@ -34,6 +34,7 @@ inline bool PrepareCadencePacket(ASFW::Protocols::Audio::AMDTP::AmdtpTxPacketize
     if (!packetizer.PrepareNextPacket(slot, timing, plan, out)) {
         return false;
     }
+    if (!packetizer.ExposePreparedPacket(slot, out)) return false;
     if (out.isData) {
         nextAudioFrame += out.framesInPacket;
     }

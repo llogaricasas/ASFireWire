@@ -116,10 +116,67 @@ void DirectAudioReceiveConsumer::OnReceiveQuiesced() noexcept {
     if (timingObserver_ != nullptr) {
         timingObserver_->Reset();
     }
+    // The receive stream stopped. A restart inside the session keeps the MIDI
+    // epoch, so without a mark the half of a message received before the stop
+    // would be joined with the bytes after it. Mark while still bound; the
+    // sink refuses a block that is no longer armed, which is already a break.
+    MarkMidiGapAllPorts();
+    UnbindMidi();
     inputWriter_.Unbind();
     clockPublisher_.Unbind();
     inputView_ = {};
     replayResetForStart_ = false;
+}
+
+void DirectAudioReceiveConsumer::UnbindMidi() noexcept {
+    midiSink_.Unbind();
+    midiBinding_ = {};
+    midiBound_ = false;
+    midiBytesThisBatch_ = false;
+    lastMidiBindingGeneration_ = 0;
+    midiBoundEpoch_ = 0;
+}
+
+void DirectAudioReceiveConsumer::MarkMidiGapAllPorts() noexcept {
+    if (!midiBound_) return;
+    for (uint8_t port = 0; port < midiBinding_.geometry.portCount; ++port) {
+        midiSink_.MarkMidiDiscontinuity(port);
+    }
+}
+
+void DirectAudioReceiveConsumer::RefreshMidiBinding(
+    const ::ASFW::Audio::Runtime::MidiReceiveBinding& binding) noexcept {
+    // MIDI rides stream 0 only; a secondary slice carries no MPX slot.
+    if (configuration_.isSecondary || !binding.Valid()) {
+        if (midiBound_) UnbindMidi();
+        return;
+    }
+    // The epoch is the stream the bytes belong to. It is latched with the
+    // binding: a restart in place moves it, and the ring sink refuses a stale
+    // one rather than append the old run's bytes to the new run's ring.
+    const uint64_t epoch = binding.block->streamEpoch.load(std::memory_order_acquire);
+    if (midiBound_ && binding.generation == lastMidiBindingGeneration_ &&
+        epoch == midiBoundEpoch_) {
+        return;
+    }
+    midiBinding_ = binding;
+    midiSink_.Bind(binding.block, epoch);
+    midiBoundEpoch_ = epoch;
+    lastMidiBindingGeneration_ = binding.generation;
+    midiBound_ = true;
+    midiBytesThisBatch_ = false;
+}
+
+void DirectAudioReceiveConsumer::EndReceiveBatch(
+    const ::ASFW::Isoch::IsochReceiveBatch&) noexcept {
+    // The bytes of every packet in this drain are in the rings now. Notify
+    // once: a wake from the first packet would let the MIDI queue drain and
+    // finish before the later packets were written, stranding their bytes.
+    if (!midiBytesThisBatch_) return;
+    midiBytesThisBatch_ = false;
+    if (midiBound_ && midiBinding_.wake != nullptr) {
+        midiBinding_.wake->MidiReceived(midiBinding_.endpointId);
+    }
 }
 
 void DirectAudioReceiveConsumer::BeginReceiveBatch(
@@ -133,6 +190,7 @@ void DirectAudioReceiveConsumer::BeginReceiveBatch(
 
     ::ASFW::Audio::Runtime::DirectAudioBindingSnapshot snapshot{};
     if (!bindingSource_->CopyDirectAudioBinding(snapshot)) {
+        UnbindMidi();
         if (lastBindingGeneration_ != 0) {
             inputWriter_.Unbind();
             clockPublisher_.Unbind();
@@ -142,6 +200,7 @@ void DirectAudioReceiveConsumer::BeginReceiveBatch(
         }
         return;
     }
+    RefreshMidiBinding(snapshot.midiRx);
     if (snapshot.generation == lastBindingGeneration_) {
         return;
     }
@@ -242,14 +301,29 @@ void DirectAudioReceiveConsumer::ConsumePacket(
     }
 
     const bool primeDelayLine = primeCaptureDelayLine_;
+    RxMidiExtraction midi{};
+    if (midiBound_) {
+        midi.sink = &midiSink_;
+        midi.geometry = midiBinding_.geometry;
+        midi.counters = &midiCounters_;
+        // This drain's own pair, not anything held across BeginReceiveBatch:
+        // the batch is handed to every ConsumePacket, so each packet is dated
+        // against the right reference (the dead [MidiIn] t= on the midi branch
+        // came from a begin-hook that dropped its batch argument).
+        midi.drainCycleTimer = batch.drainCycleTimer;
+        midi.drainHostTicks = batch.drainHostTicks;
+    }
     const RxAudioPacketProcessorResult result = processor_.ProcessPacket(
         packet.payload.data(), packet.payload.size(),
         absoluteFrameCursor_, channels,
         *payloadCodec_, configuration_.channelOffset,
         !configuration_.isSecondary, configuration_.captureChannelMap,
-        primeDelayLine, configuration_.framing);
+        primeDelayLine, configuration_.framing, midi);
     if (primeDelayLine && result.framesDecoded != 0) {
         primeCaptureDelayLine_ = false;
+    }
+    if (result.midiBytesDelivered != 0) {
+        midiBytesThisBatch_ = true;
     }
     // Attribute every decoded packet before the reject branch returns; the
     // master stream only, so a second slice cannot double-count.
@@ -416,7 +490,7 @@ void DirectAudioReceiveConsumer::ConsumePacket(
     if (timingObserver_ != nullptr && !configuration_.isSecondary) {
         timingObserver_->ObservePacket(
             std::span<const uint8_t>(packet.payload.data(), packet.payload.size()),
-            result.strideQuadlets, result.framesDecoded, cycleFields.cycle);
+            result.strideQuadlets, result.framesDecoded, cycleFields.cycle, replayEntry.firstAudioFrame);
     }
 
     if (result.hasValidCip && result.syt != 0xffff) {
@@ -474,7 +548,7 @@ void DirectAudioReceiveConsumer::ConsumePacket(
     //
     // With a Receive epoch on the device's hardware timeline, the packet is an
     // observation and the timeline projects every ZTS boundary it covers,
-    // including one inside the packet (documentation/HARDWARE_TIMELINE_OWNERSHIP.md).
+    // including one inside the packet.
     // The observation is the packet's arrival: its receive bus time and the
     // drain's (bus, host) pair, the same arithmetic as the host time above,
     // so a boundary on a packet start is byte-identical to before.
@@ -663,6 +737,11 @@ void DirectAudioReceiveConsumer::ResetReplayEpochForDiscontinuity(
     ReplayResetReason reason,
     const ReplayResetContext& context,
     bool reportTimingLoss) noexcept {
+    // A receive-cycle gap is a packet the device sent and we never saw: any MIDI
+    // byte in it is gone, so no message may span the hole.
+    if (reason == ReplayResetReason::kReceiveCycleGap) {
+        MarkMidiGapAllPorts();
+    }
     auto* control = inputView_.control;
     if (!control || !replayResetForStart_) {
         replayCycleInitialized_ = false;
@@ -676,7 +755,6 @@ void DirectAudioReceiveConsumer::ResetReplayEpochForDiscontinuity(
     // would move the input ring and the RX replay the TX cursor aligns from
     // (milestone 6). Accounting for the lost frames, instead of the restart
     // the timing-loss callback triggers, is FW-218's call.
-    // documentation/HARDWARE_TIMELINE_OWNERSHIP.md decision (b).
     if (wasEstablished && !configuration_.isSecondary) {
         auto& timeline = control->hardwareTimeline;
         if (timeline.Epoch() != 0 &&

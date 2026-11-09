@@ -16,6 +16,11 @@ enum class FirefaceModel : uint8_t { kFF400, kFF800 };
 // fireface_def.h:84-90, fireface_flash.cpp:59-82 and ALSA former/ff400.rs:399-455,
 // ff800.rs:113-174. All register values are little-endian quadlets.
 namespace Register {
+// Raw read words: +0 sync status, +4 clock/settings, +8 FF800 transmit channel
+// (0xffffffff pending, else low 6 bits), +12 unresolved. RME 3.41 kext x86_64
+// hwStart 0x3fa2/0x4149/0x42ae. Its UserClientReadStatus 0x1be8 instead returns
+// q0/q1 plus software rate/counter; do not confuse that API with this raw block.
+// Evidence and vendor names: documentation/ff800-vendor-status.md.
 inline constexpr uint64_t kStatus = 0x801c0000ULL;
 // Same address, write side: one quadlet per playback data channel. 0 lets the
 // device fetch PCM from that channel, 1 mutes it (FFADO RME_FF_CHANNEL_MUTE_MASK,
@@ -35,19 +40,8 @@ inline constexpr uint32_t kFF400FlashPolls = 25;
 inline constexpr uint32_t kFF400FlashPollIntervalMs = 2;
 inline constexpr uint64_t kFF400Revision = 0x80100290ULL;
 inline constexpr uint64_t kFF800Init = 0x00020000001cULL;
-// The rest of the init block, which Linux writes as its own registers at
-// 0xfc88f000 + 4 and + 8 (FF800_RX_PACKET_FORMAT, FF800_ALLOC_TX_STREAM,
-// ff-protocol-former.c) and FFADO writes in one 3-quadlet block from
-// 0x20000001c. The FF800 latches the packet format only once the new
-// sample-transfer frequency is in effect, so the driver writes the frequency
-// alone first and waits for it (see FirefaceFamilyDriver::WaitForConfigured48k).
-inline constexpr uint64_t kFF800PacketFormat = 0x000200000020ULL;   // FF800_RX_PACKET_FORMAT + the tx stream size
-// Linux sleeps a flat 100 ms after the frequency write, because "if starting
-// isochronous communication immediately, change of STF has no effect... let's
-// sleep for a bit". The driver reads the frequency back instead of sleeping
-// blind, so the bound only has to be above that sleep.
-inline constexpr uint32_t kFF800RateSettleTimeoutMs = 200;
-inline constexpr uint32_t kFF800RateSettlePollMs = 5;
+// RME 3.41 x86_64 hwInitDevice 0x7919 sends all three init words together;
+// no separate format-tail command or inter-word settling delay is established.
 inline constexpr uint64_t kFF800Start = 0x000200000028ULL;
 inline constexpr uint64_t kFF800Stop = 0x000200000034ULL;
 inline constexpr uint64_t kFF800Revision = 0x000200000100ULL;

@@ -90,6 +90,7 @@ void ROMScanSession::Start(ROMScanRequest request, ScanCompletionCallback comple
         }
 
         session->gen_ = request.gen;
+        session->scanActive_ = true;
         session->topology_ = std::move(request.topology);
         session->localNodeId_ = request.localNodeId;
         session->completion_ = std::move(completion);
@@ -98,25 +99,10 @@ void ROMScanSession::Start(ROMScanRequest request, ScanCompletionCallback comple
         session->hadBusyNodes_ = false;
         session->inflight_ = 0;
         session->completedROMs_.clear();
+        session->previousROMs_ = std::move(request.previousROMs);
         session->nodeScans_.clear();
         session->rootProbeStarted_ = false;
         session->rootProbeTerminal_ = false;
-
-        const auto initialSpeedFor = [session](uint8_t nodeId) {
-            const auto pathSpeed = Driver::PathSpeedCodeBetween(
-                session->topology_, session->localNodeId_, nodeId);
-            const auto chosen = pathSpeed
-                                    ? std::min(session->params_.startSpeed,
-                                               static_cast<FwSpeed>(*pathSpeed))
-                                    : session->params_.startSpeed;
-            ASFW_LOG(ConfigROM,
-                     "[ROMScanSpeed] gen=%u local=%u node=%u pathCode=%d configuredStart=S%u selectedStart=S%u",
-                     session->gen_.value, session->localNodeId_, nodeId,
-                     pathSpeed ? static_cast<int>(*pathSpeed) : -1,
-                     100u << static_cast<uint8_t>(session->params_.startSpeed),
-                     100u << static_cast<uint8_t>(chosen));
-            return chosen;
-        };
 
         if (request.targetNodes.empty()) {
             for (const auto& node : session->topology_.physical.nodes) {
@@ -127,7 +113,7 @@ void ROMScanSession::Start(ROMScanRequest request, ScanCompletionCallback comple
                     continue;
                 }
                 session->nodeScans_.emplace_back(node.physicalId, session->gen_,
-                                                 initialSpeedFor(node.physicalId),
+                                                 FwSpeed::S100,
                                                  session->params_.perStepRetries);
                 session->nodeScans_.back().SetConfigROMReadyRetriesLeft(
                     session->params_.configROMReadyRetries);
@@ -142,7 +128,7 @@ void ROMScanSession::Start(ROMScanRequest request, ScanCompletionCallback comple
                 if (nodeId == session->localNodeId_) {
                     continue;
                 }
-                session->nodeScans_.emplace_back(nodeId, session->gen_, initialSpeedFor(nodeId),
+                session->nodeScans_.emplace_back(nodeId, session->gen_, FwSpeed::S100,
                                                  session->params_.perStepRetries);
                 session->nodeScans_.back().SetConfigROMReadyRetriesLeft(
                     session->params_.configROMReadyRetries);
@@ -175,8 +161,9 @@ void ROMScanSession::Abort() {
         session->completionNotified_ = true;
         session->nodeScans_.clear();
         session->completedROMs_.clear();
+        session->previousROMs_.clear();
         session->inflight_ = 0;
-        session->gen_ = Generation{0};
+        session->scanActive_ = false;
         session->hadBusyNodes_ = false;
     });
 }
@@ -343,7 +330,8 @@ void ROMScanSession::StartBIBRead(ROMScanNodeStateMachine& node) {
 
     const uint8_t nodeId = node.NodeId();
     const Generation gen = gen_;
-    const auto speed = node.CurrentSpeed();
+    // Linux core-device.c:593-614 reads the BIB at S100 before speed selection.
+    const auto speed = FwSpeed::S100;
     NotifyRootBIBPending(nodeId);
 
     auto weakSelf = weak_from_this();
@@ -358,6 +346,17 @@ void ROMScanSession::StartBIBRead(ROMScanNodeStateMachine& node) {
 }
 
 void ROMScanSession::RetryWithFallback(ROMScanNodeStateMachine& node) {
+    if (node.CurrentState() == ROMScanNodeStateMachine::State::ReadingBIB) {
+        // BIB access is already at the floor. A booting/busy device or a failed
+        // S100 read says nothing about its maximum operational speed.
+        if (node.RetriesLeft() > 0) {
+            node.DecrementRetries();
+            (void)TransitionNodeState(node, ROMScanNodeStateMachine::State::Idle, "BIB retry at S100");
+        } else {
+            (void)TransitionNodeState(node, ROMScanNodeStateMachine::State::Failed, "BIB retries exhausted");
+        }
+        return;
+    }
     const auto oldSpeed = node.CurrentSpeed();
     (void)oldSpeed;
     const RetryBackoffPolicy retryPolicy{};
@@ -468,7 +467,7 @@ Driver::Role::RootBibReadStatus ROMScanSession::MapBIBFailureStatus(
 }
 
 void ROMScanSession::HandleBIBComplete(uint8_t nodeId, ROMReader::ReadResult result) {
-    if (aborted_.load(std::memory_order_relaxed) || result.generation != gen_) {
+    if (aborted_.load(std::memory_order_relaxed) || !IsCurrentScan(result.generation)) {
         return;
     }
 
@@ -539,9 +538,7 @@ void ROMScanSession::HandleBIBComplete(uint8_t nodeId, ROMReader::ReadResult res
     ASFW_LOG(ConfigROM,
              "Node %u BIB: link_spd=%u max_rec=%u readSpeed=S%u gen=%u",
              nodeId, bibRes->bib.linkSpd, bibRes->bib.maxRec,
-             100u << static_cast<uint8_t>(node.CurrentSpeed()), gen_.value);
-
-    speedPolicy_.RecordSuccess(nodeId, node.CurrentSpeed());
+             100u << static_cast<uint8_t>(FwSpeed::S100), gen_.value);
 
     if (bibRes->bib.format == ConfigROMFormat::Minimal1212) {
         NotifyRootBIBFailure(nodeId, Driver::Role::RootBibReadStatus::Failed);
@@ -549,9 +546,85 @@ void ROMScanSession::HandleBIBComplete(uint8_t nodeId, ROMReader::ReadResult res
         return;
     }
 
-    NotifyRootBIBSuccess(nodeId, bibRes->bib);
+    SelectOperationalSpeed(node);
+}
 
-    ContinueAfterBIBSuccess(node, nodeId);
+void ROMScanSession::SelectOperationalSpeed(ROMScanNodeStateMachine& node) {
+    const auto path = Driver::PathSpeedCodeBetween(topology_, localNodeId_, node.NodeId());
+    auto candidate = path ? std::min(params_.startSpeed, static_cast<FwSpeed>(*path)) : FwSpeed::S100;
+    if (const auto learned = speedPolicy_.ObservedSpeed(FW::NodeId{node.NodeId()}))
+        candidate = std::min(candidate, *learned);
+    node.SetCurrentSpeed(candidate);
+
+    // Linux core-device.c:615-644: probe after the BIB, before the root dir.
+    // ROM link_spd decides whether probing is needed; it is not the probe's
+    // starting limit, since firmware can under-report it.
+    const bool probe = candidate > FwSpeed::S100 &&
+        (node.ROM().bib.linkSpd < static_cast<uint8_t>(candidate) ||
+         (path && *path >= static_cast<uint8_t>(FwSpeed::S800)) || topology_.betaRepeatersPresent ||
+         topology_.physical.betaRepeatersPresent);
+    if (probe) {
+        if (!TransitionNodeState(node, ROMScanNodeStateMachine::State::ProbingSpeed, "operational speed probe")) {
+            Pump(); return;
+        }
+        StartSpeedProbe(node);
+    } else {
+        FinishSpeedSelection(node);
+    }
+}
+
+void ROMScanSession::StartSpeedProbe(ROMScanNodeStateMachine& node) {
+    ++inflight_;
+    const auto nodeId = node.NodeId();
+    const auto speed = node.CurrentSpeed();
+    ASFW_LOG(ConfigROM, "[ROMSpeedProbe] gen=%u node=%u submit=S%u",
+             gen_.value, nodeId, SpeedMbps(speed));
+    reader_->ReadQuadletsBE(nodeId, gen_, speed, 0, 1,
+        [weakSelf = weak_from_this(), nodeId](ROMReader::ReadResult result) mutable {
+            if (auto self = weakSelf.lock()) {
+                self->DispatchAsync([self, nodeId, result = std::move(result)]() mutable {
+                    self->HandleSpeedProbeComplete(nodeId, std::move(result));
+                });
+            }
+        });
+}
+
+void ROMScanSession::HandleSpeedProbeComplete(uint8_t nodeId, ROMReader::ReadResult result) {
+    if (aborted_.load(std::memory_order_relaxed) || !IsCurrentScan(result.generation)) return;
+    if (inflight_ > 0) --inflight_;
+    auto* node = FindNode(nodeId);
+    if (!node || node->CurrentState() != ROMScanNodeStateMachine::State::ProbingSpeed) { Pump(); return; }
+    if (result.success && result.quadletsBE.size() == 1) {
+        FinishSpeedSelection(*node);
+        return;
+    }
+    hadBusyNodes_ = true;
+    ASFW_LOG(ConfigROM, "[ROMSpeedProbe] gen=%u node=%u failed=S%u status=%{public}s",
+             gen_.value, nodeId, SpeedMbps(node->CurrentSpeed()), Async::ToString(result.status));
+    if (result.status == Async::AsyncStatus::kAborted ||
+        result.status == Async::AsyncStatus::kStaleGeneration) {
+        (void)TransitionNodeState(*node, ROMScanNodeStateMachine::State::Failed, "speed probe terminated");
+        NotifyRootBIBFailure(nodeId, MapBIBFailureStatus(result.status));
+        Pump(); return;
+    }
+    node->SetCurrentSpeed(static_cast<FwSpeed>(static_cast<uint8_t>(node->CurrentSpeed()) - 1));
+    if (node->CurrentSpeed() == FwSpeed::S100) {
+        // Linux's probe stops at the floor: the initial BIB already proved S100.
+        FinishSpeedSelection(*node);
+    } else {
+        StartSpeedProbe(*node);
+    }
+}
+
+void ROMScanSession::FinishSpeedSelection(ROMScanNodeStateMachine& node) {
+    speedPolicy_.RecordSuccess(node.NodeId(), node.CurrentSpeed());
+    ASFW_LOG(ConfigROM, "[ROMSpeedProbe] gen=%u node=%u selected=S%u",
+             gen_.value, node.NodeId(), SpeedMbps(node.CurrentSpeed()));
+    // Role observers can start CSR transactions immediately. Publish BIB
+    // evidence only after those transactions can use the selected speed.
+    NotifyRootBIBSuccess(node.NodeId(), node.ROM().bib);
+    if (aborted_.load(std::memory_order_relaxed)) return;
+    ContinueAfterBIBSuccess(node, node.NodeId());
 }
 
 void ROMScanSession::ContinueAfterBIBSuccess(ROMScanNodeStateMachine& node, uint8_t nodeId) {
@@ -565,7 +638,37 @@ void ROMScanSession::ContinueAfterBIBSuccess(ROMScanNodeStateMachine& node, uint
     // Apple: IOFireWireFamily.kmodproj/IOFireWireDevice.cpp:917.
     // General IEEE 1394 ROMs always continue to the root directory; crc_length
     // is CRC coverage and must not be used as a total-ROM/minimal-ROM test.
+    ContinueToRootDirectory(node);
+}
+
+void ROMScanSession::ContinueToRootDirectory(ROMScanNodeStateMachine& node) {
+    if (const auto* previous = UnchangedROMPolicy::Find(node.ROM().rawQuadlets, previousROMs_)) {
+        CompleteFromPreviousROM(node, *previous);
+        return;
+    }
     StartRootDirRead(node);
+}
+
+void ROMScanSession::CompleteFromPreviousROM(ROMScanNodeStateMachine& node,
+                                             const ConfigROM& previous) {
+    ConfigROM rom = previous;
+    rom.gen = gen_;
+    rom.nodeId = node.NodeId();
+    rom.state = ROMState::Fresh;
+
+    if (!TransitionNodeState(node, ROMScanNodeStateMachine::State::Complete,
+                             "bus info block unchanged")) {
+        Pump();
+        return;
+    }
+
+    ASFW_LOG(ConfigROM,
+             "ROMScanSession: Node %u gen=%u bus info block unchanged (GUID=0x%016llx), "
+             "reusing the ROM read in gen=%u (%zu quadlets)",
+             node.NodeId(), gen_.value, rom.bib.guid, previous.gen.value, rom.rawQuadlets.size());
+    completedROMs_.push_back(std::move(rom));
+    MaybeFinish();
+    Pump();
 }
 
 bool ROMScanSession::ShouldDelayConfigROMReadyRetry(
@@ -643,7 +746,10 @@ void ROMScanSession::StartRootDirRead(ROMScanNodeStateMachine& node) {
         return;
     }
 
-    node.SetRetriesLeft(params_.perStepRetries);
+    // Give the root step its own initial budget, but preserve it across BIB
+    // rereads. Only RetryBackoffPolicy replenishes it after a speed fallback.
+    // Linux core-device.c:1020-1024 likewise retains ROM retries across scans.
+    node.InitializeRootDirRetries(params_.perStepRetries);
     ++inflight_;
 
     auto weakSelf = weak_from_this();
@@ -663,7 +769,7 @@ void ROMScanSession::HandleRootDirComplete(uint8_t nodeId, ROMReader::ReadResult
     if (aborted_.load(std::memory_order_relaxed)) {
         return;
     }
-    if (result.generation != gen_) {
+    if (!IsCurrentScan(result.generation)) {
         return;
     }
 
@@ -777,7 +883,7 @@ void ROMScanSession::EnsurePrefix(uint8_t nodeId,
                     if (self->aborted_.load(std::memory_order_relaxed)) {
                         return;
                     }
-                    if (res.generation != self->gen_) {
+                    if (!self->IsCurrentScan(res.generation)) {
                         return;
                     }
 
@@ -796,6 +902,7 @@ void ROMScanSession::EnsurePrefix(uint8_t nodeId,
 
                     if (!res.success || res.quadletsBE.empty()) {
                         ASFW_LOG(ConfigROM, "EnsurePrefix read failed: node=%u", nodeId);
+                        node->MutableROM().readIncomplete = true;
                         if (completionHolder && *completionHolder) {
                             (*completionHolder)(false);
                         }
@@ -814,6 +921,7 @@ void ROMScanSession::EnsurePrefix(uint8_t nodeId,
                         ASFW_LOG_V2(ConfigROM,
                                     "EnsurePrefix short read: node=%u have=%zu required=%u", nodeId,
                                     rawQuadlets.size(), requiredTotalQuadlets.value);
+                        node->MutableROM().readIncomplete = true;
                     }
 
                     if (completionHolder && *completionHolder) {
@@ -832,7 +940,7 @@ void ROMScanSession::MaybeFinish() {
     if (completionNotified_ || completion_ == nullptr) {
         return;
     }
-    if (gen_ == Generation{0}) {
+    if (!scanActive_) {
         return;
     }
     if (!nodeScans_.empty() && inflight_ > 0) {
@@ -855,8 +963,9 @@ void ROMScanSession::MaybeFinish() {
     // Make the session inert before calling out.
     nodeScans_.clear();
     completedROMs_.clear();
+    previousROMs_.clear();
     inflight_ = 0;
-    gen_ = Generation{0};
+    scanActive_ = false;
     hadBusyNodes_ = false;
 
     if (completion) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "ASFWAudioDevice.hpp"
+#include "RateConfiguration.hpp"
 #include "../Protocols/AudioTypes.hpp"
 #include <optional>
 #include <algorithm>
@@ -15,10 +16,10 @@ namespace ASFW::Audio {
         config.currentSampleRate, &Runtime::RateFormation::sampleRateHz);
     if (formation != config.rateFormationCandidates.end() && formation->packedPcm) {
         return config.playbackStreams.size() == 1 && config.captureStreams.size() == 1 &&
-            config.playbackStreams[0].am824Slots == Encoding::Motu::DataBlockQuadlets(caps.hostToDevicePcmChunks) &&
-            config.captureStreams[0].am824Slots == Encoding::Motu::DataBlockQuadlets(caps.deviceToHostPcmChunks) &&
-            caps.hostToDevicePcmChunks == caps.hostOutputPcmChannels &&
-            caps.deviceToHostPcmChunks == caps.hostInputPcmChannels;
+            config.playbackStreams[0].am824Slots == Encoding::Motu::DataBlockQuadlets(caps.hostToDevicePcmChunks, formation->packedPlaybackMessageChunks) &&
+            config.captureStreams[0].am824Slots == Encoding::Motu::DataBlockQuadlets(caps.deviceToHostPcmChunks, formation->packedCaptureMessageChunks) &&
+            caps.hostToDevicePcmChunks == (config.playbackStreams[0].packedPcmChunks ? config.playbackStreams[0].packedPcmChunks : caps.hostOutputPcmChannels) &&
+            caps.deviceToHostPcmChunks == (config.captureStreams[0].packedPcmChunks ? config.captureStreams[0].packedPcmChunks : caps.hostInputPcmChannels);
     }
     const auto matches = [](const auto& streams, uint32_t count, const auto& observed) {
         if (count != streams.size() || count > kMaxAudioStreamsPerDirection) return false;
@@ -30,6 +31,19 @@ namespace ASFW::Audio {
     };
     return matches(config.playbackStreams, caps.hostToDeviceStreamCount, caps.hostToDeviceStreams) &&
         matches(config.captureStreams, caps.deviceToHostStreamCount, caps.deviceToHostStreams);
+}
+
+// Whether a hardware observation settles its rate for this endpoint: the clock
+// is confirmed at a rate the catalog offers, and the registers match that
+// rate's formation. A provisional formation has no layout to match yet; the
+// registers read now are its layout (WithObservedRateCatalog).
+[[nodiscard]] inline bool ObservationSettlesRate(const Model::ASFWAudioDevice& config,
+                                                 const RateHardwareObservation& observed) noexcept {
+    if (!observed.clockConfirmed) return false;
+    const uint32_t rate = observed.caps.sampleRateHz;
+    if (Model::LayoutIsProvisional(config, rate)) return true;
+    const auto actual = Model::WithRateFormation(config, rate);
+    return actual && RuntimeCapsMatchConfiguration(*actual, observed.caps);
 }
 
 [[nodiscard]] inline std::optional<AudioStreamRuntimeCaps> DiscoveredCaps(
@@ -44,6 +58,8 @@ namespace ASFW::Audio {
     caps.sampleRateHz = config.currentSampleRate;
     caps.hostInputPcmChannels = capture.pcmChannels;
     caps.hostOutputPcmChannels = playback.pcmChannels;
+    caps.deviceToHostPcmChunks = capture.packedPcmChunks;
+    caps.hostToDevicePcmChunks = playback.packedPcmChunks;
     caps.deviceToHostAm824Slots = capture.am824Slots;
     caps.hostToDeviceAm824Slots = playback.am824Slots;
     caps.deviceToHostStreamCount = caps.hostToDeviceStreamCount = 1;

@@ -14,6 +14,7 @@ add_executable(IsochReceiveContextTests
     IsochReceiveContextTests.cpp
     IsochRxDmaRingTests.cpp
     IsochRxTimingTests.cpp
+    MidiReceivePathTests.cpp
     "${ASFW_DRIVER_DIR}/Isoch/Receive/IsochReceiveContext.cpp"
     "${ASFW_DRIVER_DIR}/Isoch/Receive/IsochRxDmaRing.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Engine/Direct/AudioClockPublisher.cpp"
@@ -114,20 +115,13 @@ add_audio_test(MotuRxTimingTests
     MotuRxTimingTests.cpp
 )
 
-# MOTU SPH regulator: fractional transmit clock
-add_audio_test(MotuSphQ32AccumulatorTests
-    MotuSphQ32AccumulatorTests.cpp
-)
+add_audio_test(MotuSphSynthesizerTests MotuSphSynthesizerTests.cpp)
+
+# MOTU timing integration
 
 # MOTU SPH regulator: the clock servo and its hard-resync gate
-add_audio_test(MotuSphClockServoTests
-    MotuSphClockServoTests.cpp
-)
 
 # MOTU SPH regulator: per-rate production configuration
-add_audio_test(MotuSphServoPolicyTests
-    MotuSphServoPolicyTests.cpp
-)
 
 # MOTU SPH regulator: the transmit timing stamper, for every protocol version
 add_audio_test(MotuTxTimingStamperTests
@@ -142,30 +136,6 @@ add_audio_test(MotuTxTimingStamperTests
     "${ASFW_DRIVER_DIR}/Audio/Wire/IEC61883/CipHeader.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Wire/IEC61883/DbcCounter.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Wire/MOTU/MotuPayloadWriter.cpp"
-)
-
-# MOTU SPH regulator: absolute-phase conditioner
-add_audio_test(MotuRelPhaseConditionerTests
-    MotuRelPhaseConditionerTests.cpp
-)
-
-# MOTU SPH regulator: the release observer that publishes the transmit phase trace
-add_audio_test(MotuTxPhaseTracePublisherTests
-    MotuTxPhaseTracePublisherTests.cpp
-)
-
-# MOTU SPH regulator: the transmit presentation residual and its cadence lattice
-add_audio_test(MotuTxPhaseResidualQuantizationTests
-    MotuTxPhaseResidualQuantizationTests.cpp
-    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Engine/Direct/Tx/DiceTxStreamEngine.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Wire/AMDTP/AmdtpCadence.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Wire/AMDTP/AmdtpPacketTimeline.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Wire/AMDTP/AmdtpPayloadWriter.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Wire/AMDTP/AmdtpTxPacketizer.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Wire/AMDTP/PcmSlotCodec.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Wire/IEC61883/CipHeader.cpp"
-    "${ASFW_DRIVER_DIR}/Audio/Wire/IEC61883/DbcCounter.cpp"
 )
 
 # MOTU SPH regulator: device sample period measured from received SPH
@@ -284,6 +254,7 @@ add_audio_test(AmdtpDirectTxTests
     AmdtpDirectTxTests.cpp
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/ApogeeDuetProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Engine/Direct/Tx/DiceTxStreamEngine.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Wire/AMDTP/AmdtpCadence.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Wire/AMDTP/AmdtpPacketTimeline.cpp"
@@ -304,6 +275,7 @@ add_audio_test(AudioDriverTxProducerTests
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/ASFWAudioDriverZts.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/ASFWAudioDriverTxProducer.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/ASFWAudioDriverOutputWrite.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/ASFWAudioDriverMidi.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Engine/Direct/Tx/DiceTxStreamEngine.cpp"
     "${ASFW_DRIVER_DIR}/Audio/Wire/AMDTP/AmdtpCadence.cpp"
@@ -329,6 +301,7 @@ target_include_directories(AudioDriverTxProducerTests PRIVATE
 # (the dext process outlived an unplug while it did).
 add_audio_test(AudioDriverTeardownTests
     AudioDriverTeardownTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/ASFWAudioDriverControls.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/ASFWAudioDriverTeardown.cpp"
     # What constructing ASFWAudioDriver_IVars links.
     "${ASFW_DRIVER_DIR}/Audio/Engine/Direct/Tx/DiceTxStreamEngine.cpp"
@@ -391,6 +364,9 @@ add_audio_test(ResolvedStreamConfigTests
 add_audio_test(NubGeometryRoundTripTests
     NubGeometryRoundTripTests.cpp
     ${CMAKE_SOURCE_DIR}/../ASFWDriver/Audio/DriverKit/Config/AudioDriverConfig.cpp
+    # AudioDriverConfig decodes the published parameter controls.
+    "${ASFW_DRIVER_DIR}/Audio/Controls/CoreAudioProjection.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Model/Topology/Validate.cpp"
 )
 
 # DICE Profile Registry and Quirks Tests
@@ -401,11 +377,12 @@ add_audio_test(DiceProfileTests
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/ApogeeDuetProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
 )
 
-# Every DICE profile's answers, recorded (DICE_TCAT_ARCHITECTURE.md §4.2 stage C).
+# Every DICE profile's answers, recorded.
 # Zero timestamps the RX path publishes, recorded (Epic 4, T1).
 add_audio_test(ZtsCharacterizationTests
     ZtsCharacterizationTests.cpp
@@ -423,6 +400,7 @@ add_audio_test(DiceProfileEquivalenceTests
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/ApogeeDuetProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
 )
@@ -435,6 +413,7 @@ set(ASFW_TIMING_PROFILE_SOURCES
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/MOTU/MotuProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MackieOnyx400FProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/GenericAvcProfile.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/ApogeeDuetProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/AVC/MAudioSpecialProfile.cpp"
     "${ASFW_DRIVER_DIR}/Audio/DriverKit/Config/DICE/DiceProfile.cpp"
 )
@@ -485,3 +464,39 @@ add_audio_test(DeviceConfigurationStateMachineTests
 
 add_audio_test(DiceMultirateValidationTests DiceMultirateValidationTests.cpp)
 target_compile_definitions(DiceMultirateValidationTests PRIVATE ASFW_DICE_MULTIRATE_VALIDATION=1)
+
+# Controls: AUAA semantic core (FW-202) and the AV/C projection (FW-204).
+add_audio_test(TopologyModelTests
+    topology/TopologyModelTests.cpp
+    "${ASFW_DRIVER_DIR}/UserClient/WireFormats/ControlSnapshotDocument.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Model/Topology/Naming.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Model/Topology/Validate.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Controls/CoreAudioProjection.cpp"
+)
+add_audio_test(AvcControlProjectionTests
+    topology/AvcControlProjectionTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Controls/AvcControlProjection.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Model/Topology/Naming.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Model/Topology/Validate.cpp"
+)
+
+add_audio_test(CoreAudioProjectionTests
+    topology/CoreAudioProjectionTests.cpp
+    "${ASFW_DRIVER_DIR}/Audio/Controls/CoreAudioProjection.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Model/Topology/Validate.cpp"
+)
+
+add_audio_test(DuetControlModelTests
+    topology/DuetControlModelTests.cpp
+    "${ASFW_DRIVER_DIR}/UserClient/WireFormats/ControlSnapshotDocument.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Controls/CoreAudioProjection.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Model/Topology/Validate.cpp"
+)
+
+add_audio_test(OrpheusControlModelTests
+    topology/OrpheusControlModelTests.cpp
+    "${ASFW_DRIVER_DIR}/UserClient/WireFormats/ControlSnapshotDocument.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Controls/CoreAudioProjection.cpp"
+    "${ASFW_DRIVER_DIR}/Audio/Model/Topology/Validate.cpp"
+)
+

@@ -11,10 +11,12 @@
 namespace ASFW::Audio::Runtime {
 
 // Packed MOTU capture can carry 34 PCM channels in only 28 quadlets (both
-// ADAT banks at 1x). Host buffer/name capacity is distinct from the 32-slot
-// AM824 map and its bit masks. Linux motu-protocol-v3.c:209-239,274-281.
+// ADAT banks at 1x). Host buffer/name capacity is distinct from the AM824
+// slot map. Linux motu-protocol-v3.c:209-239,274-281.
 inline constexpr uint32_t kMaxPackedPcmChannels = 34;
-inline constexpr uint32_t kMaxHostPcmChannels = kMaxPackedPcmChannels;
+inline constexpr uint32_t kMaxHostPcmChannels =
+    kMaxPackedPcmChannels > Encoding::kMaxPcmChannels ? kMaxPackedPcmChannels
+                                                      : Encoding::kMaxPcmChannels;
 
 // A formation describes one rate, not the shape observed at discovery time.
 // Protocol adapters supply these facts; generic code never scales ADAT widths.
@@ -25,6 +27,7 @@ struct RateWireStream final {
     Wire::PcmSlotMap pcmSlots{};
     // DICE multiplexes up to eight physical ports into one AM824 slot.
     uint32_t midiPortCount{0};
+    uint32_t packedPcmChunks{0}; // MOTU wire width, including padding; zero means pcmChannels.
     friend bool operator==(const RateWireStream&, const RateWireStream&) = default;
 };
 
@@ -38,6 +41,11 @@ struct RateFormation final {
     bool packedPcm{false}; // MOTU: 3-byte chunks, not PCM quadlet slots.
     uint32_t packedCaptureMessageChunks{2};
     uint32_t packedPlaybackMessageChunks{2};
+    // The device supports this rate but its layout has not been read yet: the
+    // streams are a placeholder for the HAL format list only. A rate change
+    // reads the real layout once the clock is locked at the rate, and only a
+    // measured formation is ever installed or streamed.
+    bool layoutProvisional{false};
     friend bool operator==(const RateFormation&, const RateFormation&) = default;
 };
 
@@ -118,13 +126,15 @@ ResolveAudioConfiguration(uint32_t rate, std::span<const RateFormation> formatio
                 (selected->packedPcm
                     ? (stream.midiSlots != 0 || !stream.pcmSlots.IsIdentity() ||
                        messageChunks > 2 ||
-                       stream.dataBlockSize != 1 + ((messageChunks + stream.pcmChannels) * 3 + 3) / 4)
-                    : (stream.pcmChannels > stream.dataBlockSize - stream.midiSlots ||
+                       (stream.packedPcmChunks && (stream.packedPcmChunks < stream.pcmChannels || stream.packedPcmChunks > kMaxPackedPcmChannels)) ||
+                       stream.dataBlockSize != 1 + ((messageChunks + (stream.packedPcmChunks ? stream.packedPcmChunks : stream.pcmChannels)) * 3 + 3) / 4)
+                    : (stream.packedPcmChunks != 0 || stream.pcmChannels > stream.dataBlockSize - stream.midiSlots ||
                        !stream.pcmSlots.FitsWithin(stream.pcmChannels, stream.dataBlockSize))))
                 return std::unexpected(ConfigurationError::InvalidFormation);
-            uint32_t used = 0;
+            static_assert(Encoding::kMaxAmdtpDbs <= 64);
+            uint64_t used = 0;
             for (uint32_t channel = 0; !selected->packedPcm && channel < stream.pcmChannels; ++channel) {
-                const uint32_t bit = uint32_t{1} << stream.pcmSlots.SlotFor(channel);
+                const uint64_t bit = uint64_t{1} << stream.pcmSlots.SlotFor(channel);
                 if (used & bit) return std::unexpected(ConfigurationError::InvalidFormation);
                 used |= bit;
             }
@@ -163,12 +173,17 @@ MaximumFormationAllocation(std::span<const RateFormation> formations,
             probePolicy, ceiling, 0, ConfigurationValidationPolicy::HardwareBatch);
         if (!resolved) return std::unexpected(resolved.error());
         result.frameCapacity = std::max(result.frameCapacity, resolved->timing.frameRingFrames);
-        result.playbackChannelCapacity = std::max(result.playbackChannelCapacity, resolved->playbackChannels);
-        result.captureChannelCapacity = std::max(result.captureChannelCapacity, resolved->captureChannels);
+        // A provisional layout can be larger than its placeholder (a device
+        // attached at 96 kHz shows the 2x layout for 48 kHz too), so reserve
+        // the protocol limit. The mappings are never replaced afterwards.
+        const auto playback = formation.layoutProvisional ? limit : resolved->playbackChannels;
+        const auto capture = formation.layoutProvisional ? limit : resolved->captureChannels;
+        result.playbackChannelCapacity = std::max(result.playbackChannelCapacity, playback);
+        result.captureChannelCapacity = std::max(result.captureChannelCapacity, capture);
         for (const auto& direction : {std::span(formation.playback), std::span(formation.capture)})
             for (const auto& stream : direction)
-                result.maxPacketBytes = std::max(result.maxPacketBytes,
-                    8U + resolved->maxPacketFrames * stream.dataBlockSize * 4U);
+                result.maxPacketBytes = std::max(result.maxPacketBytes, 8U + resolved->maxPacketFrames * 4U *
+                    (formation.layoutProvisional ? Encoding::kMaxAmdtpDbs : stream.dataBlockSize));
     }
     return result;
 }

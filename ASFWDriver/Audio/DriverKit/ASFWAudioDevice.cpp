@@ -4,6 +4,7 @@
 //
 // IOUserAudioDevice subclass implementing StartIO/StopIO for transport lifecycle.
 //
+#include "Config/MOTU/MotuProfile.hpp"
 #include <expected>
 #include <cmath>
 #include <new>
@@ -24,6 +25,7 @@
 
 #include <DriverKit/DriverKit.h>
 #include <DriverKit/IOLib.h>
+#include <DriverKit/OSDictionary.h>
 
 // The audio completion group (frames per interrupt, input-safety floor, ZTS
 // tiling) and the transport's IOC cadence must be the same number of cycles.
@@ -68,6 +70,7 @@ bool ASFWAudioDevice::init(IOUserAudioDriver* in_driver,
 }
 
 void ASFWAudioDevice::free() {
+    ASFW_LOG(Audio, "[Lifecycle] ASFWAudioDevice free obj=%p", this);
     if (ivars) {
         ivars->driverIvars = nullptr;
         if (ivars->rateLock) IOLockFree(ivars->rateLock);
@@ -88,7 +91,7 @@ namespace {
 
 // Stop the TX producer and wait out a pass in flight, for every device family,
 // before the slot provider is cleared and the mapped slabs are released
-// (TX_OWNERSHIP.md, T6). It used to wait only for M-Audio, so a DICE/OXFW/MOTU
+// It used to wait only for M-Audio, so a DICE/OXFW/MOTU
 // pass could still be writing packets while StopIO released them. The producer
 // runs on txPreparationQueue and never waits on workQueue, so this cannot
 // deadlock when called from workQueue.
@@ -178,6 +181,9 @@ kern_return_t ReleaseWireTransport(ASFWAudioDriver_IVars& ivars,
         }
     }
 
+    // The MIDI view goes with the TX slab it composes into; the TX preparation
+    // queue was drained by QuiesceTxPreparation above.
+    ASFW::Audio::DriverKit::UnbindMidiTx(ivars);
     ivars.txPayloadMap = nullptr;
     ivars.txMetadataMap = nullptr;
     ivars.txControlMap = nullptr;
@@ -188,8 +194,6 @@ kern_return_t ReleaseWireTransport(ASFWAudioDriver_IVars& ivars,
     ivars.runtime.txSlotProvider.metadataRing = nullptr;
     ivars.runtime.txSlotProvider.queueControl = nullptr;
     ivars.runtime.txSlotProvider.numSlots = 0;
-    ivars.runtime.txSlotProvider.releaseObserver = nullptr;
-    ivars.runtime.motuTxPhaseTrace.Unbind();
     ivars.runtime.txExecutionTimeline.queueControl = nullptr;
     ivars.runtime.motuSphActive.store(false, std::memory_order_relaxed);
 
@@ -239,6 +243,7 @@ kern_return_t ReleaseKeptWire(ASFWAudioDriver_IVars& ivars,
 void ResetClientWriteSide(ASFWAudioDriver_IVars& ivars,
                           ASFW::Audio::Runtime::AudioTransportControlBlock& control) noexcept {
     control.client.Reset();
+    if (ivars.device.vendorId == 0x00130eU) ivars.runtime.txStartupClientTrace.ArmJoin();
     control.playbackRingWriteFrame.store(0, std::memory_order_relaxed);
     control.playbackRingReadFrame.store(0, std::memory_order_relaxed);
     control.playbackRingOldestValidFrame.store(0, std::memory_order_release);
@@ -264,6 +269,10 @@ kern_return_t ReleaseIdleKeptWire(ASFWAudioDevice_IVars& local,
     RunOnWorkQueue(ivars, ^{
         if (local.wire.MustReleaseOnInvalidation()) {
             kr = ReleaseKeptWire(ivars, local.transportStopStatus, local.wire, reason);
+        } else if (reason == ASFW::Audio::Runtime::WireReleaseReason::kRateChange) {
+            // The host must release a live old-rate wire at StopIO, before
+            // Perform changes formats and bindings underneath transport.
+            local.wire.OnRateChangeRequested();
         }
     });
     return kr;
@@ -272,6 +281,19 @@ kern_return_t ReleaseIdleKeptWire(ASFWAudioDevice_IVars& local,
 } // namespace
 
 kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
+    return StartOrJoinWire(in_flags, true);
+}
+
+kern_return_t ASFWAudioDevice::PrepareWire() {
+    if (!ivars || !ivars->driverIvars) return kIOReturnNotReady;
+    const auto* profile = static_cast<const ASFW::Isoch::Audio::IAudioStreamProfile*>(
+        ivars->driverIvars->device.profile);
+    if (!profile || !profile->StartsWireBeforePublication()) return kIOReturnSuccess;
+    return StartOrJoinWire(IOUserAudioStartStopFlags::None, false);
+}
+
+kern_return_t ASFWAudioDevice::StartOrJoinWire(IOUserAudioStartStopFlags in_flags,
+                                              bool startClientIO) {
     if (!ivars || !ivars->driverIvars) {
         ASFW_LOG(Audio, "ASFWAudioDevice: StartIO failed - no driver ivars");
         return kIOReturnNotReady;
@@ -292,7 +314,11 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
     auto& local = *this->ivars;
     __block kern_return_t kr = kIOReturnSuccess;
 
-    ivars.workQueue->DispatchSync(^{
+    RunOnWorkQueue(ivars, ^{
+        if (!startClientIO && ivars.runtime.isRunning.load(std::memory_order_acquire)) {
+            kr = kIOReturnBusy;
+            return;
+        }
         using ASFW::Audio::Runtime::WireReleaseReason;
         using ASFW::Audio::Runtime::WireStartPlan;
         using ASFW::Audio::Runtime::WireStopPlan;
@@ -300,6 +326,7 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
         bool txResourcesAllocated = false;
 
         const auto releaseTxResources = [&]() noexcept {
+            ASFW::Audio::DriverKit::UnbindMidiTx(ivars);
             ivars.txPayloadMap = nullptr;
             ivars.txMetadataMap = nullptr;
             ivars.txControlMap = nullptr;
@@ -310,8 +337,6 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
             ivars.runtime.txSlotProvider.metadataRing = nullptr;
             ivars.runtime.txSlotProvider.queueControl = nullptr;
             ivars.runtime.txSlotProvider.numSlots = 0;
-            ivars.runtime.txSlotProvider.releaseObserver = nullptr;
-            ivars.runtime.motuTxPhaseTrace.Unbind();
             ivars.runtime.txExecutionTimeline.queueControl = nullptr;
             ivars.runtime.motuSphActive.store(false, std::memory_order_relaxed);
 
@@ -382,11 +407,22 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
                     return;
                 }
             } else if (plan == WireStartPlan::kRejoin) {
+                if (!startClientIO) return;
                 auto* control = ivars.runtime.directAudioGraph.control;
                 const auto* profile =
                     static_cast<const ASFW::Isoch::Audio::IAudioStreamProfile*>(ivars.device.profile);
                 const uint32_t budgetMs = profile ? profile->InitialClockAnchorTimeoutMs() : 500U;
                 ResetClientWriteSide(ivars, *control);
+                if (ivars.device.vendorId == 0x00130eU) {
+                    ASFW_LOG(DirectAudio,
+                             "[TxStartup] stage=rejoin epoch=%llu join=%llu rate=%u completion=%llu committed=%llu write=%llu read=%llu",
+                             ivars.runtime.txStartupEpoch,
+                             ivars.runtime.txStartupClientTrace.join.load(std::memory_order_relaxed), startRateHz,
+                             ivars.runtime.txSlotProvider.queueControl->completionCursor.load(std::memory_order_acquire),
+                             ivars.runtime.txSlotProvider.queueControl->committedEnd.load(std::memory_order_acquire),
+                             control->playbackRingWriteFrame.load(std::memory_order_relaxed),
+                             control->playbackRingReadFrame.load(std::memory_order_relaxed));
+                }
                 uint32_t waitMs = 0;
                 while (ivars.runtime.lastHalZeroTimestampHostTicks.load(std::memory_order_acquire) == 0 &&
                        waitMs < budgetMs) {
@@ -616,6 +652,10 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
                 kr = failStart(armed.status, armed.failedStage);
                 return;
             }
+            // MIDI composition for this run, if the endpoint has a MIDI service.
+            // Never fails the start: a seam that cannot be used leaves MIDI TX
+            // off and audio exactly as it was.
+            ASFW::Audio::DriverKit::BindMidiTx(ivars, txConfig);
             const uint32_t timingRateHz =
                 ivars.device.currentSampleRate > 0
                     ? static_cast<uint32_t>(ivars.device.currentSampleRate)
@@ -699,6 +739,13 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
 
         // --- Prefill TX ring ---
         ASFW::Audio::DriverKit::PrefillTxRingBeforeStart(ivars);
+        if (ivars.device.vendorId == 0x00130eU) {
+            ASFW_LOG(DirectAudio,
+                     "[TxStartup] stage=prefill epoch=%llu rate=%u committed=%llu slots=%u filled=%llu",
+                     ivars.runtime.txStartupEpoch, startRateHz,
+                     ivars.runtime.txSlotProvider.queueControl->committedEnd.load(std::memory_order_acquire),
+                     ivars.runtime.txSlotProvider.numSlots, ivars.runtime.txFilledFrameEnd);
+        }
 
         auto* prefillControl = ivars.runtime.txSlotProvider.queueControl;
         const uint64_t prefillExpose =
@@ -733,6 +780,14 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
                      startKr);
             kr = failStart(startKr, "StartAudioStreaming");
             return;
+        }
+        if (ivars.device.vendorId == 0x00130eU) {
+            ASFW_LOG(DirectAudio,
+                     "[TxStartup] stage=wire-started epoch=%llu rate=%u generation=%u completion=%llu committed=%llu",
+                     ivars.runtime.txStartupEpoch, startRateHz,
+                     ivars.runtime.txSlotProvider.queueControl->streamGeneration.load(std::memory_order_acquire),
+                     ivars.runtime.txSlotProvider.queueControl->completionCursor.load(std::memory_order_acquire),
+                     ivars.runtime.txSlotProvider.queueControl->committedEnd.load(std::memory_order_acquire));
         }
 
         // StartAudioStreaming initializes the shared transport control block.
@@ -822,12 +877,13 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
                     TransportHealthy(ivars, local.transportStopStatus.load(std::memory_order_acquire)),
                     &timeoutReason) == WireStopPlan::kRetain) {
                 ivars.runtime.isRunning.store(false, std::memory_order_release);
-                local.wire.OnStartTimedOutRetained(startRateHz);
+                if (startClientIO) local.wire.OnStartTimedOutRetained(startRateHz);
+                else local.wire.OnPrepared(startRateHz);
                 ASFW_LOG(Audio,
                          "[WireRetain] phase=start-timeout action=keep guid=0x%016llx rate=%u waitMs=%u timeouts=%u",
                          ivars.device.guid, startRateHz, ztsWaitMs,
                          local.wire.ConsecutiveStartTimeouts());
-                kr = kIOReturnTimeout;
+                kr = startClientIO ? kIOReturnTimeout : kIOReturnSuccess;
                 return;
             }
             kr = failStart(kIOReturnTimeout, "WaitForInitialHardwareZts");
@@ -841,6 +897,13 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
                 std::memory_order_acquire),
             initialZtsHostTicks,
             ztsWaitMs);
+
+        if (!startClientIO) {
+            local.wire.OnPrepared(startRateHz);
+            ASFW_LOG(Audio, "[WireRetain] phase=prepared guid=0x%016llx rate=%u",
+                     ivars.device.guid, startRateHz);
+            return;
+        }
 
         // Hardware-specific setup must finish before super::StartIO updates
         // ADK's IO state. Open the RT gate first so callbacks arriving as part
@@ -869,7 +932,7 @@ kern_return_t ASFWAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags) {
                  static_cast<void*>(ivars.runtime.directAudioGraph.audioDevice));
     });
 
-    if (kr == kIOReturnSuccess) {
+    if (kr == kIOReturnSuccess && startClientIO) {
         const auto inputFormat = ivars.inputStream
             ? ivars.inputStream->GetCurrentStreamFormat()
             : IOUserAudioStreamBasicDescription{};
@@ -1040,6 +1103,29 @@ ResolveRate(ASFWAudioDriver_IVars& driver, uint32_t rate, uint64_t revision,
         .resolved = std::make_shared<const ResolvedAudioConfiguration>(*resolved)};
 }
 
+// Take the nub's catalog after it measured `rateHz` from the device's
+// registers (CopyObservedRateCatalog). The device must be locked at the rate.
+[[nodiscard]] kern_return_t AdoptObservedRateCatalog(ASFWAudioDriver_IVars& driver, uint32_t rateHz) {
+    OSDictionary* rawProperties = nullptr;
+    const auto status = driver.device.audioNub->CopyObservedRateCatalog(rateHz, &rawProperties);
+    const auto properties = OSSharedPtr(rawProperties, OSNoRetain);
+    if (status != kIOReturnSuccess) return status;
+    ASFW::Isoch::Audio::ParsedAudioDriverConfig catalog{};
+    ASFW::Isoch::Audio::InitializeAudioDriverConfigDefaults(catalog);
+    ASFW::Isoch::Audio::ParseAudioDriverConfigFromProperties(properties.get(), catalog);
+    if (catalog.guid != driver.device.guid ||
+        catalog.rateRouteIncarnation != driver.device.rateRouteIncarnation ||
+        std::ranges::find(catalog.rateFormationCandidates, rateHz,
+            &ASFW::Audio::Runtime::RateFormation::sampleRateHz) == catalog.rateFormationCandidates.end())
+        return kIOReturnAborted;
+    driver.device.rateFormationCandidates = std::move(catalog.rateFormationCandidates);
+    driver.device.sampleRateCount = catalog.sampleRateCount;
+    std::ranges::copy(std::span{catalog.sampleRates, catalog.sampleRateCount}, driver.device.sampleRates);
+    driver.device.rateRouteEpoch = catalog.rateRouteEpoch;
+    driver.device.rateBusGeneration = catalog.rateBusGeneration;
+    return kIOReturnSuccess;
+}
+
 void InstallDriverFormation(ASFWAudioDriver_IVars& driver,
                               const ASFW::Audio::Runtime::ResolvedAudioConfiguration& resolved) {
     auto& state = driver.device;
@@ -1060,19 +1146,32 @@ void InstallDriverFormation(ASFWAudioDriver_IVars& driver,
         for (uint32_t i = 0; i < count; ++i) {
             destination[i] = {.pcmChannels = streams[i].pcmChannels,
                 .am824Slots = streams[i].dataBlockSize, .midiPorts = streams[i].midiPortCount ? streams[i].midiPortCount : streams[i].midiSlots,
-                .channelOffset = offset, .pcmSlotMap = streams[i].pcmSlots, .hasPcmSlotMap = true};
+                .channelOffset = offset, .pcmSlotMap = streams[i].pcmSlots, .hasPcmSlotMap = true, .packedPcmChunks = streams[i].packedPcmChunks};
             offset += streams[i].pcmChannels;
         }
     };
     copy(resolved.formation.playback, state.playbackStreams, state.playbackStreamCount);
     copy(resolved.formation.capture, state.captureStreams, state.captureStreamCount);
+    if (resolved.formation.packedPcm && state.profile) {
+        const auto version = static_cast<const ASFW::Isoch::Audio::IAudioStreamProfile*>(state.profile)->TxStreamPolicy().motuUnitVersion;
+        const auto names = [&](const auto& stream, bool capture, auto& destination) {
+            const auto chunks = stream.packedPcmChunks ? stream.packedPcmChunks : stream.pcmChannels;
+            const auto* layout = ASFW::Encoding::Motu::PortLayoutFor(
+                version, resolved.formation.sampleRateHz, chunks, capture);
+            if (!layout) return;
+            for (uint32_t i = 0; i < stream.pcmChannels; ++i)
+                snprintf(destination[i], sizeof(destination[i]), "%s", layout->ports[i].name);
+        };
+        names(resolved.formation.capture.front(), true, state.inputChannelNames);
+        names(resolved.formation.playback.front(), false, state.outputChannelNames);
+    }
 }
 
 // Validation shared by the request (HandleChangeSampleRate, external resync)
 // and the commit (PerformDeviceConfigurationChange): the rate must be one this
 // device advertised and resolve to a timing geometry that fits the shared
 // allocation. Resolving BEFORE the transport moves means an unsupported rate is
-// refused while the device clock is untouched (TIMING_GEOMETRY_OWNERSHIP.md §4).
+// refused while the device clock is untouched.
 [[nodiscard]] std::expected<ASFW::Audio::Runtime::ResolvedTimingGeometry, kern_return_t>
 ValidateSampleRate(ASFWAudioDriver_IVars& ivars, uint32_t rateHz, const char* origin) noexcept {
     bool rateSupported = false;
@@ -1142,6 +1241,33 @@ ValidateSampleRate(ASFWAudioDriver_IVars& ivars, uint32_t rateHz, const char* or
         return kr;
     }
     ivars.device.currentSampleRate = rate;
+
+    // Observed-only DICE devices learn formats after publication. Declare the
+    // expanded catalog inside this stopped-IO window, before selecting it.
+    if (!programHardware && ivars.device.usesRateFormations) {
+        std::array<IOUserAudioStreamBasicDescription, 8> inputs{}, outputs{};
+        const uint32_t count = ivars.device.sampleRateCount;
+        if (!count || count > inputs.size()) return kIOReturnUnsupported;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto formation = std::ranges::find(ivars.device.rateFormationCandidates,
+                static_cast<uint32_t>(ivars.device.sampleRates[i]),
+                &ASFW::Audio::Runtime::RateFormation::sampleRateHz);
+            if (formation == ivars.device.rateFormationCandidates.end()) return kIOReturnUnsupported;
+            uint32_t capture = 0, playback = 0;
+            for (const auto& stream : formation->capture) capture += stream.pcmChannels;
+            for (const auto& stream : formation->playback) playback += stream.pcmChannels;
+            ASFW::Audio::DriverKit::FillFloat32Format(inputs[i], formation->sampleRateHz, capture);
+            ASFW::Audio::DriverKit::FillFloat32Format(outputs[i], formation->sampleRateHz, playback);
+        }
+        if ((kr = device.SetAvailableSampleRates(ivars.device.sampleRates, count)) != kIOReturnSuccess)
+            return kr;
+        if (ivars.inputStream &&
+            (kr = ivars.inputStream->SetAvailableStreamFormats(inputs.data(), count)) != kIOReturnSuccess)
+            return kr;
+        if (ivars.outputStream &&
+            (kr = ivars.outputStream->SetAvailableStreamFormats(outputs.data(), count)) != kIOReturnSuccess)
+            return kr;
+    }
 
     // The validated ADK contract (ADKVirtualAudioLab) moves the active format
     // with SetSampleRate; the base implementation does nothing more.
@@ -1293,6 +1419,12 @@ kern_return_t ASFWAudioDevice::StageSampleRate(double in_sample_rate, bool hardw
             if (!prior) { IOLockUnlock(local.rateLock); return prior.error(); }
             local.rateMachine.state = Idle{{ivars.device.guid, ivars.device.rateBusGeneration, 0, *prior}};
         }
+        if (hardwareObservation) {
+            // CopyObservedRateCatalog validated this new route. A reset changes
+            // the route generation, not the committed HAL format or revision.
+            if (auto* idle = std::get_if<Idle>(&local.rateMachine.state))
+                idle->committed.routeGeneration = ivars.device.rateBusGeneration;
+        }
         auto staged = Reduce(local.rateMachine, CoreAudioRateIntent{
             ivars.device.guid, ivars.device.rateBusGeneration, rateHz});
         if (!staged) { IOLockUnlock(local.rateLock); return kIOReturnBusy; }
@@ -1351,7 +1483,7 @@ kern_return_t ASFWAudioDevice::StageSampleRate(double in_sample_rate, bool hardw
 
     // The commit (including the ZTS period, legal only inside the perform
     // window) happens in PerformDeviceConfigurationChange; the host stops IO,
-    // performs, then restarts IO (SAMPLE_RATE_EXPANSION.md, ADK transaction).
+    // performs, then restarts IO (the ADK configuration-change transaction).
     (void)ReleaseIdleKeptWire(*this->ivars, ASFW::Audio::Runtime::WireReleaseReason::kRateChange);
     ivars.device.pendingSampleRateHz.store(rateHz, std::memory_order_release);
     const kern_return_t kr =
@@ -1375,6 +1507,18 @@ kern_return_t ASFWAudioDevice::RequestExternalRateResync(uint32_t nominalRateHz)
         return kIOReturnNotReady;
     }
     auto& driverIvars = *this->ivars->driverIvars;
+    if (driverIvars.device.usesRateFormations) {
+        if (!driverIvars.device.audioNub) return kIOReturnNotReady;
+        if (nominalRateHz == static_cast<uint32_t>(driverIvars.device.currentSampleRate))
+            return kIOReturnSuccess;
+        IOLockLock(ivars->rateLock);
+        const bool pending = !std::holds_alternative<ASFW::Configuration::Idle>(ivars->rateMachine.state) &&
+            !std::holds_alternative<ASFW::Configuration::Uninitialized>(ivars->rateMachine.state);
+        IOLockUnlock(ivars->rateLock);
+        if (pending) return kIOReturnBusy;
+        const auto status = AdoptObservedRateCatalog(driverIvars, nominalRateHz);
+        if (status != kIOReturnSuccess) return status;
+    }
     if (!driverIvars.device.rateFormationCandidates.empty())
         return StageSampleRate(nominalRateHz, true);
 
@@ -1515,11 +1659,32 @@ kern_return_t ASFWAudioDevice::PerformDeviceConfigurationChange(
             return status == kIOReturnSuccess ? kIOReturnNotReady : status;
         }
         auto commitConfiguration = transaction.candidate;
-        const bool requestedConfirmed = readback == kIOReturnSuccess && confirmed(transaction.candidate.sampleRate);
+        bool requestedConfirmed = readback == kIOReturnSuccess && confirmed(transaction.candidate.sampleRate);
         bool otherConfirmed = false;
         if (!requestedConfirmed && readback == kIOReturnSuccess && input && (output == input || output == 0)) {
             const auto actual = ResolveRate(driver, input, transaction.prior.revision + 1);
             if (actual) { commitConfiguration = *actual; otherConfirmed = true; }
+        }
+        // A provisional rate's layout is read now, with the clock locked at it,
+        // as TCAT's RestartStreaming reads TX/RX after CLOCK_ACCEPTED. The
+        // measured formation is never the staged placeholder, so the device
+        // confirmed another configuration than the candidate.
+        if ((requestedConfirmed || otherConfirmed) &&
+            commitConfiguration.resolved->formation.layoutProvisional) {
+            const uint32_t rate = commitConfiguration.sampleRate;
+            const auto adopted = AdoptObservedRateCatalog(driver, rate);
+            std::expected<DeviceConfiguration, kern_return_t> measured = std::unexpected(adopted);
+            if (adopted == kIOReturnSuccess) measured = ResolveRate(driver, rate, transaction.prior.revision + 1);
+            const bool learned = measured && !measured->resolved->formation.layoutProvisional;
+            if (learned) commitConfiguration = *measured;
+            else status = measured ? kIOReturnNotReady : measured.error();
+            otherConfirmed = learned;
+            requestedConfirmed = false;
+            ASFW_LOG(Audio, "[RateTxn] phase=learn token=%llu gen=%u rate=%u result=0x%x (%{public}s) in=%u out=%u",
+                transaction.identity.token, generation, rate, learned ? kIOReturnSuccess : status,
+                ASFW::Logging::IOReturnName(learned ? kIOReturnSuccess : status),
+                learned ? commitConfiguration.resolved->captureChannels : 0U,
+                learned ? commitConfiguration.resolved->playbackChannels : 0U);
         }
         ASFW_LOG(Audio, "[RateTxn] phase=confirm kind=%{public}s token=%llu gen=%u requested=%u out=%u in=%u kr=0x%x (%{public}s)",
             requestedConfirmed ? "requested" : otherConfirmed ? "other" : "unknown",
@@ -1580,7 +1745,9 @@ kern_return_t ASFWAudioDevice::PerformDeviceConfigurationChange(
         return failure;
     }
     if (change_action == kConfigChangeActionIoRestart) {
-        ASFW_LOG(Audio, "ASFWAudioDevice: IO restart window (StopIO done; StartIO follows)");
+        ASFW_LOG(Audio, "ASFWAudioDevice: IO restart window (StopIO done; preparing wire)");
+        const auto prepared = PrepareWire();
+        if (prepared != kIOReturnSuccess) return prepared;
         return super::PerformDeviceConfigurationChange(change_action, in_change_info);
     }
     if (change_action != kConfigChangeActionSampleRate || !ivars ||
@@ -1611,6 +1778,7 @@ kern_return_t ASFWAudioDevice::PerformDeviceConfigurationChange(
     ASFW_LOG(Audio,
              "ASFWAudioDevice: sample rate change to %u Hz %{public}s (0x%x (%{public}s))",
              rateHz, kr == kIOReturnSuccess ? "committed" : "FAILED", kr, ASFW::Logging::IOReturnName(kr));
+    if (kr == kIOReturnSuccess) kr = PrepareWire();
     const kern_return_t superKr =
         super::PerformDeviceConfigurationChange(change_action, in_change_info);
     return kr != kIOReturnSuccess ? kr : superKr;

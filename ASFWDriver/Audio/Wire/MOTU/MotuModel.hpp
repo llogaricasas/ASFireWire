@@ -9,7 +9,9 @@
 
 namespace ASFW::Encoding::Motu {
 enum class ProtocolVersion : uint8_t { V1 = 1, V2, V3 };
-enum class OpticalLayout : uint8_t { None, V2, V2EightPre, V3Banks };
+// V3BankA: one optical bank. Vendor BoxTrack16::SetupStrmFwIds @0x51330 reads only
+// the bank-A bits of 0x0c94 (in 0x1/0x10000, out 0x100/0x40000).
+enum class OpticalLayout : uint8_t { None, V2, V2EightPre, V3Banks, V3BankA };
 enum class FetchRule : uint8_t { None, Traveler, Spartan, V3 };
 // How far ahead of its transmit cycle a packet's presentation time is: the
 // first DATA packet's first block is stamped with its transmit time plus this
@@ -17,15 +19,11 @@ enum class FetchRule : uint8_t { None, Traveler, Spartan, V3 };
 // assumed: three bus cycles for every model and at every rate. Seen on the
 // wire only for the 828mk3 at 48 kHz (k828mk3Policy).
 inline constexpr uint32_t kDefaultPresentationLeadTicks = 3 * kTicksPerCycle;
-// The absolute presentation phase the SPH regulator holds at 48 kHz, in ticks:
-// `rel`, the transmit presentation residual minus the device's absolute
-// receive phase, as MotuRxTimingObserver forms it. Seen on the wire only for
-// the 828mk3 (k828mk3Policy).
-// assumed: the same value for every other model.
-// assumed: our `rel` reads the quantity the official driver's capture was
-// analysed for (the same cadence-period mean); that the loop holds it is seen
-// only through that instrument.
-inline constexpr int32_t kDefaultAbsolutePhaseSetpointTicks48k = 510;
+// Device-relative presentation target in audio frames. Measured: paired
+// official-driver/device SPHs differ by 6656 ticks (13 frames) at 48 kHz,
+// 97.41% within one tick over 2044 same-cycle DATA pairs. Source: contributor
+// vendor-sampled-90s capture, 2026-08-22. Other models/rates: best effort.
+inline constexpr uint32_t kDefaultPresentationOffsetFrames = 13;
 struct RuntimePolicy final {
     bool requireTimingBeforeFetch{false};
     uint32_t minimumHostRunMs{0};
@@ -33,18 +31,8 @@ struct RuntimePolicy final {
     bool clearIsoCommLowBits{false};
     bool write48kStreamConfig{false};
     uint32_t presentationLeadTicks{kDefaultPresentationLeadTicks};
-    int32_t absolutePhaseSetpointTicks48k{kDefaultAbsolutePhaseSetpointTicks48k};
+    uint32_t presentationOffsetFrames{kDefaultPresentationOffsetFrames};
 };
-// The setpoint the regulator holds at a rate, or none. Only 48 kHz has one:
-// at every other rate the loop is relative and holds the phase the stream
-// started with.
-[[nodiscard]] constexpr std::optional<int32_t> AbsolutePhaseSetpointTicksAtRate(
-    int32_t setpointTicks48k, uint32_t sampleRateHz) noexcept {
-    if (sampleRateHz != 48'000) {
-        return std::nullopt;
-    }
-    return setpointTicks48k;
-}
 inline constexpr RuntimePolicy kTimingBeforeFetch{.requireTimingBeforeFetch = true};
 inline constexpr RuntimePolicy kOriginal828{.requireTimingBeforeFetch = true, .minimumHostRunMs = 100};
 inline constexpr RuntimePolicy k828mk3Policy{
@@ -53,13 +41,8 @@ inline constexpr RuntimePolicy k828mk3Policy{
     // vendor driver: the official driver's first DATA packet carries an SPH of
     // exactly its transmit cycle + 9216 ticks (bus capture, 828mk3, 48 kHz).
     .presentationLeadTicks = 3 * kTicksPerCycle,
-    // vendor driver: the official driver holds rel at +510 ticks with zero
-    // spread over 87.5 s on the wire (828mk3, 48 kHz).
-    .absolutePhaseSetpointTicks48k = 510};
-#ifndef ASFW_MOTU_V1_VALIDATION
-#define ASFW_MOTU_V1_VALIDATION 0
-#endif
-inline constexpr bool kV1HardwareBatch = ASFW_MOTU_V1_VALIDATION != 0;
+    // Paired vendor capture: 13 frames after the device stamp at 48 kHz.
+    .presentationOffsetFrames = 13};
 struct Model final {
     uint32_t unitVersion;
     const char* name;
@@ -74,7 +57,7 @@ struct Model final {
 };
 // Wire facts: references/linux-sound-firewire-stack/firewire/motu/
 // motu.c:164-180; motu-protocol-v2.c:274-320; motu-protocol-v3.c:269-359.
-// Vendor disagreements: tmp/motu-research/vendor-four-gaps.md. Counts include
+// Counts include
 // padding chunks; they must never be interpreted as physical port counts.
 inline constexpr std::array kModels{
     Model{0x1, "828", ProtocolVersion::V1, {10,0,0}, {10,0,0}, OpticalLayout::None, FetchRule::None, 0, kOriginal828},
@@ -92,16 +75,18 @@ inline constexpr std::array kModels{
     Model{0x33, "Audio Express", ProtocolVersion::V3, {10,10,0}, {10,10,0}, OpticalLayout::None, FetchRule::V3},
     Model{0x35, "828mk3 Hybrid", ProtocolVersion::V3, {18,18,14}, {14,14,14}, OpticalLayout::V3Banks, FetchRule::V3, 4},
     Model{0x37, "896mk3 Hybrid", ProtocolVersion::V3, {18,14,10}, {18,14,10}, OpticalLayout::V3Banks, FetchRule::V3, 5},
-    Model{0x39, "Track16", ProtocolVersion::V3, {14,14,14}, {6,6,6}, OpticalLayout::V3Banks, FetchRule::V3, 7},
+    Model{0x39, "Track16", ProtocolVersion::V3, {14,14,14}, {6,6,6}, OpticalLayout::V3BankA, FetchRule::V3, 0, kTimingBeforeFetch},
     Model{0x45, "4pre", ProtocolVersion::V3, {10,10,0}, {10,10,0}, OpticalLayout::None, FetchRule::V3},
 };
 // Vendor 896mk3 SetupStrmFwIds @0x3f118 compares provider Gestalt to
 // 0x31333934 ("1394"): FireWire selects 18 playback chunks at 1x, matching
 // Linux motu-protocol-v3.c. The 16-chunk branch belongs to other providers.
+// Track16 is a USB/FireWire hybrid, but its vendor FireWire class (BoxTrack16)
+// does not consult Gestalt: one geometry, matching Linux motu-protocol-v3.c:330-337.
 [[nodiscard]] constexpr bool FireWireOnly(uint32_t version) noexcept {
     switch (version) {
     case 1: case 2: case 3: case 5: case 9: case 0xd: case 0xf:
-    case 0x15: case 0x17: case 0x19: case 0x1b: return true;
+    case 0x15: case 0x17: case 0x19: case 0x1b: case 0x39: return true;
     default: return false;
     }
 }

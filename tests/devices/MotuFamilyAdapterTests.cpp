@@ -3,8 +3,7 @@
 // Copyright (c) 2026 ASFireWire Project
 //
 // MotuFamilyAdapterTests.cpp
-// The MOTU adapter on the audio device host (documentation/AUDIO_DEVICE_HOST.md
-// §4.2, §6 E3/E3a). The adapter runs against the real MotuProtocol over a
+// The MOTU adapter on the audio device host. The adapter runs against the real MotuProtocol over a
 // recording bus, so Describe's register read, the channel counts it publishes
 // and the wire traffic it causes are all the production ones.
 // Policies come from a real DeviceRegistry seeded with a ConfigROM, so the
@@ -147,8 +146,6 @@ DeviceRecord SeedDevice(DeviceRegistry& registry, uint64_t guid, uint32_t vendor
                         uint32_t modelId, uint32_t unitSpecId, uint32_t unitSwVersion, Generation generation = Generation{1}) {
     ConfigROM rom{};
     rom.gen = generation;
-    rom.firstSeen = generation;
-    rom.lastValidated = generation;
     rom.nodeId = 1;
     rom.bib.guid = guid;
     rom.bib.maxRec = 8;
@@ -566,7 +563,7 @@ TEST(MotuFamilyAdapterTests, UnsolicitedClockChangeRaisesClockStatusOnly) {
 }
 
 TEST(MotuFamilyAdapterTests, V1AndV3ReadFailureRefusesGuessedInitialGeometry) {
-    for (uint32_t version : {1U,2U,0x15U,0x17U,0x19U,0x1bU}) {
+    for (uint32_t version : {1U,2U,0x15U,0x17U,0x19U,0x1bU,0x39U}) {
         MotuRig rig;
         rig.record.unitSwVersion = version;
         const auto route = rig.registry.CurrentRoute(kMotuGuid);

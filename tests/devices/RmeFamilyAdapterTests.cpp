@@ -2,8 +2,7 @@
 // Copyright (c) 2026 ASFireWire Project
 //
 // RmeFamilyAdapterTests.cpp
-// The RME Fireface adapter on the audio device host (documentation/AUDIO_DEVICE_HOST.md
-// §4.2, §6 E2). Plain values in, plain values out: no host, no bus, no driver.
+// The RME Fireface adapter on the audio device host. Plain values in, plain values out: no host, no bus, no driver.
 // Policies come from a real DeviceRegistry seeded with a ConfigROM, so the
 // catalog decision is the one the driver would make.
 
@@ -90,8 +89,6 @@ DeviceRecord SeedDevice(DeviceRegistry& registry, uint64_t guid, uint32_t vendor
                         uint32_t modelId, uint32_t unitSpecId, uint32_t unitSwVersion) {
     ConfigROM rom{};
     rom.gen = Generation{1};
-    rom.firstSeen = Generation{1};
-    rom.lastValidated = Generation{1};
     rom.nodeId = 2;
     rom.bib.guid = guid;
     rom.bib.maxRec = 8;

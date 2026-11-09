@@ -19,7 +19,7 @@ source control. Never edit the generated project or pbxproj manually; change
 when xcodegen is installed). After adding/removing/renaming source files or build
 settings, update `project.yml`, regenerate, and commit the updated project
 alongside it. CI asserts that `ASFW.xcodeproj` matches `project.yml` on every run.
-(`ADKVirtualAudioLab/` has its own separate `project.yml`.)
+(The local-only `ADKVirtualAudioLab/`, when present, has its own separate `project.yml`.)
 
 **Every build setting must live in `project.yml`** — anything set only in the
 generated project is lost on the next regeneration.
@@ -107,7 +107,7 @@ CoreAudio / HAL
 | `Audio/Wire/` | Content framing: `IEC61883`, `CIP`, `AMDTP`, `AM824`, `RawPcm24In32`. Builds the CIP-headered stream handed to transport. CIP spans DV/MPEG/audio — **provisional home, not transport** |
 | `Audio/Runtime/` | Timing/buffer geometry: `HostClockAnchor`, `PlaybackRingRange` |
 | `Audio/Ports/` | Seam interfaces: `IAmdtpTxSlotProvider`, `ICycleTimeline` |
-| `Audio/Host/` | `AudioDeviceHost`: the one publication/recovery/teardown shell (queue `com.asfw.audio.host`, `[AudioHost]` log lines), plus one stateless `FamilyAdapter` per family (DICE, AV/C, MOTU, RME). See `documentation/AUDIO_DEVICE_HOST.md` |
+| `Audio/Host/` | `AudioDeviceHost`: the one publication/recovery/teardown shell (queue `com.asfw.audio.host`, `[AudioHost]` log lines), plus one stateless `FamilyAdapter` per family (DICE, AV/C, MOTU, RME). See `Audio/Host/AudioDeviceHost.hpp` |
 | `Audio/Engine/`, `Audio/Core/`, `Audio/Model/`, `Audio/Config/`, `Audio/Protocols/` | Engine wiring, runtime model, config |
 
 **Composition / cross-cutting:**
@@ -116,7 +116,7 @@ CoreAudio / HAL
 | `Service/` | `DriverContext` (the `ServiceContext`/DI root), `LocalRequestWiring` |
 | `Scheduling/` | `Scheduler`, `WatchdogCoordinator` (timer/dispatch) |
 | `DeviceProfiles/` | Device capability profiles: `Audio`, `Common` |
-| `Diagnostics/` | `DiagnosticsService`, metric sinks. Audio telemetry contract: `Audio/Runtime/AudioTelemetrySnapshot.hpp`; inventory: `documentation/OBSERVABILITY_INVENTORY.md` |
+| `Diagnostics/` | `DiagnosticsService`, metric sinks. Audio telemetry contract: `Audio/Runtime/AudioTelemetrySnapshot.hpp`; the snapshot header documents the telemetry layout and ownership rules |
 | `Debug/` | `AsyncTraceCapture`, `BusResetPacketCapture` |
 | `Snapshot/` | State snapshot |
 | `UserClient/` | DriverKit user-client: `Core`, `Handlers`, `Storage`, `WireFormats` |
@@ -214,10 +214,13 @@ the user, name the upstream, and offer to fetch it (see the *References are read
 | `IOFireWireSBP2/` | Apple's SBP-2 kext | apple-oss-distributions/IOFireWireSBP2 (SBP2-452) |
 | (fetch if needed) | Apple SBP transport | apple-oss-distributions/IOFireWireSerialBusProtocolTransport (261) |
 
-The `ADKVirtualAudioLab/` (committed) is a closed, hardware-free AudioDriverKit lab — the
-runtime-truth source for ADK lifecycle/ownership questions (see its `README.md`, O1–O3). It is
-immune by construction to the cross-service bugs, so use it to *answer* ADK behavior, not to
-template the FireWire side.
+The optional local-only `ADKVirtualAudioLab/` is a closed, hardware-free AudioDriverKit
+lab, retained by the maintainer for extraction into a separate project. It is not tracked
+or required by the main build. Check whether it is present before using it as empirical
+evidence for ADK lifecycle/ownership (its `README.md`, O1–O3). It is immune by construction
+to the cross-service bugs, so use it to answer ADK behavior, not to template FireWire.
+For public checkouts without the lab, validate behavior with working references or an
+explicitly scoped hardware experiment; do not assume the local lab is available.
 
 ## Critical Rules and Gotchas
 
@@ -229,7 +232,7 @@ template the FireWire side.
 
 **Endianness:** OHCI descriptor headers are little-endian; IEEE 1394 wire payloads are big-endian. Use `ToBusOrder`/`FromBusOrder` (defined in `FWCommon.hpp`) explicitly. Never assume.
 
-**IT descriptor layout:** The `OUTPUT_MORE_IMMEDIATE` skip address lives at offset `0x08` (third quadlet), **not** `0x04` — OHCI 1.2 draft Figure 9-2, matching Linux `firewire-ohci` and Apple. See `ASFWDriver/Isoch/README.md`.
+**IT descriptor layout:** The `OUTPUT_MORE_IMMEDIATE` skip address lives at offset `0x08` (third quadlet), **not** `0x04` — OHCI 1.2 draft Figure 9-2, matching Linux `firewire-ohci` and Apple.
 
 **Constants:** All OHCI hardware register constants go in `ASFWDriver/Hardware/OHCIConstants.hpp` (single source of truth). Never define them in `.cpp` files or class headers.
 
@@ -251,7 +254,7 @@ template the FireWire side.
 
 **Ground truth per question type** (don't hallucinate, don't guess a `§`):
 - **API surface** (DriverKit / AudioDriverKit / PCIDriverKit signatures, enums, entitlements) → `ctx7` / `find-docs` / SDK headers. The trap: `ctx7` will confidently answer about a *single method in isolation* while omitting the surrounding contract (call ordering, what must precede/follow, ownership, concurrency, post-`Stop` behavior). A right per-method answer is **not** a right *lifecycle* answer.
-- **Behavioral contract** (lifecycle, ownership, ordering, concurrency) → validate empirically against `ADKVirtualAudioLab` or working reference kexts — never from recall.
+- **Behavioral contract** (lifecycle, ownership, ordering, concurrency) → validate empirically against the local-only `ADKVirtualAudioLab` when available, or working reference kexts — never from recall.
 - **Paywalled specs** (IEEE 1394 / OHCI / IEC 61883) → **not** available via `ctx7`/`find-docs`. Source from in-repo docs or ask the user. If you don't know the exact section, say so and ask — never invent one.
 - **Wire behavior** (Linux / libffado) → cite the in-tree ref you cross-checked, e.g. `// cross-validated with Linux amdtp-stream.c:412`.
 

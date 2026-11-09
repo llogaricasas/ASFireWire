@@ -4,6 +4,8 @@
 <dict>
   <key>com.apple.security.app-sandbox</key>
   <false/>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
   <key>com.apple.developer.system-extension.install</key>
   <true/>
   <!-- No DriverKit user-client entitlement here on purpose: the dext carries

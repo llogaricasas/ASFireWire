@@ -8,8 +8,10 @@ timestamps.
 
 Vocabulary (`RTL_raw`, `RTL_ts`, scheduling distance, residual, reference
 planes) is shared with the rest of the project: see
-[`documentation/LATENCY_VOCABULARY.md`](../../documentation/LATENCY_VOCABULARY.md).
-Baseline procedure: [`documentation/MEASUREMENT_BASELINE.md`](../../documentation/MEASUREMENT_BASELINE.md).
+the measurement fields in [`rtl_core.h`](rtl_core.h).
+The [baseline capture helper](../baseline/capture_baseline.sh) collects a labeled run;
+use its output-directory option to keep new measurements under `build/` rather than
+the retained `documentation/fixtures/` evidence.
 
 ## Contents
 
@@ -17,7 +19,9 @@ Baseline procedure: [`documentation/MEASUREMENT_BASELINE.md`](../../documentatio
 |---|---|
 | `rtl_core.h` / `rtl_core.c` | platform-neutral core: timeline audit, trial admission, detector, aggregation, evidence JSON, self-test. No CoreAudio. Unit-tested on any host (`tests/tools/RtlCoreTests.cpp`). |
 | `tone_core.h` / `tone_core.c` | platform-neutral tone glitch detector behind `--tone`. Unit-tested on any host (`tests/tools/ToneCoreTests.cpp`). |
-| `rtl_loopback.c` | macOS front end: device selection, declared geometry, IOProc, report |
+| `tone_io.h` / `tone_io.c` | platform-neutral per-callback IO record for `--tone`: which callback delivered a glitch, and whether CoreAudio misbehaved near it. Unit-tested on any host (`tests/tools/ToneIoTests.cpp`). |
+| `rtl_session.h` / `rtl_session.c` | the one CoreAudio IO implementation: device queries, declared geometry, the impulse and tone IOProcs, the run loop. Shared by `rtl_loopback` and the ASFW app (Round-Trip Latency section); the header states the real-time contract. |
+| `rtl_loopback.c` | macOS command-line front end: device selection, report, evidence file |
 | `analyze_rtl.py` | offline analyser for pre-recorded WAV/AIFF click trains (the DAW-era method) |
 | `test_analyze_rtl.py` | unit tests for the analyser (run by ctest when Python 3 is available) |
 | `build.sh` | builds every host measurement tool into `build/tools` |

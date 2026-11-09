@@ -116,6 +116,7 @@ endif()
 add_library(asfw_test_support STATIC
     "support/LoggingStubs.cpp"
     "support/HardwareInterfaceStub.cpp"
+    "${ASFW_DRIVER_DIR}/Hardware/PhysicalRequestFilter.cpp"
     "${ASFW_DRIVER_DIR}/Logging/LogRing.cpp"
 )
 target_link_libraries(asfw_test_support PUBLIC asfw_test_common_interface)
@@ -192,4 +193,5 @@ add_subdirectory(protocols)
 add_subdirectory(audio)
 add_subdirectory(devices)
 add_subdirectory(common)
+add_subdirectory(midi)
 add_subdirectory(tools)

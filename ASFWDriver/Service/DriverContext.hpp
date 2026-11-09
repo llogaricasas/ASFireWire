@@ -28,6 +28,11 @@ namespace ASFW::Audio {
 class AudioCoordinator;
 }
 
+namespace ASFW::Midi {
+class MidiNubPublisher;
+class MidiEndpointPublication;
+}
+
 namespace ASFW::Protocols::SBP2 {
 class SBP2NubPublisher;
 class SBP2TargetBridge;
@@ -38,6 +43,10 @@ struct ServiceContext {
     std::atomic<uint64_t> irqEntries{0}, irqExits{0};
     uint32_t irqProbeTicks{0}, irqPendingSamples{0}, irqProbeReports{0};
     uint64_t irqProbeLastEntries{0};
+    // One master-enable retrigger per stall, issued by the watchdog; the next
+    // probe reports whether the ISR was entered again.
+    bool irqRetriggerPending{false};
+    uint64_t irqRetriggerEntries{0};
     ASFW::Driver::ControllerCore::Dependencies deps;
     ASFW::Driver::ControllerConfig config{}; // immutable identity/static config
     // Initial (wiring-time) role policy. The runtime-mutable copy is owned by
@@ -61,6 +70,11 @@ struct ServiceContext {
     ASFW::Protocols::DV::DVCaptureService dvCapture;
     ASFW::Driver::InterruptDispatcher interruptDispatcher;
     std::shared_ptr<ASFW::Audio::AudioCoordinator> audioCoordinator;
+    // MIDI rides audio endpoints: the coordinator tells midiPublication when a
+    // DICE endpoint is published or retired, and it asks midiNubPublisher for
+    // the MIDI nub. Created with the coordinator, gone with it (Reset).
+    std::shared_ptr<ASFW::Midi::MidiNubPublisher> midiNubPublisher;
+    std::shared_ptr<ASFW::Midi::MidiEndpointPublication> midiPublication;
     std::shared_ptr<ASFW::Protocols::SBP2::SBP2NubPublisher> sbp2NubPublisher;
     std::shared_ptr<ASFW::Protocols::SBP2::SBP2TargetBridge> sbp2Bridge;
 

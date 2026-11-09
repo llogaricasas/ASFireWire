@@ -20,6 +20,8 @@
   </array>
   <key>com.apple.developer.driverkit.family.audio</key>
   <true/>
+  <key>com.apple.developer.driverkit.family.midi</key>
+  <true/>
   <key>com.apple.developer.driverkit.family.scsicontroller</key>
   <true/>
   <!-- Lets the ASFW app (and the MCP console) open ASFWDriverUserClient.

@@ -3,7 +3,7 @@
 //
 // SessionTestSupport.hpp - One device, one host transport, one trace.
 //
-// Stage S2 of documentation/AUDIO_SESSION_REDESIGN.md replaces the duplex
+// The session redesign replaced the duplex
 // coordinator. These helpers record everything the session layer does, in
 // order, into one WireTrace:
 //
@@ -471,6 +471,7 @@ struct SessionShape {
     uint32_t unitVersion;
     const ::ASFW::Testing::DICE::DiceDeviceImage* diceImage{nullptr};  // null: scripted device
     bool spro24Dsp{false};
+    uint64_t guid{0};  // 0: synthetic OUI-prefixed GUID
 };
 
 inline constexpr uint32_t kDiceUnitVersion = 0x000001;
@@ -480,14 +481,13 @@ inline constexpr uint32_t kAvcUnitVersion = 0x010001;
 // The GUID carries the vendor's OUI in its top 24 bits, as a real one does;
 // the catalog cross-checks it.
 inline constexpr uint64_t SessionGuid(const SessionShape& shape) noexcept {
+    if (shape.guid != 0) return shape.guid;
     return (uint64_t{shape.vendorId} << 40) | 0x0004713ULL;
 }
 
 inline ConfigROM MakeSessionRom(const SessionShape& shape, Generation gen) {
     ConfigROM rom{};
     rom.gen = gen;
-    rom.firstSeen = gen;
-    rom.lastValidated = gen;
     rom.nodeId = 2;
     rom.bib.guid = SessionGuid(shape);
     rom.bib.maxRec = 8;
@@ -499,6 +499,7 @@ inline ConfigROM MakeSessionRom(const SessionShape& shape, Generation gen) {
     unit.offsetQuadlets = 5;
     unit.unitSpecId = shape.unitSpecifier;
     unit.unitSwVersion = shape.unitVersion;
+    if (shape.guid != 0) unit.modelId = shape.modelId;  // a captured DICE unit directory carries it
     rom.unitDirectories.push_back(unit);
     return rom;
 }
@@ -557,7 +558,7 @@ struct SessionRig {
         if (IsDice()) {
             // The real host and DICE adapter listen, as in the driver: every
             // DICE golden also shows which notifications they turn into
-            // restarts (AUDIO_DEVICE_HOST.md §6 E5).
+            // restarts.
             diceAdapter.emplace(notifications);
             deviceHost.emplace(publisher, registry, runtime, sessions, host);
             deviceHost->Install(ASFW::Audio::AudioBackendKind::Dice, *diceAdapter);

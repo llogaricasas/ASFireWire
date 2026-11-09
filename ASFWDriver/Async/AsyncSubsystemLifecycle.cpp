@@ -64,7 +64,6 @@ uint64_t GetCurrentMonotonicTimeUsec() {
 }
 
 constexpr uint32_t kAsyncInterruptMask = 0x0000000Du;
-constexpr uint32_t kLinkControlRcvPhyPktBit = 1u << 12;
 // TODO(ASFW-Topology): Replace the compatibility S100 default with topology-driven speed
 // selection once the async startup path can query the negotiated link speed.
 // Replace with topology-based speed queries when TopologyManager is available.
@@ -105,107 +104,6 @@ bool ShouldEnableCoherencyTrace(OSObject* owner) {
     const bool enabled = ParseBooleanLikeProperty(properties->getObject("ASFWTraceDMACoherency"));
     properties->release();
     return enabled;
-}
-
-// Retry state structure (heap-allocated, freed after final completion)
-// Similar to Apple's command object pattern but lighter-weight
-struct RetryState {
-    ReadParams params;
-    RetryPolicy policy;
-    CompletionCallback userCallback;
-    uint8_t attemptsRemaining;
-    AsyncHandle currentHandle{};
-    AsyncSubsystem* subsystem; // Back-pointer for re-submission
-
-    RetryState(const ReadParams& p, const RetryPolicy& pol, CompletionCallback cb,
-               AsyncSubsystem* sub)
-        : params(p), policy(pol), userCallback(cb), attemptsRemaining(pol.maxRetries),
-          subsystem(sub) {}
-};
-
-using RetryStatePtr = std::shared_ptr<RetryState>;
-
-// Static callback function that implements retry logic
-// This matches Apple's IOFWAsyncCommand::complete() pattern where retries
-// are decremented and execute() is called again on transient failures
-// Signature matches CompletionCallback: (AsyncHandle, AsyncStatus, responseCode, std::span<const
-// uint8_t>)
-void ReadWithRetryCallback(AsyncHandle handle, AsyncStatus status, uint8_t responseCode,
-                           std::span<const uint8_t> responsePayload,
-                           const RetryStatePtr& state) {
-    if (!state) {
-        return;
-    }
-
-    // Check if retry is needed (Apple's pattern: retry on timeout/busy)
-    bool shouldRetry = false;
-    const char* retryReason = "";
-
-    if (state->attemptsRemaining > 0 && status != AsyncStatus::kSuccess) {
-        // Apple pattern: IOFWAsyncCommand::complete() checks rcode and decrements fCurRetries
-        if (status == AsyncStatus::kTimeout && state->policy.retryOnTimeout) {
-            shouldRetry = true;
-            retryReason = "timeout";
-        } else if (status == AsyncStatus::kBusyRetryExhausted && state->policy.retryOnBusy) {
-            shouldRetry = true;
-            retryReason = "busy";
-        }
-        // TODO(ASFW-Async): Add speed fallback on type error (Apple's
-        // IOFWReadCommand::gotPacket pattern).
-        // if (status == AsyncStatus::kTypeError && state->policy.speedFallback) {
-        //     state->params.speedCode = 0;  // Downgrade to S100
-        //     shouldRetry = true;
-        //     retryReason = "type error, downgrading speed";
-        // }
-    }
-
-    if (shouldRetry) {
-        const uint8_t attemptNumber = state->policy.maxRetries - state->attemptsRemaining + 1;
-        state->attemptsRemaining--;
-
-        ASFW_LOG(Async, "ReadWithRetry: %{public}s on attempt %u, %u retries remaining",
-                 retryReason, attemptNumber, state->attemptsRemaining);
-
-        // Apple pattern: Delay before retry (simple blocking sleep)
-        // In production, this could be improved with async timer dispatch
-        if (state->policy.retryDelayUsec > 0) {
-            const uint32_t delayMs = static_cast<uint32_t>(state->policy.retryDelayUsec / 1000);
-            if (delayMs > 0) {
-                IOSleep(delayMs); // Convert µs to ms
-            }
-        }
-
-        // Re-submit transaction (Apple pattern: call execute() again)
-        // Note: This creates a new handle - cancellation of original handle won't
-        // affect retries. This matches Apple's behavior where commands are atomic.
-        state->currentHandle =
-            state->subsystem->Read(state->params, [state](AsyncHandle h, AsyncStatus s, uint8_t rc,
-                                                          std::span<const uint8_t> payload) {
-                ReadWithRetryCallback(h, s, rc, payload, state);
-            });
-
-        if (!state->currentHandle) {
-            // Retry submission failed - invoke user callback with error
-            ASFW_LOG_ERROR(Async, "ReadWithRetry: Re-submission failed after %{public}s",
-                           retryReason);
-            if (state->userCallback) {
-                state->userCallback(handle, AsyncStatus::kHardwareError, 0xFF,
-                                    std::span<const uint8_t>{});
-            }
-        }
-    } else {
-        // Final completion - no more retries available or success achieved
-        // Invoke user callback with actual result
-        if (status != AsyncStatus::kSuccess) {
-            ASFW_LOG(Async, "ReadWithRetry: Final completion after %u attempts: status=%{public}s",
-                     state->policy.maxRetries - state->attemptsRemaining + 1,
-                     ASFW::Async::ToString(status));
-        }
-
-        if (state->userCallback) {
-            state->userCallback(handle, status, responseCode, responsePayload);
-        }
-    }
 }
 
 struct PayloadContext {
@@ -352,7 +250,7 @@ kern_return_t AsyncSubsystem::InitializeCoreStartState(size_t completionQueueCap
     completionQueue_->Activate();
 
     tracking_ = std::make_unique<Track_Tracking<CompletionQueue>>(
-        labelAllocator_.get(), txnMgr_.get(), *completionQueue_, nullptr);
+        labelAllocator_.get(), txnMgr_.get(), *completionQueue_, nullptr, splitTimeout_);
 
     asyncTraceCapture_ = std::make_unique<Debug::AsyncTraceCapture>();
     std::memset(&inboundCSRStats_, 0, sizeof(inboundCSRStats_));
@@ -427,7 +325,7 @@ kern_return_t AsyncSubsystem::ProvisionAsyncDataPath(const char*& failureStage) 
                                            *generationTracker_, *packetRouter_);
 
     responseSender_ = std::make_unique<ResponseSender>(*descriptorBuilderResponse_, *submitter_,
-                                                       *contextManager_, *generationTracker_);
+                                                       *contextManager_, *generationTracker_, splitTimeout_);
     packetRouter_->SetResponseSender(responseSender_.get());
 
     ASFW_LOG(Async, "✓ ContextManager provisioned");
@@ -446,7 +344,7 @@ void AsyncSubsystem::FinalizeStart() {
     busResetCapture_ = std::make_unique<Debug::BusResetPacketCapture>();
 
     hardware_->SetInterruptMask(kAsyncInterruptMask, true);
-    hardware_->SetLinkControlBits(kLinkControlRcvPhyPktBit);
+    hardware_->SetLinkControlBits(Driver::LinkControlBits::kRcvPhyPkt);
 
     // Report DMA cache mode (always uncached since kIOMemoryMapCacheModeInhibit works reliably)
     ASFW_LOG_TYPE(Async, OS_LOG_TYPE_INFO, "AsyncSubsystem::Start complete (DMA always uncached)");
@@ -573,7 +471,8 @@ void AsyncSubsystem::Teardown(bool disableHardware) {
     acceptingSubmissions_.store(false, std::memory_order_release);
     if (disableHardware && hardware_) {
         hardware_->SetInterruptMask(0xFFFFFFFFu, false);
-        hardware_->ClearLinkControlBits(kLinkControlRcvPhyPktBit);
+        hardware_->ClearLinkControlBits(Driver::LinkControlBits::kRcvPhyPkt);
+        hardware_->ClearPhysicalRequestFilters();
     }
 
     // CRITICAL: Deactivate completion queue BEFORE stopping contexts
@@ -696,12 +595,22 @@ void AsyncSubsystem::OnTimeoutTick() {
 
     const uint64_t nowUsec = GetCurrentMonotonicTimeUsec();
 
+    const uint32_t drainedByWatchdog = DrainTxCompletions("watchdog");
+
+    // Backstop for a lost receive interrupt (an MSI edge the controller never
+    // sent, or one we acknowledged away): a packet then sits in an AR ring
+    // until something else interrupts. Same queue as the ISR, so this is the
+    // ISR's own scan, just timer-driven. Every 10 ms keeps a straddle fragment
+    // from being retried (and V2-logged) every tick.
+    if (rxPath_ && watchdogTickCount_.load(std::memory_order_relaxed) % 10 == 0) {
+        rxPath_->ProcessARInterrupts(isRunning_, busResetCapture_.get(), /*quiet=*/true);
+    }
+
     // Delegate timeout processing to Tracking actor
     if (tracking_) {
         tracking_->OnTimeoutTick(nowUsec);
     }
 
-    const uint32_t drainedByWatchdog = DrainTxCompletions("watchdog");
     const bool contextsRearmed = EnsureATContextsRunning("timeout-watchdog");
 
     watchdogTickCount_.fetch_add(1, std::memory_order_relaxed);
